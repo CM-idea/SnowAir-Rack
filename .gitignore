@@ -1,0 +1,35 @@
+# Build output
+dist/
+build/
+
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.idb
+*.log
+
+# Test artifacts
+drop-target/
+tests/assets/*.tmp
+HostSim.log
+shot*.png
+*-crop.png
+
+# Local reference checkouts (third-party; not part of this repository)
+å‚è€ƒ/
+
+# OS
+Thumbs.db
+desktop.ini
+/rack.json
+²Î¿¼/
+*.bat
+THIRD_PARTY_NOTICES.md
+referto/
+images/
