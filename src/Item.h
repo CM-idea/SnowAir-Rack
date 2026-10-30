@@ -5,8 +5,12 @@
 
 struct Item {
     int id = 0;
+    /* 0=图片, 1=便签(纯文字), 2=录屏, 3=其他文件 */
+    int kind = 0;
     std::wstring path;        /* file used for copy/open/drag */
     std::wstring sourcePath;  /* original SnowAir capture */
+    std::wstring thumbPath;   /* 录屏封面（可为空） */
+    std::wstring label;       /* 录屏/文件卡片上显示的文字 */
     std::wstring note;
     int noteColor = 0;
     float aspect = 1.0f;

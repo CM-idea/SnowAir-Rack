@@ -10,6 +10,7 @@
 #include "Theme.h"
 
 class RackWindow;
+class PinWindow;
 
 class Plugin {
 public:
@@ -23,6 +24,12 @@ public:
     void OnQuickHang(const wchar_t* path);
     void OnHangText(const std::wstring& text);
     void OnHangImage(const std::wstring& path);
+    /* 统一上绳：kind = SNOWAIR_ENTRY_*，label/path/thumb 来自剪贴板条目。 */
+    void OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
+                     const std::wstring& thumb);
+    /* 点击图片卡片的夹子：把图片贴到桌面。 */
+    void PinItemToDesktop(int index);
+    void PinImageFile(const std::wstring& path);
     void DestroyNoteText(const std::wstring& text);
     void OnSettingChanged(const wchar_t* key);
     int SettingsCount() const;
@@ -67,6 +74,7 @@ private:
 
     std::unique_ptr<RackWindow> window_;
     std::unique_ptr<ClipboardBubble> clipboard_;
+    std::unique_ptr<PinWindow> pinWindow_;
     uint64_t clipboardClosedTick_ = 0;
     int lastHostDark_ = -1;
     std::unique_ptr<Graphics> graphics_;

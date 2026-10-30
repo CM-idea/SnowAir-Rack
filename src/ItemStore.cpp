@@ -39,50 +39,26 @@ bool ItemStore::Load(std::vector<Item>& items) const
         const json::Value* noteValue = value.Get("note");
         const bool hasNote = noteValue && noteValue->type == json::Type::String &&
                              !noteValue->text.empty();
-        if (!path || path->type != json::Type::String) {
-            /* note-only cards keep no file path */
-            if (!hasNote) continue;
-            Item item;
-            item.note = util::Utf8ToWide(noteValue->text);
-            if (const json::Value* id = value.Get("id"); id && id->type == json::Type::Number) {
-                item.id = static_cast<int>(id->number);
-            }
-            if (const json::Value* aspect = value.Get("aspect");
-                aspect && aspect->type == json::Type::Number && aspect->number > 0.0) {
-                item.aspect = static_cast<float>(aspect->number);
-            }
-            if (const json::Value* offset = value.Get("offsetX");
-                offset && offset->type == json::Type::Number) {
-                item.rackOffsetX = static_cast<float>(offset->number);
-            }
-            if (const json::Value* locked = value.Get("locked");
-                locked && locked->type == json::Type::Bool) {
-                item.locked = locked->boolean;
-            }
-            if (const json::Value* added = value.Get("addedMs");
-                added && added->type == json::Type::Number) {
-                item.addedMs = static_cast<uint64_t>(added->number);
-            }
-            if (const json::Value* color = value.Get("noteColor");
-                color && color->type == json::Type::Number) {
-                item.noteColor = rack::ClampInt(static_cast<int>(color->number), 0, 2);
-            }
-            item.aspect = 1.1f;   /* notes: slightly landscape */
-            items.push_back(std::move(item));
-            continue;
+        int kind = 0;
+        bool hasKind = false;
+        if (const json::Value* k = value.Get("kind"); k && k->type == json::Type::Number) {
+            kind = rack::ClampInt(static_cast<int>(k->number), 0, 3);
+            hasKind = true;
         }
-        const std::wstring wide = util::Utf8ToWide(path->text);
-        if (wide.empty() || !util::FileExists(wide)) {
-            if (!hasNote) continue;
+        std::wstring label;
+        if (const json::Value* l = value.Get("label"); l && l->type == json::Type::String) {
+            label = util::Utf8ToWide(l->text);
         }
+        std::wstring thumbPath;
+        if (const json::Value* tp = value.Get("thumbPath");
+            tp && tp->type == json::Type::String) {
+            thumbPath = util::Utf8ToWide(tp->text);
+        }
+        const bool hasPath = path && path->type == json::Type::String && !path->text.empty();
         Item item;
-        item.path = wide.empty() ? std::wstring() : util::FullPath(wide);
-        item.sourcePath = item.path;
-        if (const json::Value* source = value.Get("sourcePath");
-            source && source->type == json::Type::String) {
-            const std::wstring sourcePath = util::Utf8ToWide(source->text);
-            if (!sourcePath.empty()) item.sourcePath = sourcePath;
-        }
+        item.kind = hasKind ? kind : (hasPath ? 0 : 1);
+        item.label = label;
+        if (!thumbPath.empty()) item.thumbPath = util::FullPath(thumbPath);
         if (const json::Value* id = value.Get("id"); id && id->type == json::Type::Number) {
             item.id = static_cast<int>(id->number);
         }
@@ -102,13 +78,29 @@ bool ItemStore::Load(std::vector<Item>& items) const
             added && added->type == json::Type::Number) {
             item.addedMs = static_cast<uint64_t>(added->number);
         }
-        if (const json::Value* note = value.Get("note");
-            note && note->type == json::Type::String) {
-            item.note = util::Utf8ToWide(note->text);
-        }
         if (const json::Value* color = value.Get("noteColor");
             color && color->type == json::Type::Number) {
             item.noteColor = rack::ClampInt(static_cast<int>(color->number), 0, 2);
+        }
+        if (hasNote) item.note = util::Utf8ToWide(noteValue->text);
+
+        if (!hasPath) {
+            /* 无路径：便签 / 纯文字录屏 / 纯文字文件 */
+            if (!hasNote && item.label.empty()) continue;
+            item.aspect = 1.1f;
+            items.push_back(std::move(item));
+            continue;
+        }
+        const std::wstring wide = util::Utf8ToWide(path->text);
+        item.path = util::FullPath(wide);
+        item.sourcePath = item.path;
+        if (const json::Value* source = value.Get("sourcePath");
+            source && source->type == json::Type::String) {
+            const std::wstring sourcePath = util::Utf8ToWide(source->text);
+            if (!sourcePath.empty()) item.sourcePath = sourcePath;
+        }
+        if (!util::FileExists(item.path) && !hasNote && item.label.empty()) {
+            continue;
         }
         if (item.path.empty()) item.aspect = 1.1f;
         item.mtime = util::FileWriteTime(item.path);
@@ -123,13 +115,16 @@ bool ItemStore::Save(const std::vector<Item>& items) const
     output += "{\n  \"version\": 1,\n  \"items\": [\n";
     bool first = true;
     for (const auto& item : items) {
-        if (item.path.empty() && item.note.empty()) {
+        if (item.path.empty() && item.note.empty() && item.label.empty()) {
             continue;
         }
         if (!first) output += ",\n";
         first = false;
-        output += "    { \"path\": " + json::Quote(util::WideToUtf8(item.path));
+        output += "    { \"kind\": " + std::to_string(item.kind);
+        output += ", \"path\": " + json::Quote(util::WideToUtf8(item.path));
         output += ", \"sourcePath\": " + json::Quote(util::WideToUtf8(item.sourcePath));
+        output += ", \"thumbPath\": " + json::Quote(util::WideToUtf8(item.thumbPath));
+        output += ", \"label\": " + json::Quote(util::WideToUtf8(item.label));
         output += ", \"id\": " + std::to_string(item.id);
         output += ", \"aspect\": " + std::to_string(item.aspect);
         output += ", \"offsetX\": " + std::to_string(item.rackOffsetX);

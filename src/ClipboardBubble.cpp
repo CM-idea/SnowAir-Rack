@@ -173,6 +173,7 @@ ClipboardBubble::~ClipboardBubble()
 {
     Close();
     DestroyModalEdit();
+    DestroyNoteEdit();
     DestroySearchEdit();
     if (editBrush_) {
         DeleteObject(editBrush_);
@@ -235,7 +236,7 @@ void ClipboardBubble::LoadIcons()
     BuildGlyph(0xE61D, iconText_);    // text
     BuildGlyph(0xE675, iconImage_);   // image
     BuildGlyph(0xE61C, iconFiles_);   // folder
-    BuildGlyph(0xE64C, iconGear_);    // settings
+    BuildGlyph(0xE66D, iconGear_);    // filter（分类设置）
     BuildGlyph(0xE640, iconDrag_);    // drag handle
 }
 
@@ -749,6 +750,297 @@ bool ClipboardBubble::HitGear(float x, float y) const
     return rack::PointIn(rect, x, y);
 }
 
+int ClipboardBubble::HitModalButton(float x, float y) const
+{
+    const float s = scale_;
+    /* 所有弹窗的按钮几何只在这里定义一次：绘制、悬停和点击共用同一份，
+       避免改了尺寸之后按钮画在一处、命中在另一处。 */
+    if (deleteConfirm_ >= 0) {
+        const float w = 300.0f * s;
+        const float h = 150.0f * s;
+        const float left = (width_ - w) * 0.5f;
+        const float top = (height_ - h) * 0.5f;
+        const float btnY = top + h - 44.0f * s;
+        if (rack::PointIn(D2D1::RectF(left + w - 148.0f * s, btnY, left + w - 84.0f * s,
+                                      btnY + 28.0f * s), x, y)) {
+            return 1;
+        }
+        if (rack::PointIn(D2D1::RectF(left + w - 76.0f * s, btnY, left + w - 16.0f * s,
+                                      btnY + 28.0f * s), x, y)) {
+            return 3;
+        }
+        return 0;
+    }
+    if (noteEditorOpen_) {
+        const NoteEditorLayout layout = BuildNoteEditorLayout();
+        if (rack::PointIn(layout.cancel, x, y)) return 1;
+        if (rack::PointIn(layout.save, x, y)) return 2;
+        return 0;
+    }
+    if (!tagEditorOpen_ && !categoryEditorOpen_) {
+        return 0;
+    }
+    if (tagEditorOpen_) {
+        const TagEditorLayout layout = BuildTagEditorLayout();
+        if (rack::PointIn(layout.cancel, x, y)) return 1;
+        if (rack::PointIn(layout.save, x, y)) return 2;
+        return 0;
+    }
+    const float w = 320.0f * s;
+    const float h = 132.0f * s;
+    const float pad = 18.0f * s;
+    const float left = (width_ - w) * 0.5f;
+    const float top = (height_ - h) * 0.5f;
+    const float right = left + w;
+    const D2D1_RECT_F ok = D2D1::RectF(right - pad - 72.0f * s, top + 86.0f * s, right - pad,
+                                       top + 116.0f * s);
+    const D2D1_RECT_F cancel = D2D1::RectF(ok.left - 8.0f * s - 72.0f * s, top + 86.0f * s,
+                                           ok.left - 8.0f * s, top + 116.0f * s);
+    if (rack::PointIn(cancel, x, y)) return 1;
+    if (rack::PointIn(ok, x, y)) return 2;
+    return 0;
+}
+
+ClipboardBubble::TagEditorLayout ClipboardBubble::BuildTagEditorLayout() const
+{
+    /* 布局对齐 SnowAir 的「自定义标签」弹窗：
+       标题 + 一条内联输入框（标签 chip 与输入光标同一行、自动换行）+ 右下角取消/确定。 */
+    const float s = scale_;
+    const float cardW = 320.0f * s;
+    const float padX = 18.0f * s;
+    const float padY = 16.0f * s;
+    const float innerRight = cardW - padX;
+    const float chipH = 20.0f * s;
+    const float chipGap = 4.0f * s;
+    const float labelH = 15.0f * s;
+    const float buttonH = 30.0f * s;
+    const float buttonW = 72.0f * s;
+    const float fieldPadX = 6.0f * s;
+    const float fieldPadY = 5.0f * s;
+    const float editW = 96.0f * s;
+
+    bool hasCats = false;
+    for (const auto& category : categories_) {
+        if (category.builtin < 0) {
+            hasCats = true;
+            break;
+        }
+    }
+
+    TagEditorLayout layout;
+    float y = padY;
+    layout.title = D2D1::RectF(padX, y, innerRight, y + 20.0f * s);
+    y = layout.title.bottom + 10.0f * s;
+
+    if (hasCats) {
+        layout.labelCats = D2D1::RectF(padX, y, innerRight, y + labelH);
+        y = layout.labelCats.bottom + 4.0f * s;
+        float x = padX;
+        float rowTop = y;
+        for (int i = 0; i < static_cast<int>(categories_.size()); ++i) {
+            const Category& category = categories_[static_cast<size_t>(i)];
+            if (category.builtin >= 0) continue;
+            const float w = TextWidth(category.name, chipFormat_.Get()) + 10.0f * s;
+            if (x + w > innerRight) {
+                x = padX;
+                rowTop += chipH + chipGap;
+            }
+            TagChipRect chip;
+            chip.rect = D2D1::RectF(x, rowTop, x + w, rowTop + chipH);
+            chip.text = category.name;
+            chip.index = i;
+            layout.catChips.push_back(std::move(chip));
+            x += w + chipGap;
+        }
+        y = rowTop + chipH + 10.0f * s;
+    }
+
+    layout.labelTags = D2D1::RectF(padX, y, innerRight, y + labelH);
+    const float fieldTop = layout.labelTags.bottom + 4.0f * s;
+    float x = padX + fieldPadX;
+    float rowTop = fieldTop + fieldPadY;
+    for (const auto& tag : tagSelection_) {
+        const float w = TextWidth(tag, chipFormat_.Get()) + 10.0f * s;
+        if (x + w > innerRight - fieldPadX) {
+            x = padX + fieldPadX;
+            rowTop += chipH + chipGap;
+        }
+        TagChipRect chip;
+        chip.rect = D2D1::RectF(x, rowTop, x + w, rowTop + chipH);
+        chip.text = tag;
+        layout.tagChips.push_back(std::move(chip));
+        x += w + chipGap;
+    }
+    if (x + editW > innerRight - fieldPadX) {
+        x = padX + fieldPadX;
+        rowTop += chipH + chipGap;
+    }
+    layout.edit = D2D1::RectF(x, rowTop, x + editW, rowTop + chipH);
+    const float fieldBottom = rowTop + chipH + fieldPadY;
+    layout.field = D2D1::RectF(padX, fieldTop, innerRight, fieldBottom);
+
+    y = fieldBottom + 10.0f * s;
+    layout.save = D2D1::RectF(innerRight - buttonW, y, innerRight, y + buttonH);
+    layout.cancel = D2D1::RectF(layout.save.left - 8.0f * s - buttonW, y,
+                                layout.save.left - 8.0f * s, y + buttonH);
+    y += buttonH;
+    const float cardH = y + padY;
+
+    const float left = (width_ - cardW) * 0.5f;
+    const float top = (height_ - cardH) * 0.5f;
+    auto shift = [&](D2D1_RECT_F& r) {
+        r.left += left;
+        r.right += left;
+        r.top += top;
+        r.bottom += top;
+    };
+    shift(layout.title);
+    shift(layout.labelCats);
+    shift(layout.labelTags);
+    shift(layout.field);
+    shift(layout.edit);
+    shift(layout.cancel);
+    shift(layout.save);
+    for (auto& chip : layout.catChips) shift(chip.rect);
+    for (auto& chip : layout.tagChips) shift(chip.rect);
+    layout.card = D2D1::RectF(left, top, left + cardW, top + cardH);
+    return layout;
+}
+
+std::wstring ClipboardBubble::TooltipAt(float x, float y, D2D1_RECT_F* anchor) const
+{
+    const float s = scale_;
+    if (anchor) *anchor = D2D1::RectF(x, y, x, y);
+    /* 弹窗按钮都写着取消/确定/完成/删除，不再额外弹提示。 */
+    if (noteEditorOpen_ || categoryEditorOpen_ || deleteConfirm_ >= 0) {
+        return L"";
+    }
+    if (tagEditorOpen_) {
+        const TagEditorLayout layout = BuildTagEditorLayout();
+        for (const auto& chip : layout.catChips) {
+            if (rack::PointIn(chip.rect, x, y)) {
+                if (anchor) *anchor = chip.rect;
+                return L"点选分类";
+            }
+        }
+        for (const auto& chip : layout.tagChips) {
+            if (rack::PointIn(chip.rect, x, y)) {
+                if (anchor) *anchor = chip.rect;
+                return L"移除标签";
+            }
+        }
+        return L"";
+    }
+    const D2D1_RECT_F plus =
+        D2D1::RectF(width_ - (kPad + kPlusW) * s, SearchTop(), width_ - kPad * s,
+                    SearchTop() + kSearchH * s);
+    const float gearRight = width_ - (kPad + 2.0f * kPlusW + kPlusGap) * s;
+    const D2D1_RECT_F gear = D2D1::RectF(gearRight, SearchTop(), gearRight + kPlusW * s,
+                                         SearchTop() + kSearchH * s);
+    if (settingsOpen_) {
+        if (HitPlus(x, y)) {
+            if (anchor) *anchor = plus;
+            return L"新建便签";
+        }
+        if (HitGear(x, y)) {
+            if (anchor) *anchor = gear;
+            return L"退出分类设置";
+        }
+        const int row = ManagerRowAt(x, y);
+        if (row >= 0 && row < static_cast<int>(categories_.size()) &&
+            categories_[static_cast<size_t>(row)].builtin < 0) {
+            const D2D1_RECT_F rr = ManagerRowRect(row);
+            const float cx = rr.right - 4.0f * s;
+            const float cy = rr.top + 4.0f * s;
+            const float dx = x - cx;
+            const float dy = y - cy;
+            if (dx * dx + dy * dy <= 100.0f * s * s) {
+                if (anchor) *anchor = D2D1::RectF(cx - 10.0f * s, cy - 10.0f * s,
+                                                  cx + 10.0f * s, cy + 10.0f * s);
+                return L"删除分类";
+            }
+        }
+        return L"";
+    }
+    if (HitPlus(x, y)) {
+        if (anchor) *anchor = plus;
+        return L"新建便签";
+    }
+    if (HitGear(x, y)) {
+        if (anchor) *anchor = gear;
+        return L"分类设置";
+    }
+    const int row = HitRow(x, y);
+    if (row >= 0) {
+        const int action = HitAction(x, y, row);
+        if (action >= 0 && row < static_cast<int>(shown_.size())) {
+            const Entry& entry =
+                entries_[static_cast<size_t>(shown_[static_cast<size_t>(row)])];
+            const std::vector<int> actions = ActionsFor(entry);
+            if (action < static_cast<int>(actions.size())) {
+                const float top = RowTop(row) + kCardHeaderTop * s +
+                                  (kCardHeaderH - kActionSize) * 0.5f * s;
+                const float right = width_ - kPad * s - kCardPadX * s;
+                const int count = static_cast<int>(actions.size());
+                const float groupW =
+                    count * kActionSize * s + (count - 1) * kActionGap * s;
+                const float bx =
+                    right - groupW + action * (kActionSize + kActionGap) * s;
+                if (anchor) *anchor = D2D1::RectF(bx, top, bx + kActionSize * s,
+                                                  top + kActionSize * s);
+                switch (actions[static_cast<size_t>(action)]) {
+                case 0: return L"复制";
+                case 1: return L"在文件夹中显示";
+                case 2: return L"挂到绳子上";
+                case 3: return L"删除";
+                default: break;
+                }
+            }
+        }
+        const int tagIndex = HitTagChip(x, y, row);
+        if (tagIndex >= 0) {
+            const Entry& entry =
+                entries_[static_cast<size_t>(shown_[static_cast<size_t>(row)])];
+            const float bottom =
+                RowTop(row) + rowHeights_[static_cast<size_t>(row)] - kCardPadY * s;
+            const float top = bottom - kCardTagH * s;
+            float cx = kPad * s + kCardPadX * s;
+            const float typeW = TextWidth(TypeTagFor(entry), tagFormat_.Get()) + 8.0f * s;
+            if (tagIndex == 0 && anchor) {
+                *anchor = D2D1::RectF(cx, top, cx + typeW, bottom);
+            }
+            cx += typeW + 6.0f * s;
+            for (int i = 0; i < static_cast<int>(entry.tags.size()); ++i) {
+                const float w =
+                    TextWidth(entry.tags[static_cast<size_t>(i)], tagFormat_.Get()) +
+                    8.0f * s;
+                if (tagIndex == i + 1 && anchor) {
+                    *anchor = D2D1::RectF(cx, top, cx + w, bottom);
+                }
+                cx += w + 6.0f * s;
+            }
+            if (tagIndex == static_cast<int>(entry.tags.size()) + 1 && anchor) {
+                const float plusW = 16.0f * s;
+                *anchor = D2D1::RectF(cx, top, cx + plusW, bottom);
+            }
+            return L"新增标签";
+        }
+    }
+    return L"";
+}
+
+void ClipboardBubble::ClearHover()
+{
+    hovered_ = -1;
+    hoveredAction_ = -1;
+    hoveredChip_ = -1;
+    hoveredTag_ = -1;
+    hoveredPlus_ = false;
+    hoveredModalButton_ = 0;
+    settingsHover_ = -1;
+    hoveredSettingsAdd_ = false;
+}
+
 D2D1_RECT_F ClipboardBubble::SettingsCardRect() const
 {
     const float s = scale_;
@@ -918,6 +1210,15 @@ void ClipboardBubble::PaintSettings(ID2D1RenderTarget* target, const Brushes& b)
     }
 }
 
+D2D1_RECT_F ClipboardBubble::SettingsAddRect() const
+{
+    const float s = scale_;
+    const D2D1_RECT_F card = ManagerCardRect(false);
+    const float h = 34.0f * s;
+    return D2D1::RectF(card.left + 6.0f * s, card.bottom - 6.0f * s - h,
+                       card.right - 6.0f * s, card.bottom - 6.0f * s);
+}
+
 D2D1_RECT_F ClipboardBubble::ManagerCardRect(bool hidden) const
 {
     const float s = scale_;
@@ -940,6 +1241,8 @@ D2D1_RECT_F ClipboardBubble::ManagerRowRect(int index) const
     const float pad = 6.0f * s;
     const float gap = 6.0f * s;
     const float tileH = 34.0f * s;
+    /* 可见分类卡底部留给「+ 新建分类」按钮。 */
+    const float reserve = hidden ? 0.0f : 44.0f * s;
     float x = card.left + pad;
     float y = card.top + pad;
     for (int i = 0; i < static_cast<int>(categories_.size()); ++i) {
@@ -951,7 +1254,7 @@ D2D1_RECT_F ClipboardBubble::ManagerRowRect(int index) const
             x = card.left + pad;
             y += tileH + gap;
         }
-        if (y + tileH > card.bottom - pad) return D2D1::RectF();
+        if (y + tileH > card.bottom - pad - reserve) return D2D1::RectF();
         if (i == index) return D2D1::RectF(x, y, x + w, y + tileH);
         x += w + gap;
     }
@@ -1022,8 +1325,6 @@ void ClipboardBubble::PaintCategoryManager(ID2D1RenderTarget* target, const Brus
         const D2D1_RECT_F card = ManagerCardRect(hiddenCard);
         target->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f * s, 8.0f * s),
                                      b.cardBg.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
     }
     bool anyHidden = false;
     for (int i = 0; i < static_cast<int>(categories_.size()); ++i) {
@@ -1034,10 +1335,12 @@ void ClipboardBubble::PaintCategoryManager(ID2D1RenderTarget* target, const Brus
         if (row.right <= row.left) continue;
         const bool custom = category.builtin < 0;
         const bool active = i == settingsHover_;
-        target->FillRoundedRectangle(D2D1::RoundedRect(row, 8.0f * s, 8.0f * s),
-                                     active ? b.hoverBg.Get() : b.secondary.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(row, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
+        /* 深色：行用 #262626、卡片 #1A1A1A；浅色对应地行用白色、卡片 #F5F4F4，
+           让分类行和卡片底色拉开一层。 */
+        ID2D1Brush* rowFill =
+            active ? b.hoverBg.Get()
+                   : (theme_.dark ? b.secondary.Get() : b.card.Get());
+        target->FillRoundedRectangle(D2D1::RoundedRect(row, 8.0f * s, 8.0f * s), rowFill);
         if (chipFormat_) {
             target->DrawText(category.name.c_str(),
                              static_cast<UINT32>(category.name.size()), chipFormat_.Get(),
@@ -1090,10 +1393,31 @@ void ClipboardBubble::PaintCategoryManager(ID2D1RenderTarget* target, const Brus
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
+    {
+        const D2D1_RECT_F add = SettingsAddRect();
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(add, 8.0f * s, 8.0f * s),
+            hoveredSettingsAdd_ ? b.hoverBg.Get() : b.card.Get());
+        target->DrawRoundedRectangle(D2D1::RoundedRect(add, 8.0f * s, 8.0f * s),
+                                     b.border.Get(), 1.0f * s);
+        const float cx = add.left + 16.0f * s;
+        const float cy = (add.top + add.bottom) * 0.5f;
+        ID2D1Brush* ink = hoveredSettingsAdd_ ? b.fg.Get() : b.secondaryFg.Get();
+        target->DrawLine(D2D1::Point2F(cx - 5.0f * s, cy), D2D1::Point2F(cx + 5.0f * s, cy),
+                         ink, 1.4f * s);
+        target->DrawLine(D2D1::Point2F(cx, cy - 5.0f * s), D2D1::Point2F(cx, cy + 5.0f * s),
+                         ink, 1.4f * s);
+        if (buttonFormat_) {
+            target->DrawText(L"新建分类", 4, buttonFormat_.Get(),
+                             D2D1::RectF(add.left + 30.0f * s, add.top, add.right, add.bottom),
+                             ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
     if (!anyHidden) {
         const D2D1_RECT_F card = ManagerCardRect(true);
         if (bigHintFormat_) {
-            target->DrawText(L"拖拽可调整顺序，双击修改分类", 16, bigHintFormat_.Get(), card,
+            const wchar_t* hint = L"拖拽排序，拖入此处隐藏；双击自定义分类可重命名";
+            target->DrawText(hint, static_cast<UINT32>(wcslen(hint)), bigHintFormat_.Get(), card,
                              b.muted.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
@@ -1108,7 +1432,8 @@ std::vector<int> ClipboardBubble::ActionsFor(const Entry& entry) const
                         (entry.kind == SNOWAIR_ENTRY_IMAGE &&
                          entry.source != SNOWAIR_SOURCE_CLIPBOARD);
     if (reveal) actions.push_back(1);
-    if (entry.kind == SNOWAIR_ENTRY_IMAGE || entry.kind == SNOWAIR_ENTRY_TEXT) actions.push_back(2);
+    /* 所有类型都能上绳：文字/图片/录屏/文件各有自己的卡片形态。 */
+    actions.push_back(2);
     actions.push_back(3); /* delete */
     return actions;
 }
@@ -1180,8 +1505,20 @@ std::wstring ClipboardBubble::TypeTagFor(const Entry& entry) const
 /* painting                                                            */
 /* ------------------------------------------------------------------ */
 
+void ClipboardBubble::UpdateSearchEditVisibility()
+{
+    if (!edit_) return;
+    const bool modal = noteEditorOpen_ || categoryEditorOpen_ || tagEditorOpen_ ||
+                       deleteConfirm_ >= 0;
+    const bool show = !modal && !settingsOpen_;
+    if (show == searchEditVisible_) return;
+    searchEditVisible_ = show;
+    ShowWindow(edit_, show ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
 void ClipboardBubble::Paint(ID2D1RenderTarget* target)
 {
+    UpdateSearchEditVisibility();
     if (!target) return;
     const float s = scale_;
     const float w = width_;
@@ -1202,19 +1539,40 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
     make(theme_.card, b.card);
     make(theme_.bg, b.panel);
     make(theme_.canvas.a > 0.01f ? theme_.canvas : theme_.bg, b.canvas);
-    make(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.38f), b.dim);
+    make(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.35f), b.dim);
     make(theme_.contentBorder.a > 0.01f ? theme_.contentBorder : theme_.border,
          b.contentBorder);
     make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xF5F4F4), b.chipBg);
+    /* 搜索框是主输入区，比面板明显一档；右侧 +/齿轮是辅助按钮，浅色下压到接近面板。 */
+    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xEDEDED), b.searchBg);
+    make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xF5F4F4), b.iconBg);
+    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.iconHover);
+    /* 分类设置处于选中态时常驻一个更明显的底，图标同时变绿。 */
+    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.iconSelected);
     make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.hoverBg);
-    make(theme_.dark ? Rgb(0x1A1A1A) : theme_.card, b.cardBg);
+    /* 深色：面板 #262626、卡片 #1A1A1A，靠深浅差分层；浅色对应地用
+       比白面板深一档的灰（#F5F4F4）填充卡片，而不是和面板同色只剩描边。 */
+    make(theme_.dark ? Rgb(0x1A1A1A) : Rgb(0xF5F4F4), b.cardBg);
     make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.tagBg);
     make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xD4D4D4), b.tagHover);
     make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.plusBg);
     make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xD4D4D4), b.plusHover);
     make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.selectedBg);
-    make(theme_.success, b.success);
+    make(Rgb(0x34C759), b.success);
     make(Rgb(0xEF4444), b.danger);
+    auto lighten = [](D2D1_COLOR_F color, float delta) {
+        color.r = std::min(1.0f, color.r + delta);
+        color.g = std::min(1.0f, color.g + delta);
+        color.b = std::min(1.0f, color.b + delta);
+        return color;
+    };
+    /* 弹窗实心按钮的悬停色：在本体色上提亮一点，避免再用一套颜色。 */
+    make(lighten(theme_.primary, 0.09f), b.primaryHover);
+    make(lighten(Rgb(0xEF4444), 0.09f), b.dangerHover);
+    /* 弹窗（新建/重命名/删除分类）用独立底色，和面板拉开层次。 */
+    make(theme_.dark ? Rgb(0x262626) : Rgb(0xFFFFFF), b.modalCard);
+    make(theme_.dark ? Rgb(0x4A4A4A) : theme_.border, b.modalBorder);
+    make(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f), b.modalShadow);
     make(Rgb(0x34C759), b.insertion);
     make(theme_.dark ? Rgb(0x333333) : Rgb(0xEFEFEF), b.disabledBg);
     make(Rgb(0xFFFFFF), b.onDanger);
@@ -1274,6 +1632,109 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
         if (shown_.empty()) PaintEmptyState(target, b);
     }
     PaintModals(target, b);
+
+    if (!tooltipText_.empty() && chipFormat_) {
+        const float padX = 8.0f * s;
+        const float tipH = 22.0f * s;
+        const float triH = 6.0f * s;
+        const float triHalf = 5.5f * s;
+        const float gap = 4.0f * s;
+        const float tipW = TextWidth(tooltipText_, chipFormat_.Get()) + 2.0f * padX;
+        const D2D1_RECT_F anchor = tooltipAnchor_;
+        const float centerX = (anchor.left + anchor.right) * 0.5f;
+        float x = rack::Clamp(centerX - tipW * 0.5f, 4.0f * s,
+                              std::max(4.0f * s, width_ - tipW - 4.0f * s));
+        const bool above = anchor.top - gap - triH - tipH >= 4.0f * s;
+        float y = above ? anchor.top - gap - triH - tipH : anchor.bottom + gap + triH;
+        y = rack::Clamp(y, 4.0f * s,
+                        std::max(4.0f * s, height_ - tipH - triH - 4.0f * s));
+        const float margin = 6.0f * s + triHalf + 2.0f * s;
+        float apexX = centerX;
+        if (x + margin <= x + tipW - margin) {
+            apexX = rack::Clamp(centerX, x + margin, x + tipW - margin);
+        } else {
+            apexX = x + tipW * 0.5f;
+        }
+        const float l = x;
+        const float t = y;
+        const float r = x + tipW;
+        const float b = y + tipH;
+        const float rad = 6.0f * s;
+
+        ComPtr<ID2D1SolidColorBrush> fill;
+        ComPtr<ID2D1SolidColorBrush> edge;
+        ComPtr<ID2D1SolidColorBrush> ink;
+        if (FAILED(target->CreateSolidColorBrush(
+                theme_.dark ? D2D1::ColorF(0.149f, 0.149f, 0.149f)
+                            : D2D1::ColorF(1.0f, 1.0f, 1.0f),
+                fill.GetAddressOf())) ||
+            FAILED(target->CreateSolidColorBrush(theme_.border, edge.GetAddressOf())) ||
+            FAILED(target->CreateSolidColorBrush(theme_.fg, ink.GetAddressOf()))) {
+            return;
+        }
+
+        /* 气泡和三角合成一条路径，再统一描边，避免三角底座多出一条横线。 */
+        ComPtr<ID2D1PathGeometry> bubble;
+        bool built = false;
+        if (SUCCEEDED(graphics_->d2d()->CreatePathGeometry(bubble.GetAddressOf())) &&
+            bubble) {
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(bubble->Open(sink.GetAddressOf())) && sink) {
+                const auto arcTo = [&](float px, float py) {
+                    D2D1_ARC_SEGMENT arc{};
+                    arc.point = D2D1::Point2F(px, py);
+                    arc.size = D2D1::SizeF(rad, rad);
+                    arc.rotationAngle = 0.0f;
+                    arc.sweepDirection = D2D1_SWEEP_DIRECTION_CLOCKWISE;
+                    arc.arcSize = D2D1_ARC_SIZE_SMALL;
+                    sink->AddArc(arc);
+                };
+                sink->BeginFigure(D2D1::Point2F(l + rad, t), D2D1_FIGURE_BEGIN_FILLED);
+                if (above) {
+                    sink->AddLine(D2D1::Point2F(r - rad, t));
+                    arcTo(r, t + rad);
+                    sink->AddLine(D2D1::Point2F(r, b - rad));
+                    arcTo(r - rad, b);
+                    sink->AddLine(D2D1::Point2F(apexX + triHalf, b));
+                    sink->AddLine(D2D1::Point2F(apexX, b + triH));
+                    sink->AddLine(D2D1::Point2F(apexX - triHalf, b));
+                    sink->AddLine(D2D1::Point2F(l + rad, b));
+                    arcTo(l, b - rad);
+                    sink->AddLine(D2D1::Point2F(l, t + rad));
+                    arcTo(l + rad, t);
+                } else {
+                    sink->AddLine(D2D1::Point2F(apexX - triHalf, t));
+                    sink->AddLine(D2D1::Point2F(apexX, t - triH));
+                    sink->AddLine(D2D1::Point2F(apexX + triHalf, t));
+                    sink->AddLine(D2D1::Point2F(r - rad, t));
+                    arcTo(r, t + rad);
+                    sink->AddLine(D2D1::Point2F(r, b - rad));
+                    arcTo(r - rad, b);
+                    sink->AddLine(D2D1::Point2F(l + rad, b));
+                    arcTo(l, b - rad);
+                    sink->AddLine(D2D1::Point2F(l, t + rad));
+                    arcTo(l + rad, t);
+                }
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                built = true;
+            }
+        }
+        if (built) {
+            target->FillGeometry(bubble.Get(), fill.Get());
+            target->DrawGeometry(bubble.Get(), edge.Get(), 1.0f * s);
+        } else {
+            const D2D1_ROUNDED_RECT rr =
+                D2D1::RoundedRect(D2D1::RectF(l, t, r, b), rad, rad);
+            target->FillRoundedRectangle(rr, fill.Get());
+            target->DrawRoundedRectangle(rr, edge.Get(), 1.0f * s);
+        }
+
+        target->DrawText(tooltipText_.c_str(),
+                         static_cast<UINT32>(tooltipText_.size()), chipFormat_.Get(),
+                         D2D1::RectF(l, t, r, b), ink.Get(),
+                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
 }
 
 void ClipboardBubble::PaintHeader(ID2D1RenderTarget* target, const Brushes& b)
@@ -1287,8 +1748,10 @@ void ClipboardBubble::PaintHeader(ID2D1RenderTarget* target, const Brushes& b)
         kPad * s, searchTop,
         w - (kPad + 2.0f * kPlusW + 2.0f * kPlusGap) * s, searchTop + searchH);
     target->FillRoundedRectangle(D2D1::RoundedRect(searchRect, 8.0f * s, 8.0f * s),
-                                 settingsOpen_ ? b.disabledBg.Get() : b.chipBg.Get());
-    if (settingsOpen_ && hintFormat_) {
+                                 b.searchBg.Get());
+    const bool modalOpen = noteEditorOpen_ || categoryEditorOpen_ || tagEditorOpen_ ||
+                           deleteConfirm_ >= 0;
+    if ((settingsOpen_ || modalOpen) && hintFormat_ && query_.empty()) {
         target->DrawText(L"请输入关键词...", 9, hintFormat_.Get(),
                          D2D1::RectF(searchRect.left + 10.0f * s, searchRect.top,
                                      searchRect.right - 10.0f * s, searchRect.bottom),
@@ -1298,29 +1761,23 @@ void ClipboardBubble::PaintHeader(ID2D1RenderTarget* target, const Brushes& b)
     const D2D1_RECT_F plusRect = D2D1::RectF(
         w - (kPad + kPlusW) * s, searchTop, w - kPad * s, searchTop + searchH);
     target->FillRoundedRectangle(D2D1::RoundedRect(plusRect, 8.0f * s, 8.0f * s),
-                                 hoveredPlus_ ? b.plusHover.Get() : b.plusBg.Get());
+                                 hoveredPlus_ ? b.iconHover.Get() : b.iconBg.Get());
 
     const D2D1_RECT_F gearRect = D2D1::RectF(
         plusRect.left - kPlusGap * s - kPlusW * s, searchTop,
         plusRect.left - kPlusGap * s, searchTop + searchH);
-    target->FillRoundedRectangle(D2D1::RoundedRect(gearRect, 8.0f * s, 8.0f * s),
-                                 hoveredGear_ ? b.plusHover.Get() : b.plusBg.Get());
+    target->FillRoundedRectangle(
+        D2D1::RoundedRect(gearRect, 8.0f * s, 8.0f * s),
+        settingsOpen_ ? b.iconSelected.Get()
+                      : (hoveredGear_ ? b.iconHover.Get() : b.iconBg.Get()));
     {
-        const float gx = (gearRect.left + gearRect.right) * 0.5f;
-        const float gy = (gearRect.top + gearRect.bottom) * 0.5f;
+        const D2D1_POINT_2F center = D2D1::Point2F(
+            (gearRect.left + gearRect.right) * 0.5f, (gearRect.top + gearRect.bottom) * 0.5f);
         ID2D1Brush* ink = settingsOpen_ ? b.success.Get()
                                          : (hoveredGear_ ? b.fg.Get() : b.secondaryFg.Get());
-        for (int i = 0; i < 3; ++i) {
-            const float ly = gy + static_cast<float>(i - 1) * 5.0f * s;
-            target->DrawLine(D2D1::Point2F(gx - 6.5f * s, ly),
-                             D2D1::Point2F(gx + 6.5f * s, ly), ink, 1.2f * s);
+        if (iconGear_) {
+            DrawGlyph(target, iconGear_.Get(), center, 14.0f * s, ink);
         }
-        target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(gx + 2.5f * s, gy - 5.0f * s),
-                                          2.2f * s, 2.2f * s), ink);
-        target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(gx - 2.5f * s, gy),
-                                          2.2f * s, 2.2f * s), ink);
-        target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(gx + 3.0f * s, gy + 5.0f * s),
-                                          2.2f * s, 2.2f * s), ink);
     }
     const float cx = (plusRect.left + plusRect.right) * 0.5f;
     const float cy = (plusRect.top + plusRect.bottom) * 0.5f;
@@ -1373,8 +1830,6 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
             D2D1::RectF(kPad * s, top, width_ - kPad * s, top + height);
         target->FillRoundedRectangle(D2D1::RoundedRect(card, 8.0f * s, 8.0f * s),
                                      b.cardBg.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(card, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
 
         const float headerTop = top + kCardHeaderTop * s;
         if (metaFormat_ && !entry.time.empty()) {
@@ -1590,8 +2045,50 @@ void ClipboardBubble::PaintEmptyState(ID2D1RenderTarget* target, const Brushes& 
 
 void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
 {
+    const float s = scale_;
+    /* 弹窗统一底色 + 柔和投影，让卡片从变暗的面板上明显浮起来。 */
+    auto paintModalCard = [&](const D2D1_RECT_F& card) {
+        const float radius = 16.0f * s;
+        target->FillRoundedRectangle(D2D1::RoundedRect(card, radius, radius),
+                                     b.modalCard.Get());
+        target->DrawRoundedRectangle(D2D1::RoundedRect(card, radius, radius),
+                                     b.modalBorder.Get(), 1.0f * s);
+    };
+
+    if (noteEditorOpen_) {
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(D2D1::RectF(0.0f, kArrowH * s, width_, height_), 16.0f * s,
+                              16.0f * s),
+            b.dim.Get());
+        const NoteEditorLayout layout = BuildNoteEditorLayout();
+        paintModalCard(layout.card);
+        if (titleFormat_) {
+            target->DrawText(L"新建便签", 4, titleFormat_.Get(), layout.title, b.fg.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        target->FillRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
+                                     b.modalCard.Get());
+        target->DrawRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
+                                     b.modalBorder.Get(), 1.0f * s);
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
+            hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
+        target->DrawRoundedRectangle(
+            D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s), b.modalBorder.Get(),
+            1.0f * s);
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(layout.save, 6.0f * s, 6.0f * s),
+            hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
+        if (buttonFormat_) {
+            target->DrawText(L"取消", 2, buttonFormat_.Get(), layout.cancel, b.fg.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            target->DrawText(L"完成", 2, buttonFormat_.Get(), layout.save, b.primaryFg.Get(),
+                             D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        return;
+    }
+
     if (deleteConfirm_ >= 0) {
-        const float s = scale_;
         target->FillRoundedRectangle(
             D2D1::RoundedRect(D2D1::RectF(0.0f, kArrowH * s, width_, height_), 10.0f * s,
                               10.0f * s),
@@ -1601,10 +2098,7 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
         const float left = (width_ - w) * 0.5f;
         const float top = (height_ - h) * 0.5f;
         const D2D1_RECT_F card = D2D1::RectF(left, top, left + w, top + h);
-        target->FillRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                     b.card.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                     b.border.Get(), 1.0f * s);
+        paintModalCard(card);
         if (titleFormat_) {
             target->DrawText(L"删除分类", 4, titleFormat_.Get(),
                              D2D1::RectF(left + 16.0f * s, top + 12.0f * s,
@@ -1623,12 +2117,14 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
                                                    left + w - 84.0f * s, top + h - 16.0f * s);
             const D2D1_RECT_F del = D2D1::RectF(left + w - 76.0f * s, top + h - 44.0f * s,
                                                 left + w - 16.0f * s, top + h - 16.0f * s);
-            target->FillRoundedRectangle(D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s),
-                                         b.card.Get());
+            target->FillRoundedRectangle(
+                D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s),
+                hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
             target->DrawRoundedRectangle(D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s),
-                                         b.border.Get(), 1.0f * s);
+                                         b.modalBorder.Get(), 1.0f * s);
             target->FillRoundedRectangle(D2D1::RoundedRect(del, 8.0f * s, 8.0f * s),
-                                         b.danger.Get());
+                                         hoveredModalButton_ == 3 ? b.dangerHover.Get()
+                                                                  : b.danger.Get());
             target->DrawText(L"取消", 2, buttonFormat_.Get(), cancel, b.fg.Get(),
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             target->DrawText(L"删除", 2, buttonFormat_.Get(), del, b.primaryFg.Get(),
@@ -1637,44 +2133,46 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
         return;
     }
     if (!tagEditorOpen_ && !categoryEditorOpen_) return;
-    const float s = scale_;
     target->FillRoundedRectangle(
         D2D1::RoundedRect(D2D1::RectF(0.0f, kArrowH * s, width_, height_), 16.0f * s,
                           16.0f * s),
         b.dim.Get());
 
     if (categoryEditorOpen_) {
-        const float w = 300.0f * s;
+        const float w = 320.0f * s;
         const float h = 132.0f * s;
+        const float pad = 18.0f * s;
         const float left = (width_ - w) * 0.5f;
         const float top = (height_ - h) * 0.5f;
-        const D2D1_RECT_F card = D2D1::RectF(left, top, left + w, top + h);
-        target->FillRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                     b.card.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                     b.border.Get(), 1.0f * s);
+        const float right = left + w;
+        const D2D1_RECT_F card = D2D1::RectF(left, top, right, top + h);
+        paintModalCard(card);
         if (titleFormat_) {
             target->DrawText(renamingCategory_ >= 0 ? L"重命名分类" : L"新建分类", 4, titleFormat_.Get(),
-                             D2D1::RectF(left + 16.0f * s, top + 12.0f * s,
-                                         left + w - 16.0f * s, top + 34.0f * s),
+                             D2D1::RectF(left + pad, top + 16.0f * s, right - pad,
+                                         top + 36.0f * s),
                              b.fg.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
+        const D2D1_RECT_F field = D2D1::RectF(left + pad, top + 46.0f * s, right - pad,
+                                              top + 76.0f * s);
+        const D2D1_RECT_F ok = D2D1::RectF(right - pad - 72.0f * s, top + 86.0f * s, right - pad,
+                                           top + 116.0f * s);
+        const D2D1_RECT_F cancel = D2D1::RectF(ok.left - 8.0f * s - 72.0f * s,
+                                               top + 86.0f * s, ok.left - 8.0f * s,
+                                               top + 116.0f * s);
+        target->FillRoundedRectangle(D2D1::RoundedRect(field, 6.0f * s, 6.0f * s),
+                                     b.modalCard.Get());
+        target->DrawRoundedRectangle(D2D1::RoundedRect(field, 6.0f * s, 6.0f * s),
+                                     b.modalBorder.Get(), 1.0f * s);
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(cancel, 6.0f * s, 6.0f * s),
+            hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
+        target->DrawRoundedRectangle(
+            D2D1::RoundedRect(cancel, 6.0f * s, 6.0f * s), b.modalBorder.Get(), 1.0f * s);
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(ok, 6.0f * s, 6.0f * s),
+            hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
         if (buttonFormat_) {
-            const float btnY = top + 88.0f * s;
-            const D2D1_RECT_F cancel = D2D1::RectF(left + w - 148.0f * s, btnY,
-                                                   left + w - 84.0f * s, btnY + 28.0f * s);
-            const D2D1_RECT_F ok = D2D1::RectF(left + w - 76.0f * s, btnY,
-                                               left + w - 16.0f * s, btnY + 28.0f * s);
-            const D2D1_RECT_F field = D2D1::RectF(left + 16.0f * s, top + 44.0f * s,
-                                                  left + w - 16.0f * s, top + 72.0f * s);
-            target->FillRoundedRectangle(D2D1::RoundedRect(field, 8.0f * s, 8.0f * s),
-                                         b.chipBg.Get());
-            target->FillRoundedRectangle(
-                D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s), b.card.Get());
-            target->DrawRoundedRectangle(
-                D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s), b.border.Get(), 1.0f * s);
-            target->FillRoundedRectangle(D2D1::RoundedRect(ok, 8.0f * s, 8.0f * s),
-                                         b.primary.Get());
             target->DrawText(L"取消", 2, buttonFormat_.Get(), cancel, b.fg.Get(),
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             target->DrawText(L"确定", 2, buttonFormat_.Get(), ok, b.primaryFg.Get(),
@@ -1683,146 +2181,62 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
         return;
     }
 
-    const float w = 320.0f * s;
-    const float h = 306.0f * s;
-    const float left = (width_ - w) * 0.5f;
-    const float top = (height_ - h) * 0.5f;
-    const D2D1_RECT_F card = D2D1::RectF(left, top, left + w, top + h);
-    target->FillRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                 b.card.Get());
-    target->DrawRoundedRectangle(D2D1::RoundedRect(card, 16.0f * s, 16.0f * s),
-                                 b.border.Get(), 1.0f * s);
+    const TagEditorLayout layout = BuildTagEditorLayout();
+    paintModalCard(layout.card);
     if (titleFormat_) {
-        target->DrawText(L"分类与标签", 5, titleFormat_.Get(),
-                         D2D1::RectF(left + 14.0f * s, top + 10.0f * s,
-                                     left + w - 14.0f * s, top + 30.0f * s),
-                         b.fg.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
-    const float chipH = 22.0f * s;
-    if (smallFormat_) {
-        target->DrawText(L"所属分类", 4, smallFormat_.Get(),
-                         D2D1::RectF(left + 14.0f * s, top + 34.0f * s,
-                                     left + w - 14.0f * s, top + 46.0f * s),
-                         b.muted.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
-    {
-        float cx = left + 14.0f * s;
-        const float catTop = top + 48.0f * s;
-        for (int i = 0; i < static_cast<int>(categories_.size()); ++i) {
-            const Category& category = categories_[static_cast<size_t>(i)];
-            if (category.builtin >= 0) continue;
-            const float cw = TextWidth(category.name, metaFormat_.Get()) + 14.0f * s;
-            if (cx + cw > left + w - 14.0f * s) {
-                cx = left + 14.0f * s;
-                break;
-            }
-            const bool selected = std::find(editCats_.begin(), editCats_.end(), i) != editCats_.end();
-            const D2D1_RECT_F chip = D2D1::RectF(cx, catTop, cx + cw, catTop + chipH);
-            target->FillRoundedRectangle(D2D1::RoundedRect(chip, 8.0f * s, 8.0f * s),
-                                         b.tagBg.Get());
-            if (metaFormat_) {
-                target->DrawText(category.name.c_str(), static_cast<UINT32>(category.name.size()),
-                                 metaFormat_.Get(), chip,
-                                 selected ? b.success.Get() : b.secondaryFg.Get(),
-                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            }
-            cx += cw + 6.0f * s;
-        }
-    }
-    if (smallFormat_) {
-        target->DrawText(L"标签", 2, smallFormat_.Get(),
-                         D2D1::RectF(left + 14.0f * s, top + 78.0f * s,
-                                     left + w - 14.0f * s, top + 90.0f * s),
-                         b.muted.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
-
-    /* selected tags */
-    float cx = left + 14.0f * s;
-    const float selTop = top + 92.0f * s;
-    for (const auto& tag : tagSelection_) {
-        const float cw = TextWidth(tag, metaFormat_.Get()) + 14.0f * s;
-        if (cx + cw > left + w - 14.0f * s) {
-            cx = left + 14.0f * s;
-            break;
-        }
-        const D2D1_RECT_F chip = D2D1::RectF(cx, selTop, cx + cw, selTop + chipH);
-        target->FillRoundedRectangle(D2D1::RoundedRect(chip, 8.0f * s, 8.0f * s),
-                                     b.tagBg.Get());
-        if (metaFormat_) {
-            target->DrawText(tag.c_str(), static_cast<UINT32>(tag.size()), metaFormat_.Get(),
-                             chip, b.success.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-        cx += cw + 6.0f * s;
-    }
-
-    if (buttonFormat_) {
-        const D2D1_RECT_F field = D2D1::RectF(left + 14.0f * s, top + 120.0f * s,
-                                              left + w - 14.0f * s - 64.0f * s,
-                                              top + 148.0f * s);
-        target->FillRoundedRectangle(D2D1::RoundedRect(field, 8.0f * s, 8.0f * s),
-                                     b.card.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(field, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
-        const D2D1_RECT_F addBtn = D2D1::RectF(left + w - 14.0f * s - 56.0f * s,
-                                               top + 120.0f * s, left + w - 14.0f * s,
-                                               top + 148.0f * s);
-        target->FillRoundedRectangle(D2D1::RoundedRect(addBtn, 8.0f * s, 8.0f * s),
-                                     b.card.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(addBtn, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
-        target->DrawText(L"添加", 2, buttonFormat_.Get(), addBtn, b.fg.Get(),
+        target->DrawText(L"分类与标签", 5, titleFormat_.Get(), layout.title, b.fg.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
-    if (smallFormat_) {
-        target->DrawText(L"全部标签", 4, smallFormat_.Get(),
-                         D2D1::RectF(left + 14.0f * s, top + 154.0f * s,
-                                     left + w - 14.0f * s, top + 166.0f * s),
+    auto label = [&](const D2D1_RECT_F& r, const wchar_t* text) {
+        if (r.right <= r.left || !smallFormat_) return;
+        target->DrawText(text, static_cast<UINT32>(wcslen(text)), smallFormat_.Get(), r,
                          b.muted.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    }
-    float tx = left + 14.0f * s;
-    float ty = top + 168.0f * s;
-    const float maxX = left + w - 14.0f * s;
-    const float maxY = top + 246.0f * s;
-    for (const auto& tag : hostTags_) {
-        bool selected = false;
-        for (const auto& chosen : tagSelection_) {
-            if (chosen == tag) {
-                selected = true;
-                break;
-            }
+    };
+    label(layout.labelCats, L"分类");
+    label(layout.labelTags, L"标签");
+
+    auto chipText = [&](const TagChipRect& c, ID2D1Brush* ink) {
+        if (!chipFormat_) return;
+        target->DrawText(c.text.c_str(), static_cast<UINT32>(c.text.size()),
+                         chipFormat_.Get(), c.rect, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    };
+    /* 分类：选中=实心主色，未选中=描边（SnowAir 选中胶囊的写法），一眼能区分。 */
+    for (const auto& c : layout.catChips) {
+        const bool selected =
+            std::find(editCats_.begin(), editCats_.end(), c.index) != editCats_.end();
+        const D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(c.rect, 4.0f * s, 4.0f * s);
+        if (selected) {
+            target->FillRoundedRectangle(rounded, b.primary.Get());
+            chipText(c, b.primaryFg.Get());
+        } else {
+            target->FillRoundedRectangle(rounded, b.tagBg.Get());
+            chipText(c, b.secondaryFg.Get());
         }
-        if (selected) continue;
-        const float cw = TextWidth(tag, metaFormat_.Get()) + 14.0f * s;
-        if (tx + cw > maxX) {
-            tx = left + 14.0f * s;
-            ty += chipH + 6.0f * s;
-        }
-        if (ty + chipH > maxY) break;
-        const D2D1_RECT_F chip = D2D1::RectF(tx, ty, tx + cw, ty + chipH);
-        target->FillRoundedRectangle(D2D1::RoundedRect(chip, 8.0f * s, 8.0f * s),
-                                     b.tagBg.Get());
-        if (metaFormat_) {
-            target->DrawText(tag.c_str(), static_cast<UINT32>(tag.size()), metaFormat_.Get(),
-                             chip, b.secondaryFg.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-        tx += cw + 6.0f * s;
     }
 
+    /* 内联输入框：标签 chip 与输入光标共用一条流；输入框本体由 modalEdit_ 覆盖。 */
+    target->FillRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
+                                 b.modalCard.Get());
+    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
+                                 b.modalBorder.Get(), 1.0f * s);
+    for (const auto& c : layout.tagChips) {
+        const D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(c.rect, 4.0f * s, 4.0f * s);
+        target->FillRoundedRectangle(rounded, b.tagBg.Get());
+        chipText(c, b.fg.Get());
+    }
+
+    target->FillRoundedRectangle(
+        D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
+        hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
+    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
+                                 b.modalBorder.Get(), 1.0f * s);
+    target->FillRoundedRectangle(
+        D2D1::RoundedRect(layout.save, 6.0f * s, 6.0f * s),
+        hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
     if (buttonFormat_) {
-        const float btnY = top + h - 42.0f * s;
-        const D2D1_RECT_F cancel = D2D1::RectF(left + w - 148.0f * s, btnY,
-                                               left + w - 84.0f * s, btnY + 28.0f * s);
-        const D2D1_RECT_F ok = D2D1::RectF(left + w - 76.0f * s, btnY,
-                                           left + w - 16.0f * s, btnY + 28.0f * s);
-        target->FillRoundedRectangle(D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s),
-                                     b.card.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(cancel, 8.0f * s, 8.0f * s),
-                                     b.border.Get(), 1.0f * s);
-        target->FillRoundedRectangle(D2D1::RoundedRect(ok, 8.0f * s, 8.0f * s),
-                                     b.primary.Get());
-        target->DrawText(L"取消", 2, buttonFormat_.Get(), cancel, b.fg.Get(),
+        target->DrawText(L"取消", 2, buttonFormat_.Get(), layout.cancel, b.fg.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        target->DrawText(L"保存", 2, buttonFormat_.Get(), ok, b.primaryFg.Get(),
+        target->DrawText(L"确定", 2, buttonFormat_.Get(), layout.save, b.primaryFg.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 }
@@ -1846,19 +2260,27 @@ void ClipboardBubble::Open(int screenX, int screenY, float scale, const Theme& t
     hoveredChip_ = -1;
     hoveredTag_ = -1;
     hoveredPlus_ = false;
+    hoveredModalButton_ = 0;
     query_.clear();
     searchFocused_ = false;
     caretVisible_ = true;
     chipScrollX_ = 0.0f;
+    chipPress_ = -1;
+    chipDragging_ = false;
+    tooltipText_.clear();
+    trackingLeave_ = false;
     scrollY_ = 0.0f;
     tagEditorOpen_ = false;
     categoryEditorOpen_ = false;
+    noteEditorOpen_ = false;
+    if (noteEdit_) ShowWindow(noteEdit_, SW_HIDE);
     tagEditorEntry_ = -1;
     tagSelection_.clear();
     settingsOpen_ = false;
     settingsDrag_ = -1;
     settingsDrop_ = -1;
     settingsHover_ = -1;
+    hoveredSettingsAdd_ = false;
     deleteConfirm_ = -1;
     renamingCategory_ = -1;
     editCats_.clear();
@@ -1939,12 +2361,19 @@ void ClipboardBubble::Close()
     caretVisible_ = false;
     tagEditorOpen_ = false;
     categoryEditorOpen_ = false;
+    noteEditorOpen_ = false;
     tagEditorEntry_ = -1;
     tagSelection_.clear();
+    chipPress_ = -1;
+    chipDragging_ = false;
+    tooltipText_.clear();
+    trackingLeave_ = false;
+    ClearHover();
     if (captured_ && hwnd()) ReleaseCapture();
     captured_ = false;
     if (edit_) ShowWindow(edit_, SW_HIDE);
     if (modalEdit_) ShowWindow(modalEdit_, SW_HIDE);
+    if (noteEdit_) ShowWindow(noteEdit_, SW_HIDE);
     entries_.clear();
     shown_.clear();
     rowTops_.clear();
@@ -2074,7 +2503,8 @@ void ClipboardBubble::LayoutEditors()
                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                             DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 
-    if (edit_ && !tagEditorOpen_ && !categoryEditorOpen_ && !settingsOpen_) {
+    if (edit_ && !tagEditorOpen_ && !categoryEditorOpen_ && !noteEditorOpen_ &&
+        deleteConfirm_ < 0 && !settingsOpen_) {
         const float s = scale_;
         const float editH = 20.0f * s;
         const float editTop = SearchTop() + (kSearchH * s - editH) * 0.5f;
@@ -2102,23 +2532,23 @@ void ClipboardBubble::LayoutEditors()
         float ew = 0.0f;
         float eh = 0.0f;
         if (categoryEditorOpen_) {
-            const float w = 300.0f * scale_;
-            const float h = 132.0f * scale_;
+            const float s = scale_;
+            const float w = 320.0f * s;
+            const float h = 132.0f * s;
             const float cardLeft = (width_ - w) * 0.5f;
             const float cardTop = (height_ - h) * 0.5f;
-            left = cardLeft + 18.0f * scale_;
-            top = cardTop + 48.0f * scale_;
-            ew = w - 36.0f * scale_;
-            eh = 20.0f * scale_;
+            const float fieldTop = cardTop + 46.0f * s;
+            left = cardLeft + 18.0f * s + 2.0f * s;
+            top = fieldTop + 5.0f * s;
+            ew = w - 36.0f * s - 4.0f * s;
+            eh = 20.0f * s;
         } else if (tagEditorOpen_) {
-            const float w = 320.0f * scale_;
-            const float h = 306.0f * scale_;
-            const float cardLeft = (width_ - w) * 0.5f;
-            const float cardTop = (height_ - h) * 0.5f;
-            left = cardLeft + 16.0f * scale_;
-            top = cardTop + 124.0f * scale_;
-            ew = w - 32.0f * scale_ - 64.0f * scale_;
-            eh = 20.0f * scale_;
+            const TagEditorLayout layout = BuildTagEditorLayout();
+            const float s = scale_;
+            left = layout.edit.left + 1.0f * s;
+            top = layout.edit.top;
+            ew = (layout.edit.right - layout.edit.left) - 2.0f * s;
+            eh = layout.edit.bottom - layout.edit.top;
         }
         if (ew > 4.0f && eh > 4.0f) {
             POINT pt{static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top))};
@@ -2130,13 +2560,31 @@ void ClipboardBubble::LayoutEditors()
                                             static_cast<int>(std::lround(eh)) + 1, 16, 16),
             TRUE);
             SendMessageW(modalEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(editFont_), TRUE);
+            const int margin = static_cast<int>(std::lround((tagEditorOpen_ ? 2.0f : 8.0f) * scale_));
             SendMessageW(modalEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                         MAKELPARAM(static_cast<int>(std::lround(8.0f * scale_)),
-                                    static_cast<int>(std::lround(8.0f * scale_))));
+                         MAKELPARAM(margin, margin));
             if (tagEditorOpen_ || categoryEditorOpen_) {
                 ShowWindow(modalEdit_, SW_SHOWNOACTIVATE);
             }
         }
+    }
+
+    if (noteEdit_ && noteEditorOpen_) {
+        const NoteEditorLayout layout = BuildNoteEditorLayout();
+        const float s = scale_;
+        const float left = layout.field.left + 4.0f * s;
+        const float top = layout.field.top + 4.0f * s;
+        const float ew = (layout.field.right - layout.field.left) - 8.0f * s;
+        const float eh = (layout.field.bottom - layout.field.top) - 8.0f * s;
+        POINT pt{static_cast<LONG>(std::lround(left)), static_cast<LONG>(std::lround(top))};
+        ClientToScreen(hwnd(), &pt);
+        SetWindowPos(noteEdit_, HWND_TOPMOST, pt.x, pt.y, static_cast<int>(std::lround(ew)),
+                     static_cast<int>(std::lround(eh)), SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SendMessageW(noteEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(editFont_), TRUE);
+        SendMessageW(noteEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                     MAKELPARAM(static_cast<int>(std::lround(4.0f * s)),
+                                static_cast<int>(std::lround(4.0f * s))));
+        ShowWindow(noteEdit_, SW_SHOWNOACTIVATE);
     }
 }
 
@@ -2147,6 +2595,9 @@ void ClipboardBubble::LayoutEditors()
 void ClipboardBubble::OpenTagEditor(int entryIndex)
 {
     if (entryIndex < 0 || entryIndex >= static_cast<int>(entries_.size())) return;
+    ClearHover();
+    noteEditorOpen_ = false;
+    if (noteEdit_) ShowWindow(noteEdit_, SW_HIDE);
     tagEditorOpen_ = true;
     categoryEditorOpen_ = false;
     tagEditorEntry_ = entryIndex;
@@ -2167,6 +2618,8 @@ void ClipboardBubble::OpenTagEditor(int entryIndex)
     CreateModalEdit();
     if (modalEdit_) {
         SetWindowTextW(modalEdit_, L"");
+        SendMessageW(modalEdit_, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"输入标签，空格分隔"));
         ActivateForInput();
         SetFocus(modalEdit_);
     }
@@ -2177,6 +2630,7 @@ void ClipboardBubble::OpenTagEditor(int entryIndex)
 void ClipboardBubble::CloseTagEditor(bool save)
 {
     if (!tagEditorOpen_) return;
+    if (save) CommitTagText();
     const int entryIndex = tagEditorEntry_;
     if (save && entryIndex >= 0 && entryIndex < static_cast<int>(entries_.size())) {
         const std::wstring joined = JoinLines(tagSelection_);
@@ -2202,6 +2656,7 @@ void ClipboardBubble::CloseTagEditor(bool save)
     tagEditorOpen_ = false;
     tagEditorEntry_ = -1;
     tagSelection_.clear();
+    hoveredModalButton_ = 0;
     if (modalEdit_) {
         ShowWindow(modalEdit_, SW_HIDE);
         SetWindowTextW(modalEdit_, L"");
@@ -2213,12 +2668,17 @@ void ClipboardBubble::CloseTagEditor(bool save)
 
 void ClipboardBubble::OpenCategoryEditor()
 {
+    ClearHover();
+    noteEditorOpen_ = false;
+    if (noteEdit_) ShowWindow(noteEdit_, SW_HIDE);
     categoryEditorOpen_ = true;
     tagEditorOpen_ = false;
     if (edit_) ShowWindow(edit_, SW_HIDE);
     CreateModalEdit();
     if (modalEdit_) {
         SetWindowTextW(modalEdit_, L"");
+        SendMessageW(modalEdit_, EM_SETCUEBANNER, TRUE,
+                     reinterpret_cast<LPARAM>(L"输入分类名称"));
         ActivateForInput();
         SetFocus(modalEdit_);
     }
@@ -2262,6 +2722,7 @@ void ClipboardBubble::CloseCategoryEditor(bool save)
         }
         categoryEditorOpen_ = false;
         settingsOpen_ = true;
+        hoveredModalButton_ = 0;
         if (modalEdit_) {
             ShowWindow(modalEdit_, SW_HIDE);
             SetWindowTextW(modalEdit_, L"");
@@ -2300,6 +2761,7 @@ void ClipboardBubble::CloseCategoryEditor(bool save)
         }
     }
     categoryEditorOpen_ = false;
+    hoveredModalButton_ = 0;
     if (modalEdit_) {
         ShowWindow(modalEdit_, SW_HIDE);
         SetWindowTextW(modalEdit_, L"");
@@ -2309,8 +2771,111 @@ void ClipboardBubble::CloseCategoryEditor(bool save)
     Render();
 }
 
-void ClipboardBubble::AddTypedTag()
+ClipboardBubble::NoteEditorLayout ClipboardBubble::BuildNoteEditorLayout() const
 {
+    const float s = scale_;
+    const float w = 320.0f * s;
+    const float h = 222.0f * s;
+    const float pad = 18.0f * s;
+    const float left = (width_ - w) * 0.5f;
+    const float top = (height_ - h) * 0.5f;
+    const float right = left + w;
+
+    NoteEditorLayout layout;
+    layout.card = D2D1::RectF(left, top, right, top + h);
+    layout.title = D2D1::RectF(left + pad, top + 16.0f * s, right - pad, top + 36.0f * s);
+    layout.field = D2D1::RectF(left + pad, top + 46.0f * s, right - pad, top + 166.0f * s);
+    layout.save = D2D1::RectF(right - pad - 72.0f * s, top + 176.0f * s, right - pad,
+                              top + 206.0f * s);
+    layout.cancel = D2D1::RectF(layout.save.left - 8.0f * s - 72.0f * s, top + 176.0f * s,
+                                layout.save.left - 8.0f * s, top + 206.0f * s);
+    return layout;
+}
+
+void ClipboardBubble::CreateNoteEdit()
+{
+    if (noteEdit_ || !hwnd()) return;
+    noteEdit_ = CreateWindowExW(WS_EX_TOOLWINDOW, L"EDIT", L"",
+                                WS_POPUP | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
+                                    ES_NOHIDESEL | ES_WANTRETURN,
+                                0, 0, 100, 80, hwnd(), nullptr, util::GetDllModule(),
+                                nullptr);
+    if (!noteEdit_) return;
+    SetWindowLongPtrW(noteEdit_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+    noteEditOldProc_ = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        noteEdit_, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(NoteEditProc)));
+    SendMessageW(noteEdit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
+}
+
+void ClipboardBubble::DestroyNoteEdit()
+{
+    if (noteEdit_) {
+        DestroyWindow(noteEdit_);
+        noteEdit_ = nullptr;
+    }
+}
+
+LRESULT CALLBACK ClipboardBubble::NoteEditProc(HWND hwnd, UINT message, WPARAM wParam,
+                                               LPARAM lParam)
+{
+    auto* self = reinterpret_cast<ClipboardBubble*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (!self) return DefWindowProcW(hwnd, message, wParam, lParam);
+    if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        self->CloseNoteEditor(false);
+        return 0;
+    }
+    return CallWindowProcW(self->noteEditOldProc_ ? self->noteEditOldProc_ : DefWindowProcW,
+                           hwnd, message, wParam, lParam);
+}
+
+void ClipboardBubble::OpenNoteEditor()
+{
+    ClearHover();
+    noteEditorOpen_ = true;
+    categoryEditorOpen_ = false;
+    tagEditorOpen_ = false;
+    if (edit_) ShowWindow(edit_, SW_HIDE);
+    if (modalEdit_) ShowWindow(modalEdit_, SW_HIDE);
+    CreateNoteEdit();
+    if (noteEdit_) {
+        SetWindowTextW(noteEdit_, L"");
+        ActivateForInput();
+        SetFocus(noteEdit_);
+    }
+    LayoutEditors();
+    Render();
+    if (noteEdit_) SetFocus(noteEdit_);
+}
+
+void ClipboardBubble::CloseNoteEditor(bool save)
+{
+    if (!noteEditorOpen_) return;
+    std::wstring text;
+    if (save && noteEdit_) {
+        const int length = GetWindowTextLengthW(noteEdit_);
+        if (length > 0) {
+            text.resize(static_cast<size_t>(length) + 1, L'\0');
+            GetWindowTextW(noteEdit_, text.data(), length + 1);
+            text.resize(static_cast<size_t>(length));
+            text = Trim(text);
+        }
+    }
+    noteEditorOpen_ = false;
+    hoveredModalButton_ = 0;
+    if (noteEdit_) {
+        ShowWindow(noteEdit_, SW_HIDE);
+        SetWindowTextW(noteEdit_, L"");
+    }
+    Render();
+    if (save) {
+        if (!text.empty() && onHangText_) onHangText_(text);
+        Close();
+    }
+}
+
+void ClipboardBubble::CommitTagText()
+{
+    /* 与 SnowAir 自定义标签弹窗一致：空格把当前输入变成一个 chip。 */
     if (!tagEditorOpen_ || !modalEdit_) return;
     const int length = GetWindowTextLengthW(modalEdit_);
     if (length <= 0) return;
@@ -2318,17 +2883,20 @@ void ClipboardBubble::AddTypedTag()
     GetWindowTextW(modalEdit_, text.data(), length + 1);
     text.resize(static_cast<size_t>(length));
     text = Trim(text);
-    if (text.empty()) return;
-    bool exists = false;
+    SetWindowTextW(modalEdit_, L"");
+    if (text.empty()) {
+        LayoutEditors();
+        return;
+    }
     for (const auto& tag : tagSelection_) {
-        if (tag == text) {
-            exists = true;
-            break;
+        if (_wcsicmp(tag.c_str(), text.c_str()) == 0) {
+            LayoutEditors();
+            return;
         }
     }
-    if (!exists) tagSelection_.push_back(text);
-    SetWindowTextW(modalEdit_, L"");
+    tagSelection_.push_back(text);
     Render();
+    LayoutEditors();
 }
 
 /* ------------------------------------------------------------------ */
@@ -2385,9 +2953,30 @@ LRESULT CALLBACK ClipboardBubble::ModalEditProc(HWND hwnd, UINT message, WPARAM 
             else if (self->categoryEditorOpen_) self->CloseCategoryEditor(false);
             return 0;
         }
-        if (wParam == VK_RETURN) {
-            if (self->tagEditorOpen_) self->AddTypedTag();
-            else if (self->categoryEditorOpen_) self->CloseCategoryEditor(true);
+        if (self->tagEditorOpen_) {
+            /* 空格成 chip；输入为空时退格删掉最后一个 chip —— 与 SnowAir 一致。 */
+            if (wParam == VK_SPACE) {
+                if (GetWindowTextLengthW(hwnd) > 0) {
+                    self->CommitTagText();
+                }
+                return 0;
+            }
+            if ((wParam == VK_BACK || wParam == VK_DELETE) &&
+                GetWindowTextLengthW(hwnd) == 0) {
+                if (!self->tagSelection_.empty()) {
+                    self->tagSelection_.pop_back();
+                    self->Render();
+                    self->LayoutEditors();
+                }
+                return 0;
+            }
+            if (wParam == VK_RETURN) {
+                self->CommitTagText();
+                self->CloseTagEditor(true);
+                return 0;
+            }
+        } else if (wParam == VK_RETURN) {
+            self->CloseCategoryEditor(true);
             return 0;
         }
     }
@@ -2400,13 +2989,15 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
     switch (message) {
     case WM_CTLCOLOREDIT: {
         const HWND source = reinterpret_cast<HWND>(lParam);
-        if (source == edit_ || source == modalEdit_) {
+        if (source == edit_ || source == modalEdit_ || source == noteEdit_) {
             HDC dc = reinterpret_cast<HDC>(wParam);
             SetTextColor(dc, RGB(static_cast<BYTE>(theme_.fg.r * 255.0f),
                                  static_cast<BYTE>(theme_.fg.g * 255.0f),
                                  static_cast<BYTE>(theme_.fg.b * 255.0f)));
-            const D2D1_COLOR_F fill =
-                (theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xF5F4F4));
+            const bool modalField = (source == modalEdit_ || source == noteEdit_);
+            const D2D1_COLOR_F fill = modalField
+                                          ? (theme_.dark ? Rgb(0x262626) : Rgb(0xFFFFFF))
+                                          : (theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xEDEDED));
             const COLORREF bg = RGB(static_cast<BYTE>(fill.r * 255.0f),
                                     static_cast<BYTE>(fill.g * 255.0f),
                                     static_cast<BYTE>(fill.b * 255.0f));
@@ -2451,6 +3042,10 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
     case WM_LBUTTONDOWN: {
         const float mx = static_cast<float>(GET_X_LPARAM(lParam));
         const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        if (!tooltipText_.empty()) {
+            tooltipText_.clear();
+            Render();
+        }
         if (mx < 0 || my < 0 || mx > width_ || my > height_) {
             Close();
             return 0;
@@ -2462,27 +3057,34 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
             const float h = 150.0f * s;
             const float left = (width_ - w) * 0.5f;
             const float top = (height_ - h) * 0.5f;
-            const D2D1_RECT_F del = D2D1::RectF(left + w - 76.0f * s, top + h - 44.0f * s,
-                                                left + w - 16.0f * s, top + h - 16.0f * s);
-            const D2D1_RECT_F cancel = D2D1::RectF(left + w - 148.0f * s, top + h - 44.0f * s,
-                                                   left + w - 84.0f * s, top + h - 16.0f * s);
-            if (rack::PointIn(del, mx, my)) {
+            const int button = HitModalButton(mx, my);
+            if (button == 3) {
                 DeleteCategory(deleteConfirm_);
                 deleteConfirm_ = -1;
+                ClearHover();
                 Render();
                 return 0;
             }
-            if (rack::PointIn(cancel, mx, my) || !rack::PointIn(
-                    D2D1::RectF(left, top, left + w, top + h), mx, my)) {
+            if (button == 1 || !rack::PointIn(D2D1::RectF(left, top, left + w, top + h), mx,
+                                              my)) {
                 deleteConfirm_ = -1;
+                ClearHover();
                 Render();
             }
             return 0;
         }
 
-        if (settingsOpen_ && !categoryEditorOpen_ && !tagEditorOpen_) {
+        if (settingsOpen_ && !categoryEditorOpen_ && !tagEditorOpen_ && !noteEditorOpen_) {
             if (HitGear(mx, my)) {
                 gearPressed_ = true;
+                return 0;
+            }
+            if (HitPlus(mx, my)) {
+                OpenNoteEditor();
+                return 0;
+            }
+            if (rack::PointIn(SettingsAddRect(), mx, my)) {
+                OpenCategoryEditor();
                 return 0;
             }
             const int row = ManagerRowAt(mx, my);
@@ -2495,6 +3097,7 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                     if (dx * dx + dy * dy <= 100.0f * scale_ * scale_) {
                     if (CategoryHasItems(row)) {
                         deleteConfirm_ = row;
+                        ClearHover();
                         Render();
                     } else {
                         DeleteCategory(row);
@@ -2526,111 +3129,66 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
 
-        if (tagEditorOpen_ || categoryEditorOpen_) {
+        if (tagEditorOpen_ || categoryEditorOpen_ || noteEditorOpen_) {
             const float s = scale_;
-            const float w = (categoryEditorOpen_ ? 300.0f : 320.0f) * s;
-            const float h = (categoryEditorOpen_ ? 132.0f : 306.0f) * s;
-            const float left = (width_ - w) * 0.5f;
-            const float top = (height_ - h) * 0.5f;
-            const D2D1_RECT_F card = D2D1::RectF(left, top, left + w, top + h);
+            D2D1_RECT_F card{};
+            TagEditorLayout tagLayout;
+            NoteEditorLayout noteLayout;
+            if (noteEditorOpen_) {
+                noteLayout = BuildNoteEditorLayout();
+                card = noteLayout.card;
+            } else if (tagEditorOpen_) {
+                tagLayout = BuildTagEditorLayout();
+                card = tagLayout.card;
+            } else {
+                const float w = 320.0f * s;
+                const float h = 132.0f * s;
+                const float left = (width_ - w) * 0.5f;
+                const float top = (height_ - h) * 0.5f;
+                card = D2D1::RectF(left, top, left + w, top + h);
+            }
             if (!rack::PointIn(card, mx, my)) {
-                if (tagEditorOpen_) CloseTagEditor(false);
+                if (noteEditorOpen_) CloseNoteEditor(false);
+                else if (tagEditorOpen_) CloseTagEditor(false);
                 else CloseCategoryEditor(false);
                 return 0;
             }
-            const float btnY = categoryEditorOpen_ ? top + 88.0f * s : top + h - 42.0f * s;
-            const bool okHit = mx >= left + w - 76.0f * s && mx <= left + w - 16.0f * s &&
-                               my >= btnY && my <= btnY + 28.0f * s;
-            const bool cancelHit = mx >= left + w - 148.0f * s && mx <= left + w - 84.0f * s &&
-                                   my >= btnY && my <= btnY + 28.0f * s;
-            if (okHit) {
-                if (tagEditorOpen_) CloseTagEditor(true);
+            const int button = HitModalButton(mx, my);
+            if (button == 2) {
+                if (noteEditorOpen_) CloseNoteEditor(true);
+                else if (tagEditorOpen_) CloseTagEditor(true);
                 else CloseCategoryEditor(true);
                 return 0;
             }
-            if (cancelHit) {
-                if (tagEditorOpen_) CloseTagEditor(false);
+            if (button == 1) {
+                if (noteEditorOpen_) CloseNoteEditor(false);
+                else if (tagEditorOpen_) CloseTagEditor(false);
                 else CloseCategoryEditor(false);
                 return 0;
             }
             if (tagEditorOpen_) {
-                const D2D1_RECT_F addBtn = D2D1::RectF(
-                    left + w - 14.0f * s - 56.0f * s, top + 120.0f * s,
-                    left + w - 14.0f * s, top + 148.0f * s);
-                if (rack::PointIn(addBtn, mx, my)) {
-                    AddTypedTag();
+                for (const auto& chip : tagLayout.catChips) {
+                    if (!rack::PointIn(chip.rect, mx, my)) continue;
+                    auto it = std::find(editCats_.begin(), editCats_.end(), chip.index);
+                    if (it == editCats_.end()) editCats_.push_back(chip.index);
+                    else editCats_.erase(it);
+                    Render();
                     return 0;
                 }
-                const float chipH = 22.0f * s;
-                /* categories */
-                {
-                    float ccx = left + 14.0f * s;
-                    const float catTop = top + 48.0f * s;
-                    for (int i = 0; i < static_cast<int>(categories_.size()); ++i) {
-                        if (categories_[static_cast<size_t>(i)].builtin >= 0) continue;
-                        const float cw = TextWidth(categories_[static_cast<size_t>(i)].name,
-                                                   metaFormat_.Get()) +
-                                         14.0f * s;
-                        if (ccx + cw > left + w - 14.0f * s) break;
-                        if (mx >= ccx && mx <= ccx + cw && my >= catTop &&
-                            my <= catTop + chipH) {
-                            auto it = std::find(editCats_.begin(), editCats_.end(), i);
-                            if (it == editCats_.end()) editCats_.push_back(i);
-                            else editCats_.erase(it);
-                            Render();
-                            return 0;
-                        }
-                        ccx += cw + 6.0f * s;
-                    }
-                }
-                /* selected chips */
-                float cx = left + 14.0f * s;
-                const float selTop = top + 92.0f * s;
-                for (int i = 0; i < static_cast<int>(tagSelection_.size()); ++i) {
-                    const float cw = TextWidth(tagSelection_[static_cast<size_t>(i)],
-                                               metaFormat_.Get()) +
-                                     14.0f * s;
-                    if (cx + cw > left + w - 14.0f * s) break;
-                    if (mx >= cx && mx <= cx + cw && my >= selTop && my <= selTop + chipH) {
-                        tagSelection_.erase(tagSelection_.begin() + i);
-                        Render();
-                        return 0;
-                    }
-                    cx += cw + 6.0f * s;
-                }
-                /* available chips */
-                float tx = left + 14.0f * s;
-                float ty = top + 168.0f * s;
-                const float maxX = left + w - 14.0f * s;
-                const float maxY = top + 246.0f * s;
-                for (const auto& tag : hostTags_) {
-                    bool selected = false;
-                    for (const auto& chosen : tagSelection_) {
-                        if (chosen == tag) {
-                            selected = true;
-                            break;
-                        }
-                    }
-                    if (selected) continue;
-                    const float cw = TextWidth(tag, metaFormat_.Get()) + 14.0f * s;
-                    if (tx + cw > maxX) {
-                        tx = left + 14.0f * s;
-                        ty += chipH + 6.0f * s;
-                    }
-                    if (ty + chipH > maxY) break;
-                    if (mx >= tx && mx <= tx + cw && my >= ty && my <= ty + chipH) {
-                        tagSelection_.push_back(tag);
-                        Render();
-                        return 0;
-                    }
-                    tx += cw + 6.0f * s;
+                for (const auto& chip : tagLayout.tagChips) {
+                    if (!rack::PointIn(chip.rect, mx, my)) continue;
+                    auto it = std::find(tagSelection_.begin(), tagSelection_.end(), chip.text);
+                    if (it != tagSelection_.end()) tagSelection_.erase(it);
+                    Render();
+                    LayoutEditors();
+                    return 0;
                 }
             }
             return 0;
         }
 
         if (HitPlus(mx, my)) {
-            OpenCategoryEditor();
+            OpenNoteEditor();
             return 0;
         }
         const D2D1_RECT_F pill = D2D1::RectF(
@@ -2646,11 +3204,12 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
 
         const int chip = HitChip(mx, my);
         if (chip >= 0) {
-            filter_ = chip;
-            scrollY_ = 0.0f;
-            ScrollToShowChip(chip);
-            RebuildShown();
-            Reload(true);
+            /* 先不急着切分类：左右拖动是滚动分类条，松手没拖动才算点击。 */
+            chipPress_ = chip;
+            chipDragging_ = false;
+            chipDragStartX_ = mx;
+            chipDragScrollStart_ = chipScrollX_;
+            SetCapture(hwnd());
             return 0;
         }
 
@@ -2671,7 +3230,10 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                         if (host_ && host_->entry_reveal) host_->entry_reveal(host_->user, entryIndex);
                         break;
                     case 2:
-                        if (entry.kind == SNOWAIR_ENTRY_TEXT && onHangText_) {
+                        if (onHangEntry_) {
+                            onHangEntry_(entry.kind, entry.label, entry.path, entry.thumb);
+                            Close();
+                        } else if (entry.kind == SNOWAIR_ENTRY_TEXT && onHangText_) {
                             onHangText_(entry.label);
                             Close();
                         } else if (entry.kind == SNOWAIR_ENTRY_IMAGE && onHangImage_ &&
@@ -2704,6 +3266,25 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
     case WM_LBUTTONUP: {
         const float mx = static_cast<float>(GET_X_LPARAM(lParam));
         const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        if (chipPress_ >= 0) {
+            const bool wasDragging = chipDragging_;
+            chipPress_ = -1;
+            chipDragging_ = false;
+            if (GetCapture() == hwnd()) ReleaseCapture();
+            if (!wasDragging) {
+                const int chip = HitChip(mx, my);
+                if (chip >= 0) {
+                    filter_ = chip;
+                    scrollY_ = 0.0f;
+                    ScrollToShowChip(chip);
+                    RebuildShown();
+                    Reload(true);
+                }
+            } else {
+                Render();
+            }
+            return 0;
+        }
         if (gearPressed_) {
             gearPressed_ = false;
             if (HitGear(mx, my)) {
@@ -2713,7 +3294,7 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
             return 0;
         }
         if (settingsOpen_ && !categoryEditorOpen_ && HitPlus(mx, my)) {
-            OpenCategoryEditor();
+            OpenNoteEditor();
             return 0;
         }
         if (settingsDrag_ >= 0) {
@@ -2756,6 +3337,35 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
     case WM_MOUSEMOVE: {
         const float mx = static_cast<float>(GET_X_LPARAM(lParam));
         const float my = static_cast<float>(GET_Y_LPARAM(lParam));
+        {
+            D2D1_RECT_F anchor{};
+            const std::wstring tip = TooltipAt(mx, my, &anchor);
+            if (tip != tooltipText_) {
+                tooltipText_ = tip;
+                tooltipAnchor_ = anchor;
+                tooltipX_ = mx;
+                tooltipY_ = my;
+                Render();
+            }
+        }
+        if (!trackingLeave_) {
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd();
+            if (TrackMouseEvent(&tme)) trackingLeave_ = true;
+        }
+        if (deleteConfirm_ >= 0 || tagEditorOpen_ || categoryEditorOpen_ ||
+            noteEditorOpen_) {
+            /* 弹窗打开时鼠标只在弹窗上活动：下面的列表不再跟着悬停，
+               否则会隔着遮罩亮起来，看起来像是点穿到了下层。 */
+            const int button = HitModalButton(mx, my);
+            if (button != hoveredModalButton_) {
+                hoveredModalButton_ = button;
+                Render();
+            }
+            return 0;
+        }
         if (settingsOpen_) {
             if (settingsDrag_ >= 0) {
                 dragX_ = mx;
@@ -2770,10 +3380,28 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
             const int hover = ManagerRowAt(mx, my);
             const bool plus = HitPlus(mx, my) != 0;
             const bool gear = HitGear(mx, my) != 0;
-            if (hover != settingsHover_ || plus != hoveredPlus_ || gear != hoveredGear_) {
+            const bool add = rack::PointIn(SettingsAddRect(), mx, my);
+            if (hover != settingsHover_ || plus != hoveredPlus_ || gear != hoveredGear_ ||
+                add != hoveredSettingsAdd_) {
                 settingsHover_ = hover;
                 hoveredPlus_ = plus;
                 hoveredGear_ = gear;
+                hoveredSettingsAdd_ = add;
+                Render();
+            }
+            return 0;
+        }
+        if (chipPress_ >= 0) {
+            const float dx = mx - chipDragStartX_;
+            if (!chipDragging_ && std::abs(dx) > 6.0f * scale_) {
+                chipDragging_ = true;
+            }
+            if (chipDragging_) {
+                const float available = width_ - 2.0f * kPad * scale_;
+                const float maxScroll = std::max(0.0f, chipContentWidth_ - available);
+                chipScrollX_ =
+                    rack::Clamp(chipDragScrollStart_ - dx, 0.0f, maxScroll);
+                LayoutChips();
                 Render();
             }
             return 0;
@@ -2817,8 +3445,56 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
         Render();
         return 0;
     }
+    case WM_MOUSELEAVE:
+        trackingLeave_ = false;
+        if (!tooltipText_.empty()) {
+            tooltipText_.clear();
+            Render();
+        }
+        return 0;
     case WM_MOUSEACTIVATE:
         return MA_ACTIVATE;
+    case WM_SETCURSOR: {
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd(), &pt);
+        bool hand = false;
+        if (tagEditorOpen_) {
+            const TagEditorLayout layout = BuildTagEditorLayout();
+            hand = rack::PointIn(layout.cancel, static_cast<float>(pt.x), static_cast<float>(pt.y)) ||
+                   rack::PointIn(layout.save, static_cast<float>(pt.x), static_cast<float>(pt.y));
+            for (const auto& chip : layout.catChips) {
+                if (rack::PointIn(chip.rect, static_cast<float>(pt.x), static_cast<float>(pt.y))) {
+                    hand = true;
+                    break;
+                }
+            }
+            for (const auto& chip : layout.tagChips) {
+                if (rack::PointIn(chip.rect, static_cast<float>(pt.x), static_cast<float>(pt.y))) {
+                    hand = true;
+                    break;
+                }
+            }
+        } else if (deleteConfirm_ >= 0 || categoryEditorOpen_ || noteEditorOpen_) {
+            hand = HitModalButton(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0;
+        } else if (!settingsOpen_) {
+            hand = HitPlus(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0 ||
+                   HitGear(static_cast<float>(pt.x), static_cast<float>(pt.y)) ||
+                   HitChip(static_cast<float>(pt.x), static_cast<float>(pt.y)) >= 0 ||
+                   HitRow(static_cast<float>(pt.x), static_cast<float>(pt.y)) >= 0;
+        } else {
+            hand = HitPlus(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0 ||
+                   HitGear(static_cast<float>(pt.x), static_cast<float>(pt.y)) ||
+                   rack::PointIn(SettingsAddRect(), static_cast<float>(pt.x),
+                                 static_cast<float>(pt.y));
+        }
+        if (chipDragging_) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        } else {
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+        }
+        return TRUE;
+    }
     case WM_SETFOCUS:
         return 0;
     case WM_IME_STARTCOMPOSITION:
@@ -2842,7 +3518,8 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            if (tagEditorOpen_) CloseTagEditor(false);
+            if (noteEditorOpen_) CloseNoteEditor(false);
+            else if (tagEditorOpen_) CloseTagEditor(false);
             else if (categoryEditorOpen_) CloseCategoryEditor(false);
             else if (settingsOpen_) CloseSettings();
             else Close();
@@ -2853,6 +3530,11 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_CAPTURECHANGED:
         captured_ = false;
+        if (chipPress_ >= 0) {
+            chipPress_ = -1;
+            chipDragging_ = false;
+            Render();
+        }
         if (settingsDrag_ >= 0) {
             settingsDrag_ = -1;
             settingsDrop_ = -1;

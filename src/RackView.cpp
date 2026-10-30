@@ -315,7 +315,9 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     auto measure = [&]() {
         float total = 0.0f;
         for (size_t i = 0; i < items.size(); ++i) {
-            if (items[i].path.empty() && !items[i].note.empty()) {
+            const bool textCard = items[i].kind == 1 || items[i].kind == 3 ||
+                                  (items[i].kind == 2 && items[i].thumbPath.empty());
+            if (textCard) {
                 widths[i] = kNoteCardWidth * cs + 2.0f * kFrame * cs;
                 heights[i] = kNoteCardHeight * cs + 2.0f * kFrame * cs;
                 total += widths[i];
@@ -1228,6 +1230,65 @@ void RackView::DrawCopyToast(ID2D1RenderTarget* target, float s)
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
+void RackView::DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card, int kind,
+                             float s)
+{
+    /* 只画图标本身，不加底托，避免看起来像一个可以点的按钮。 */
+    const float size = 18.0f * s;
+    const D2D1_RECT_F area = D2D1::RectF(card.left + 7.0f * s,
+                                         card.bottom - 7.0f * s - size,
+                                         card.left + 7.0f * s + size,
+                                         card.bottom - 7.0f * s);
+    ComPtr<ID2D1SolidColorBrush> ink;
+    ComPtr<ID2D1SolidColorBrush> outline;
+    if (FAILED(target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.96f),
+                                             ink.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.35f),
+                                             outline.GetAddressOf()))) {
+        return;
+    }
+    const float edge = 0.9f * s;
+    if (kind == 2) {
+        /* 摄像机：机身 + 右侧镜头三角。 */
+        const float bx = area.left + 3.5f * s;
+        const float by = area.top + 6.2f * s;
+        const float bw = 7.5f * s;
+        const float bh = 5.6f * s;
+        const D2D1_ROUNDED_RECT body =
+            D2D1::RoundedRect(D2D1::RectF(bx, by, bx + bw, by + bh), 1.2f * s, 1.2f * s);
+        target->FillRoundedRectangle(body, ink.Get());
+        target->DrawRoundedRectangle(body, outline.Get(), edge);
+        ComPtr<ID2D1PathGeometry> lens;
+        if (SUCCEEDED(graphics_->d2d()->CreatePathGeometry(lens.GetAddressOf())) && lens) {
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(lens->Open(sink.GetAddressOf())) && sink) {
+                sink->BeginFigure(D2D1::Point2F(bx + bw + 0.8f * s, by + 1.6f * s),
+                                  D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(bx + bw + 4.2f * s, by - 0.4f * s));
+                sink->AddLine(D2D1::Point2F(bx + bw + 4.2f * s, by + bh + 0.4f * s));
+                sink->AddLine(D2D1::Point2F(bx + bw + 0.8f * s, by + bh - 1.6f * s));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                target->FillGeometry(lens.Get(), ink.Get());
+                target->DrawGeometry(lens.Get(), outline.Get(), edge);
+            }
+        }
+    } else {
+        /* 文件夹：主体 + 左上角标签。 */
+        const float bx = area.left + 3.5f * s;
+        const float by = area.top + 5.6f * s;
+        const D2D1_ROUNDED_RECT body = D2D1::RoundedRect(
+            D2D1::RectF(bx, by + 1.6f * s, bx + 11.0f * s, by + 8.4f * s), 1.2f * s,
+            1.2f * s);
+        const D2D1_ROUNDED_RECT tab = D2D1::RoundedRect(
+            D2D1::RectF(bx, by, bx + 4.6f * s, by + 3.0f * s), 1.2f * s, 1.2f * s);
+        target->FillRoundedRectangle(body, ink.Get());
+        target->DrawRoundedRectangle(body, outline.Get(), edge);
+        target->FillRoundedRectangle(tab, ink.Get());
+        target->DrawRoundedRectangle(tab, outline.Get(), edge);
+    }
+}
+
 void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, float s,
                               bool hovered)
 {
@@ -1271,12 +1332,42 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         return;
     }
 
+    /* 录屏无封面 / 文件：纯色卡片 + 文字 + 左下角类型图标。 */
     const bool isNoteCard = item.path.empty() && !item.note.empty();
-    if (!isNoteCard) {
-        target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), fill.Get());
-    }
+    const bool plainCard = item.kind == 3 || (item.kind == 2 && !item.thumb.valid());
+    if (plainCard) {
+        const D2D1_COLOR_F cardColor =
+            item.kind == 3 ? D2D1::ColorF(0.24f, 0.30f, 0.42f)
+                           : D2D1::ColorF(0.31f, 0.29f, 0.25f);
+        ComPtr<ID2D1SolidColorBrush> plain;
+        ComPtr<ID2D1SolidColorBrush> ink;
+        if (SUCCEEDED(target->CreateSolidColorBrush(cardColor, plain.GetAddressOf())) &&
+            SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.96f, 0.97f),
+                                                    ink.GetAddressOf()))) {
+            target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius),
+                                         fill.Get());
+            /* 和图片卡一样留一圈同样粗细的白框，再填纯色内容。 */
+            const D2D1_RECT_F inner = rack::Inset(rect, kFrame * s, kFrame * s);
+            target->FillRoundedRectangle(
+                D2D1::RoundedRect(inner, std::max(2.0f * s, radius - kFrame * s),
+                                  std::max(2.0f * s, radius - kFrame * s)),
+                plain.Get());
+            const std::wstring& text = item.label.empty() ? item.note : item.label;
+            if (noteFormat_ && !text.empty()) {
+                target->DrawText(
+                    text.c_str(), static_cast<UINT32>(text.size()), noteFormat_.Get(),
+                    rack::Inset(inner, 10.0f * s, 12.0f * s), ink.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            DrawTypeBadge(target, inner, item.kind, s);
+        }
+    } else {
+        if (!isNoteCard) {
+            target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius),
+                                         fill.Get());
+        }
 
-    D2D1_RECT_F imageRect = rack::Inset(rect, kFrame * s, kFrame * s);
+        D2D1_RECT_F imageRect = rack::Inset(rect, kFrame * s, kFrame * s);
     const bool textCard = item.path.empty() && !item.note.empty();
     if (textCard) {
         const float sw = (rect.right - rect.left) / 496.0f;
@@ -1363,6 +1454,10 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         }
     }
 
+    }
+    }
+    if (item.kind == 2) {
+        DrawTypeBadge(target, rect, item.kind, s);
     }
     if (!isNoteCard) {
         target->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), border.Get(),
@@ -1540,6 +1635,18 @@ RackHit RackView::HitTest(float x, float y, float scale) const
             hit.part = RackPart::Note;
             hit.index = i;
             return hit;
+        }
+        {
+            /* 夹子：卡片顶部中间、绳子附近的一小块，点它把图片贴到桌面。 */
+            const float cx = (box.card.left + box.card.right) * 0.5f;
+            const D2D1_RECT_F clipRect =
+                D2D1::RectF(cx - 10.0f * s, box.pinTop - 10.0f * s, cx + 10.0f * s,
+                            box.card.top + 2.0f * s);
+            if (rack::PointIn(clipRect, local.x, local.y)) {
+                hit.part = RackPart::Clip;
+                hit.index = i;
+                return hit;
+            }
         }
         if (rack::PointIn(box.card, local.x, local.y)) {
             hit.part = RackPart::Card;

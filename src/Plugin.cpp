@@ -1,10 +1,12 @@
 #include "Plugin.h"
 
 #include "NoteStore.h"
+#include "PinWindow.h"
 #include "RackWindow.h"
 #include "Util.h"
 
 #include <cstdarg>
+#include <filesystem>
 
 namespace {
 
@@ -106,8 +108,11 @@ bool Plugin::Init(const SnowAirHost* host)
         clipboard_.reset();
     } else {
         clipboard_->SetOnClosed([this]() { clipboardClosedTick_ = rack::NowMs(); });
-    clipboard_->SetOnHangText([this](const std::wstring& text) { OnHangText(text); });
-    clipboard_->SetOnHangImage([this](const std::wstring& path) { OnHangImage(path); });
+        clipboard_->SetOnHangText([this](const std::wstring& text) { OnHangText(text); });
+        clipboard_->SetOnHangImage([this](const std::wstring& path) { OnHangImage(path); });
+        clipboard_->SetOnHangEntry(
+            [this](int kind, const std::wstring& label, const std::wstring& path,
+                   const std::wstring& thumb) { OnHangEntry(kind, label, path, thumb); });
     }
 
     initialized_ = true;
@@ -129,6 +134,10 @@ void Plugin::Shutdown()
         SaveItems();
         window_->Shutdown();
         window_.reset();
+    }
+    if (pinWindow_) {
+        pinWindow_->ClosePin();
+        pinWindow_.reset();
     }
     items_.clear();
     if (graphics_) {
@@ -249,11 +258,157 @@ void Plugin::OnHangImage(const std::wstring& path)
     SaveItems();
 }
 
+void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
+                         const std::wstring& thumb)
+{
+    if (!initialized_) return;
+    Item item;
+    item.id = nextId_++;
+    item.addedMs = 0;
+    item.label = label;
+    if (kind == SNOWAIR_ENTRY_TEXT) {
+        if (label.empty()) return;
+        item.kind = 1; /* 便签 */
+        item.note = label;
+        item.noteColor = 2;
+        item.aspect = 1.1f;
+    } else if (kind == SNOWAIR_ENTRY_IMAGE) {
+        if (path.empty()) return;
+        item.kind = 0;
+        item.path = util::FullPath(path);
+        item.sourcePath = item.path;
+        item.mtime = util::FileWriteTime(item.path);
+        for (const auto& existing : items_) {
+            if (existing.kind == 0 && util::SamePath(existing.path, item.path)) {
+                if (window_) window_->Expand(true);
+                return;
+            }
+        }
+        UINT width = 0, height = 0;
+        if (graphics_ && SUCCEEDED(graphics_->images().GetSize(item.path, width, height)) &&
+            width > 0 && height > 0) {
+            item.aspect = static_cast<float>(width) / static_cast<float>(height);
+        } else {
+            item.aspect = 1.4f;
+        }
+    } else if (kind == SNOWAIR_ENTRY_MEDIA) {
+        /* 录屏：优先用封面，没封面就退化成纯文字卡片。 */
+        item.kind = 2;
+        item.aspect = 16.0f / 9.0f;
+        if (!path.empty()) {
+            item.path = util::FullPath(path);
+            item.sourcePath = item.path;
+            item.mtime = util::FileWriteTime(item.path);
+        }
+        const std::wstring cover = thumb.empty() ? std::wstring() : util::FullPath(thumb);
+        if (!cover.empty() && util::FileExists(cover)) {
+            item.thumbPath = cover;
+            UINT width = 0, height = 0;
+            if (graphics_ &&
+                SUCCEEDED(graphics_->images().GetSize(cover, width, height)) &&
+                width > 0 && height > 0) {
+                item.aspect = static_cast<float>(width) / static_cast<float>(height);
+            }
+        }
+        for (const auto& existing : items_) {
+            if (existing.kind == 2 && !item.path.empty() &&
+                util::SamePath(existing.path, item.path)) {
+                if (window_) window_->Expand(true);
+                return;
+            }
+        }
+    } else {
+        /* 文件 / 其他：纯色卡片 + 文件夹图标，文字用条目名。 */
+        item.kind = 3;
+        item.aspect = 1.4f;
+        if (!path.empty()) {
+            item.path = util::FullPath(path);
+            item.sourcePath = item.path;
+            item.mtime = util::FileWriteTime(item.path);
+        }
+        if (item.label.empty() && !item.path.empty()) {
+            item.label = std::filesystem::path(item.path).filename().wstring();
+        }
+        if (item.label.empty()) return;
+    }
+
+    items_.push_back(std::move(item));
+    while (static_cast<int>(items_.size()) > config_.maxItems) {
+        RemoveItemData(0);
+    }
+    if (window_) {
+        window_->OnItemsChanged(true);
+    }
+    SaveItems();
+}
+
+void Plugin::PinItemToDesktop(int index)
+{
+    if (index < 0 || index >= static_cast<int>(items_.size())) {
+        return;
+    }
+    const Item& item = items_[static_cast<size_t>(index)];
+    if (item.kind != 0 || item.path.empty()) {
+        return;
+    }
+    /* 优先调用宿主导出的原生贴图（带落下动效）；旧宿主没有该导出时再退回内置窗口。 */
+    using PinImageFileFn = void (*)(const wchar_t*);
+    static PinImageFileFn hostPin = []() -> PinImageFileFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinImageFileFn>(
+                          GetProcAddress(host, "SnowAirPinImageFile"))
+                    : nullptr;
+    }();
+    if (hostPin) {
+        hostPin(item.path.c_str());
+        return;
+    }
+    if (!graphics_) {
+        return;
+    }
+    if (!pinWindow_) {
+        pinWindow_ = std::make_unique<PinWindow>();
+    }
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    if (!pinWindow_->Open(graphics_.get(), item.path, cursor)) {
+        RackLog(L"PinWindow: failed to pin %s", item.path.c_str());
+    }
+}
+
+void Plugin::PinImageFile(const std::wstring& path)
+{
+    if (path.empty()) {
+        return;
+    }
+    using PinImageFileFn = void (*)(const wchar_t*);
+    static PinImageFileFn hostPin = []() -> PinImageFileFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinImageFileFn>(
+                          GetProcAddress(host, "SnowAirPinImageFile"))
+                    : nullptr;
+    }();
+    if (hostPin) {
+        hostPin(path.c_str());
+        return;
+    }
+    if (!graphics_) {
+        return;
+    }
+    if (!pinWindow_) {
+        pinWindow_ = std::make_unique<PinWindow>();
+    }
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    pinWindow_->Open(graphics_.get(), path, cursor);
+}
+
 void Plugin::OnHangText(const std::wstring& text)
 {
     if (!initialized_ || text.empty()) return;
     Item item;
     item.id = nextId_++;
+    item.kind = 1; /* 便签 */
     item.note = text;
     item.noteColor = 2; /* yellow sticky note */
     item.aspect = 1.1f;

@@ -6,7 +6,7 @@
 
 class Graphics;
 
-enum class RackPart { None, Line, Background, Card, Note, Close, Lock, Basket, Envelope };
+enum class RackPart { None, Line, Background, Card, Note, Close, Lock, Basket, Envelope, Clip };
 
 struct RackHit {
     RackPart part = RackPart::None;
@@ -83,6 +83,9 @@ private:
                   const Theme& theme, float scale, float swayAngle);
     void DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Theme& theme,
                  float scale);
+    /* 卡片左下角的类型角标：2=录屏，3=文件。 */
+    void DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card, int kind,
+                       float scale);
     void DrawClipAt(ID2D1RenderTarget* target, float centerX, float clipTop, const Theme& theme,
                     float scale, float heightDips = 24.0f);
     void DrawAccessories(ID2D1RenderTarget* target, const std::vector<Item>& items,

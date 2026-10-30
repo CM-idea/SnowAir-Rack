@@ -190,6 +190,22 @@ bool CopyText(const std::wstring& text)
     return ok;
 }
 
+bool CopyFilePath(const std::wstring& path)
+{
+    if (!util::FileExists(path)) {
+        return false;
+    }
+    if (!OpenClipboard(nullptr)) {
+        return false;
+    }
+    bool ok = false;
+    if (EmptyClipboard()) {
+        ok = SetClipboardData(CF_HDROP, MakeDropHandle(path)) != nullptr;
+    }
+    CloseClipboard();
+    return ok;
+}
+
 bool CopyImage(const std::wstring& path)
 {
     if (!util::FileExists(path)) {

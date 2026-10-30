@@ -28,6 +28,10 @@ public:
     void SetOnClosed(std::function<void()> callback) { onClosed_ = std::move(callback); }
     void SetOnHangText(std::function<void(const std::wstring&)> callback) { onHangText_ = std::move(callback); }
     void SetOnHangImage(std::function<void(const std::wstring&)> callback) { onHangImage_ = std::move(callback); }
+    void SetOnHangEntry(std::function<void(int, const std::wstring&, const std::wstring&,
+                                           const std::wstring&)> callback) {
+        onHangEntry_ = std::move(callback);
+    }
 
 protected:
     void Paint(ID2D1RenderTarget* target) override;
@@ -65,6 +69,10 @@ private:
         ComPtr<ID2D1SolidColorBrush> dim;
         ComPtr<ID2D1SolidColorBrush> contentBorder;
         ComPtr<ID2D1SolidColorBrush> chipBg;
+        ComPtr<ID2D1SolidColorBrush> searchBg;
+        ComPtr<ID2D1SolidColorBrush> iconBg;
+        ComPtr<ID2D1SolidColorBrush> iconHover;
+        ComPtr<ID2D1SolidColorBrush> iconSelected;
         ComPtr<ID2D1SolidColorBrush> hoverBg;
         ComPtr<ID2D1SolidColorBrush> tagBg;
         ComPtr<ID2D1SolidColorBrush> tagHover;
@@ -73,6 +81,11 @@ private:
         ComPtr<ID2D1SolidColorBrush> selectedBg;
         ComPtr<ID2D1SolidColorBrush> success;
         ComPtr<ID2D1SolidColorBrush> danger;
+        ComPtr<ID2D1SolidColorBrush> dangerHover;
+        ComPtr<ID2D1SolidColorBrush> primaryHover;
+        ComPtr<ID2D1SolidColorBrush> modalCard;
+        ComPtr<ID2D1SolidColorBrush> modalBorder;
+        ComPtr<ID2D1SolidColorBrush> modalShadow;
         ComPtr<ID2D1SolidColorBrush> insertion;
         ComPtr<ID2D1SolidColorBrush> disabledBg;
         ComPtr<ID2D1SolidColorBrush> onDanger;
@@ -105,6 +118,8 @@ private:
     int HitPlus(float x, float y) const;
     int HitAction(float x, float y, int row) const;
     int HitTagChip(float x, float y, int row) const;
+    /* 1 = 取消, 2 = 确定, 3 = 删除, 4 = 添加标签; 0 = 未命中任何弹窗按钮. */
+    int HitModalButton(float x, float y) const;
     std::wstring TypeTagFor(const Entry& entry) const;
 
     /* ---- painting ---- */
@@ -114,12 +129,48 @@ private:
     void PaintEmptyState(ID2D1RenderTarget* target, const Brushes& b);
 
     /* ---- interaction ---- */
+    /* 分类与标签弹窗：完全套用 SnowAir「自定义标签」弹窗的布局与交互。
+       标签以 chip 形式内联在输入框里，空格成词、退格删 chip。 */
+    struct TagChipRect {
+        D2D1_RECT_F rect{};
+        int index = -1;       /* catChips：categories_ 下标 */
+        std::wstring text;
+    };
+    struct TagEditorLayout {
+        D2D1_RECT_F card{};
+        D2D1_RECT_F title{};
+        D2D1_RECT_F labelCats{};
+        D2D1_RECT_F labelTags{};
+        D2D1_RECT_F field{};
+        D2D1_RECT_F edit{};   /* 输入框在 field 里的内联位置 */
+        D2D1_RECT_F cancel{};
+        D2D1_RECT_F save{};
+        std::vector<TagChipRect> catChips;
+        std::vector<TagChipRect> tagChips;
+    };
+    TagEditorLayout BuildTagEditorLayout() const;
+    void CommitTagText();
     void OpenTagEditor(int entryIndex);
     void CloseTagEditor(bool save);
     void OpenCategoryEditor();
     void CloseCategoryEditor(bool save);
-    void AddTypedTag();
+    /* 新建便签：搜索栏的 + 打开，输入文字后点完成直接上绳。 */
+    struct NoteEditorLayout {
+        D2D1_RECT_F card{};
+        D2D1_RECT_F title{};
+        D2D1_RECT_F field{};
+        D2D1_RECT_F cancel{};
+        D2D1_RECT_F save{};
+    };
+    NoteEditorLayout BuildNoteEditorLayout() const;
+    void OpenNoteEditor();
+    void CloseNoteEditor(bool save);
     void LayoutEditors();
+    /* 弹窗/分类设置打开时把搜索框的 EDIT 窗口藏起来，否则它会浮在遮罩上面。 */
+    void UpdateSearchEditVisibility();
+    void ClearHover();
+    /* 悬停提示：根据鼠标位置返回当前控件的提示文字，空串表示不显示。 */
+    std::wstring TooltipAt(float x, float y, D2D1_RECT_F* anchor) const;
     void ScrollToShowChip(int chip);
     void EnsureRowVisible(int row);
     std::vector<int> ActionsFor(const Entry& entry) const;
@@ -144,10 +195,21 @@ private:
     static LRESULT CALLBACK ModalEditProc(HWND hwnd, UINT message, WPARAM wParam,
                                           LPARAM lParam);
 
+    /* ---- note editor (multi-line) ---- */
+    HWND noteEdit_ = nullptr;
+    WNDPROC noteEditOldProc_ = nullptr;
+    bool noteEditorOpen_ = false;
+    void CreateNoteEdit();
+    void DestroyNoteEdit();
+    static LRESULT CALLBACK NoteEditProc(HWND hwnd, UINT message, WPARAM wParam,
+                                         LPARAM lParam);
+
     /* ---- state ---- */
     std::function<void()> onClosed_;
     std::function<void(const std::wstring&)> onHangText_;
     std::function<void(const std::wstring&)> onHangImage_;
+    std::function<void(int, const std::wstring&, const std::wstring&, const std::wstring&)>
+        onHangEntry_;
     const SnowAirHost* host_ = nullptr;
     Theme theme_;
     float scale_ = 1.0f;
@@ -168,6 +230,11 @@ private:
     std::vector<D2D1_RECT_F> chipRects_;
     float chipScrollX_ = 0.0f;
     float chipContentWidth_ = 0.0f;
+    /* 分类条左右拖拽：按下先记录，移动超过阈值才算拖拽，松手未拖拽才切换分类。 */
+    int chipPress_ = -1;
+    bool chipDragging_ = false;
+    float chipDragStartX_ = 0.0f;
+    float chipDragScrollStart_ = 0.0f;
 
     std::wstring query_;
     bool searchFocused_ = false;
@@ -184,6 +251,13 @@ private:
     int hoveredTag_ = -1;
     bool hoveredPlus_ = false;
     bool hoveredGear_ = false;
+    int hoveredModalButton_ = 0;
+    std::wstring tooltipText_;
+    float tooltipX_ = 0.0f;
+    float tooltipY_ = 0.0f;
+    D2D1_RECT_F tooltipAnchor_{};
+    bool trackingLeave_ = false;
+    bool searchEditVisible_ = false;
     bool gearPressed_ = false;
     bool captured_ = false;
 
@@ -214,6 +288,8 @@ private:
     bool settingsDropAfter_ = false;
     int renamingCategory_ = -1;
     int settingsHover_ = -1;
+    bool hoveredSettingsAdd_ = false;
+    D2D1_RECT_F SettingsAddRect() const;
     ULONGLONG lastCategoryClick_ = 0;
     int lastCategoryRow_ = -1;
     float dragX_ = 0.0f;

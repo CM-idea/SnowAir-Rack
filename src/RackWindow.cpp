@@ -479,6 +479,11 @@ void RackWindow::Animate()
         return;
     }
     const uint64_t now = rack::NowMs();
+    if (!pendingPinPath_.empty() && now >= pendingPinAt_) {
+        const std::wstring path = std::move(pendingPinPath_);
+        pendingPinPath_.clear();
+        if (plugin_) plugin_->PinImageFile(path);
+    }
     if (pendingAdjustId_ >= 0 && now >= pendingAdjustAt_) {
         const int id = pendingAdjustId_;
         pendingAdjustId_ = -1;
@@ -551,7 +556,7 @@ void RackWindow::Animate()
         std::abs(cardHover_ - cardHoverTarget_) < 0.003f && paperSettled;
     if (!animating_ && offsetAnims_.empty() && pendingAdjustId_ < 0 &&
         now >= swingUntil_ && hoverSettled && !view_.HasRemoved() &&
-        !view_.HasArrival()) {
+        !view_.HasArrival() && pendingPinPath_.empty()) {
         if (hideWhenRemovalsDone_ && plugin_->items().empty()) {
             hideWhenRemovalsDone_ = false;
             if (plugin_->config().autoRetract) {
@@ -681,6 +686,11 @@ void RackWindow::Tick()
     if (plugin_->ClipboardOpen()) {
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
+        /* The panel is anchored at the envelope and overlaps the rope strip.
+           Let the rack ignore the mouse entirely while it is open, otherwise
+           the rope window steals clicks meant for the panel (the search bar
+           '+' is right inside the overlap). */
+        SetClickThrough(true);
         lastInside_ = rack::NowMs();
         return;
     }
@@ -893,7 +903,8 @@ void RackWindow::UpdateClickThrough(const RackHit& hit)
         expand_ > 0.9f && hit.part != RackPart::None &&
         (hit.part == RackPart::Card || hit.part == RackPart::Note ||
          hit.part == RackPart::Close || hit.part == RackPart::Lock ||
-         hit.part == RackPart::Basket || hit.part == RackPart::Envelope);
+         hit.part == RackPart::Basket || hit.part == RackPart::Envelope ||
+         hit.part == RackPart::Clip);
     const bool keepMouse = mouseDown_ || dragStarted_;
     SetClickThrough(!keepMouse && !interactive);
 }
@@ -934,8 +945,13 @@ void RackWindow::UpdatePreview()
             }
         }
         if (!preview_.showing() && now - hoveredSince_ >= kPreviewDelayMs &&
-            plugin_->HoverPreviewEnabled()) {
-            ShowPreviewFor(index);
+            plugin_->HoverPreviewEnabled() && index >= 0 &&
+            index < static_cast<int>(plugin_->items().size())) {
+            const Item& hoverItem = plugin_->items()[static_cast<size_t>(index)];
+            const bool previewable =
+                hoverItem.kind == 0 ||
+                (hoverItem.kind == 2 && !hoverItem.thumbPath.empty());
+            if (previewable) ShowPreviewFor(index);
         } else if (preview_.showing() && previewIndex_ == index) {
             RECT anchor{};
             const POINT origin = screenOrigin();
@@ -1162,10 +1178,14 @@ void RackWindow::CopyItem(int index)
         return;
     }
     const Item& copyItem = plugin_->items()[index];
-    if (copyItem.path.empty() && !copyItem.note.empty()) {
+    if (copyItem.kind == 1) {
         clipboard::CopyText(copyItem.note);
-    } else {
+    } else if (copyItem.kind == 0) {
         clipboard::CopyImage(copyItem.path);
+    } else if (!copyItem.path.empty()) {
+        clipboard::CopyFilePath(copyItem.path);
+    } else {
+        clipboard::CopyText(copyItem.label);
     }
     view_.ShowCopyToast(index, rack::NowMs() + 900);
     if (hwnd()) {
@@ -1539,8 +1559,16 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
             continue;
         }
         item.thumbAttempted = true;
+        if (item.kind == 1 || item.kind == 3) {
+            continue;   /* 便签 / 文件卡片没有图片 */
+        }
+        if (item.kind == 2 && item.thumbPath.empty()) {
+            continue;   /* 录屏没有封面：退化成纯文字卡片 */
+        }
+        const std::wstring& source =
+            (item.kind == 2 && !item.thumbPath.empty()) ? item.thumbPath : item.path;
         UINT w = 0, h = 0;
-        if (SUCCEEDED(graphics_->images().GetSize(item.path, w, h)) && w > 0 && h > 0) {
+        if (SUCCEEDED(graphics_->images().GetSize(source, w, h)) && w > 0 && h > 0) {
             const float aspect = static_cast<float>(w) / static_cast<float>(h);
             if (std::abs(aspect - item.aspect) > 0.01f) {
                 item.aspect = aspect;
@@ -1550,7 +1578,7 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
         /* The card image is only ~140 DIP wide. Downscale once with WIC Fant
            close to its display size instead of letting D2D minify a 640px
            thumbnail at draw time, which turns thin UI lines into mush. */
-        graphics_->images().Load(item.path, 192.0f * scale_, target, item.thumb);
+        graphics_->images().Load(source, 192.0f * scale_, target, item.thumb);
     }
 }
 
@@ -1703,12 +1731,27 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             SetCapture(hwnd());
             SetTimer(hwnd(), kTimerLongPress, 560, nullptr);
             Render();
+        } else if (hit.part == RackPart::Clip) {
+            if (hit.index < 0 || hit.index >= static_cast<int>(plugin_->items().size())) {
+                return 0;
+            }
+            pressed_ = hit.index;
+            pressItemId_ = plugin_->items()[hit.index].id;
+            pressedPart_ = RackPart::Clip;
+            mouseDown_ = true;
+            dragStarted_ = false;
+            pressPoint_ = point;
+            SetCapture(hwnd());
+            Render();
         }
         return 0;
     }
 
     case WM_MOUSEMOVE: {
         if (!mouseDown_ || dragStarted_ || !plugin_) {
+            return 0;
+        }
+        if (pressedPart_ == RackPart::Clip) {
             return 0;
         }
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -1793,6 +1836,26 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         mouseDown_ = false;
         KillTimer(hwnd(), kTimerLongPress);
         ReleaseCapture();
+        if (pressedPart_ == RackPart::Clip) {
+            const int dx = std::abs(point.x - pressPoint_.x);
+            const int dy = std::abs(point.y - pressPoint_.y);
+            if (dx <= 6 * scale_ && dy <= 6 * scale_) {
+                const int index = plugin_->IndexById(pressItemId_);
+                if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
+                    const Item& item = plugin_->items()[static_cast<size_t>(index)];
+                    if (item.kind == 0 && !item.path.empty()) {
+                        /* 卡片完全落下去之后再贴到桌面。 */
+                        pendingPinPath_ = item.path;
+                        pendingPinAt_ = rack::NowMs() + 560;
+                        RemoveItem(index, false);
+                    }
+                }
+            }
+            pressed_ = -1;
+            pressedPart_ = RackPart::None;
+            Render();
+            return 0;
+        }
         if (cardDragging_) {
             cardDragging_ = false;
             pressed_ = -1;

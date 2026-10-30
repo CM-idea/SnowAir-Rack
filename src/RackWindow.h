@@ -169,6 +169,9 @@ private:
     std::vector<OffsetAnim> offsetAnims_;
     int pendingAdjustId_ = -1;
     uint64_t pendingAdjustAt_ = 0;
+    /* 点夹子贴图：等卡片下落动画走一半，再触发原生贴图。 */
+    std::wstring pendingPinPath_;
+    uint64_t pendingPinAt_ = 0;
 
     void FinishCardDrag(int id);
     void NormalizeLoadedSpacing();

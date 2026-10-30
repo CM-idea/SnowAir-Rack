@@ -120,8 +120,10 @@ void PreviewWindow::ShowItem(const Item& item, const D2D1_RECT_F& cardScreen,
     scale_ = scale;
     EnsureFormat(scale);
 
-    if (!util::SamePath(loadedPath_, item.path)) {
-        loadedPath_ = item.path;
+    const std::wstring previewPath =
+        (item.kind == 2 && !item.thumbPath.empty()) ? item.thumbPath : item.path;
+    if (!util::SamePath(loadedPath_, previewPath)) {
+        loadedPath_ = previewPath;
         attempted_ = false;
         preview_.Reset();
         scrollY_ = 0;
@@ -227,7 +229,9 @@ void PreviewWindow::BeforeDraw(ID2D1RenderTarget* target)
         return;
     }
     attempted_ = true;
-    graphics_->images().Load(item_->path, 2200.0f * scale_, target, preview_);
+    const std::wstring path =
+        (item_->kind == 2 && !item_->thumbPath.empty()) ? item_->thumbPath : item_->path;
+    graphics_->images().Load(path, 2200.0f * scale_, target, preview_);
 }
 
 void PreviewWindow::Paint(ID2D1RenderTarget* target)
