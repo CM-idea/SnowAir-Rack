@@ -189,6 +189,10 @@ Theme Theme::HostUi(const SnowAirHost* host, void* user)
     if (theme.accent.a < 0.01f) theme.accent = fallback.accent;
     if (theme.contentBorder.a < 0.01f) theme.contentBorder = fallback.contentBorder;
     if (theme.card.a < 0.01f) theme.card = fallback.card;
+    // 以宿主实际背景亮度判断明暗，而不是只看系统 is_dark：
+    // 系统深色 + 轻雪浅色主题时，前者会把卡片底判成深色，黑字就看不见了。
+    const float bgLum = 0.2126f * theme.bg.r + 0.7152f * theme.bg.g + 0.0722f * theme.bg.b;
+    theme.dark = bgLum < 0.5f;
     return theme;
 }
 
