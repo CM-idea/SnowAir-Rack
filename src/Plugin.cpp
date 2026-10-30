@@ -241,7 +241,9 @@ void Plugin::OnHangImage(const std::wstring& path)
         RemoveItemData(0);
     }
     if (window_) {
-        window_->Expand(true);
+        /* OnItemsChanged starts the arrival flight and expands the rack itself.
+           Expanding first rendered the new card at its final spot for a frame,
+           then yanked it back to the cursor, which read as a flicker. */
         window_->OnItemsChanged(true);
     }
     SaveItems();
@@ -261,7 +263,6 @@ void Plugin::OnHangText(const std::wstring& text)
         RemoveItemData(0);
     }
     if (window_) {
-        window_->Expand(true);
         window_->OnItemsChanged(true);
     }
     SaveItems();

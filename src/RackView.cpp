@@ -18,6 +18,9 @@ constexpr float kNoteHeight = 24.0f;
 constexpr float kFrame = 4.0f;
 constexpr float kOuterPad = 24.0f;
 constexpr float kAccessoryWidth = 260.0f;
+/* Length of the capture/note flight onto the rope, shared by Layout, Draw and
+   HasArrival so the hand-off to the resting card happens on exactly one frame. */
+constexpr float kArrivalSeconds = 0.65f;
 
 struct NotePalette {
     D2D1_COLOR_F fill;
@@ -500,6 +503,16 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     const bool expanded = expandAmount > 0.01f;
     lastHovered_ = hovered;
 
+    /* Retire a finished flight before any card is painted. Clearing the index
+       inside DrawArrival used to leave the incoming card undrawn for one whole
+       frame: it was skipped by drawGroup (still "arriving") and then skipped
+       again by DrawArrival (already "landed"), which showed up as a one-frame
+       blink the moment the picture/note settled on the rope. */
+    if (arrivalIndex_ >= 0 && (arrivalIndex_ >= static_cast<int>(cards_.size()) ||
+                               !HasArrival())) {
+        arrivalIndex_ = -1;
+    }
+
     if (expanded && layout.content.right > layout.content.left &&
         layout.content.bottom > layout.content.top) {
         ComPtr<ID2D1SolidColorBrush> hit;
@@ -657,7 +670,7 @@ void RackView::SetArrivalStart(float x, float y, float w, float h)
 bool RackView::HasArrival() const
 {
     return arrivalIndex_ >= 0 &&
-           rack::NowMs() - arrivalStartMs_ < 650;
+           static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f < kArrivalSeconds;
 }
 
 void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, const Theme& theme,
@@ -668,12 +681,10 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, const Th
         return;
     }
     const float age = static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f;
-    if (age >= 0.65f) {
-        arrivalIndex_ = -1;
-        return;
-    }
     const CardBox& targetBox = cards_[static_cast<size_t>(arrivalIndex_)];
-    const float raw = rack::Clamp(age / 0.65f, 0.0f, 1.0f);
+    /* Never bail out without painting: Draw() already skipped this card in the
+       normal pass, so returning here would blink it out for one frame. */
+    const float raw = rack::Clamp(age / kArrivalSeconds, 0.0f, 1.0f);
     const float t = raw < 0.5f ? 4.0f * raw * raw * raw
                                : 1.0f - std::pow(-2.0f * raw + 2.0f, 3.0f) * 0.5f;
     const float targetW = targetBox.card.right - targetBox.card.left;
