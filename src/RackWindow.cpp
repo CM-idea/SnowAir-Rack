@@ -32,7 +32,7 @@ bool RecyclePath(const std::wstring& path)
     return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
 }
 
-/* PicRope's SpringMotion, integrated from the current state. */
+/* 弹簧积分器：用当前位置和速度步进，和常见的 SpringMotion 形式一致。 */
 void StepSpring(float& position, float& velocity, float target, float dt, float response,
                 float damping)
 {
@@ -143,7 +143,7 @@ void RackWindow::OnItemsChanged(bool added)
         batchMenu_.Close();
         menuOpen_ = false;
         if (view_.HasRemoved()) {
-            // Let the last card finish flying into the basket before folding.
+            // 等最后一张卡片飞进篮子再收起。
             hideWhenRemovalsDone_ = true;
             EnsureVisible();
             if (expand_ < 0.9f) {
@@ -356,9 +356,8 @@ void RackWindow::FinishCardDrag(int id)
 
     const float gap = view_.DefaultGap();
     std::vector<std::pair<int, float>> changes;
-    // Reflow strictly left-to-right. Each card gets its own default gap from
-    // the card already placed before it; this cannot leave an overlap behind
-    // no matter how many cards were moved during the drag.
+    // 严格从左往右重排：每张卡和它前面那张保持各自的默认间距，
+    // 这样无论拖动过程中有几张卡被挪过，都不会留下重叠。
     float previousRight = 0.0f;
     bool first = true;
     for (const auto& entry : order) {
@@ -385,7 +384,7 @@ void RackWindow::FinishCardDrag(int id)
     const float maxLeft = view_.layout().width - width - margin;
     const float wantedLeft = baseLeft + draggedTarget;
     draggedTarget += rack::Clamp(wantedLeft, margin, std::max(margin, maxLeft)) - wantedLeft;
-    // Only the no-conflict case gets the soft magnetic centre.
+    // 只有不冲突的情况才吸附到磁吸中心。
     if (changes.empty() && std::abs(draggedTarget) <= 36.0f * scale_) {
         draggedTarget = 0.0f;
     }
@@ -425,8 +424,7 @@ void RackWindow::ToggleVisibility()
         return;
     }
     EnsureVisible();
-    // Keep it down until the pointer actually visits the rack; only then does
-    // leaving it start the normal auto-hide countdown.
+    // 在指针真正到达晾衣架之前保持收起；之后离开才按常规计时隐藏。
     hotkeyPinned_ = true;
     Expand(false);
 }
@@ -535,18 +533,10 @@ void RackWindow::Animate()
     StepSpring(basketHover_, basketHoverVelocity_, basketHoverTarget_, dt, 0.50f, 0.50f);
     StepSpring(cardHover_, cardHoverVelocity_, cardHoverTarget_, dt, 0.30f, 0.60f);
 
-    bool paperSettled = true;
-    for (int i = 0; i < 3; ++i) {
-        const float target =
-            (envelopeHoverTarget_ > 0.5f &&
-             now >= envelopeEnterMs_ + static_cast<uint64_t>(i * 45))
-                ? 1.0f
-                : 0.0f;
-        StepSpring(paperPos_[i], paperVelocity_[i], target, dt, 0.38f, 0.80f);
-        if (std::abs(paperPos_[i] - target) >= 0.003f) {
-            paperSettled = false;
-        }
-    }
+    /* 信封里那张纸只有一层，弹簧也就只跟一个值。 */
+    const float paperTarget = envelopeHoverTarget_ > 0.5f ? 1.0f : 0.0f;
+    StepSpring(paperPos_, paperVelocity_, paperTarget, dt, 0.38f, 0.80f);
+    const bool paperSettled = std::abs(paperPos_ - paperTarget) < 0.003f;
 
     Reposition();
     Render();
@@ -601,8 +591,7 @@ void RackWindow::Reposition()
     const int width = std::max(1, static_cast<int>(std::lround(layout.width)));
     int height = std::max(1, static_cast<int>(std::lround(layout.height)));
     if (view_.HasFalling() || view_.HasArrival()) {
-        // Falling/arriving cards use the full work area so the layered window
-        // never clips their flight.
+        // 掉落/飞行中的卡片要用整个工作区，分层窗口才不会把飞行裁掉。
         height = std::max(height, static_cast<int>(work.bottom - work.top));
     }
     const int x = work.left;
@@ -663,8 +652,8 @@ void RackWindow::Tick()
     const bool hostMenuOpen = plugin_->MenuOpen();
     if (hostMenuWasOpen_ && !hostMenuOpen) {
         hostMenuWasOpen_ = false;
-        // Also unhooks PinMenu's low-level mouse hook if it outlived the
-        // visible popup; otherwise it can keep swallowing desktop clicks.
+        // 同时把 PinMenu 的低级鼠标钩子摘掉（如果它比弹窗活得久的话），
+        // 否则它会一直吞掉桌面上的点击。
         plugin_->CloseMenu();
         // 常驻模式不因菜单关闭而自动收回。
         if (plugin_->config().autoRetract) {
@@ -677,8 +666,7 @@ void RackWindow::Tick()
         hostMenuWasOpen_ = true;
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
-        // The popup is its own window. Let clicks outside it pass through to
-        // the desktop instead of the full-width rack window swallowing them.
+        // 弹窗是独立窗口：让它外面的点击穿到桌面，而不是被全宽的晾衣架窗口吃掉。
         SetClickThrough(true);
         lastInside_ = rack::NowMs();
         return;
@@ -686,11 +674,27 @@ void RackWindow::Tick()
     if (plugin_->ClipboardOpen()) {
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
-        /* The panel is anchored at the envelope and overlaps the rope strip.
-           Let the rack ignore the mouse entirely while it is open, otherwise
-           the rope window steals clicks meant for the panel (the search bar
-           '+' is right inside the overlap). */
-        SetClickThrough(true);
+        lastInside_ = rack::NowMs();
+        /* 面板只在自己那块区域里优先：搜索条和绳子有重叠，重叠处让给面板，
+           否则面板上的点击会被全宽的绳子窗口吃掉。面板之外（绳子上挂着的
+           卡片）仍然由晾衣架接管 —— 之前整窗穿透，面板没盖住的卡片上的
+           点击会漏到下面那个窗口，正好被面板挡着，很容易误触。 */
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        if (plugin_->ClipboardContains(cursor)) {
+            SetClickThrough(true);
+            return;
+        }
+    }
+
+    if (editingNote_) {
+        /* 便签编辑器开着：绳子一直展开，编辑卡片从夹子上变出来。 */
+        if (!visible()) {
+            EnsureVisible();
+        }
+        if (expand_ < 0.9f) {
+            Expand(false);
+        }
         lastInside_ = rack::NowMs();
         return;
     }
@@ -778,8 +782,7 @@ bool RackWindow::CursorOverLine() const
     ScreenToClient(hwnd(), &point);
     const float s = scale_;
     if (expand_ < 0.3f) {
-        /* Tendedero uses the menu-bar band, not the rope itself. On Windows
-           that is the top edge of the screen, across the full width. */
+        /* 热区跟菜单栏条一致，而不是绳子本身；在 Windows 上就是屏幕顶边那一条。 */
         RECT client{};
         GetClientRect(hwnd(), &client);
         const float hot = 10.0f * s;
@@ -832,8 +835,7 @@ void RackWindow::UpdateHover()
             lineHover_ = true;
             hoverLineSince_ = now;
         }
-        // A deliberate hover is required so brushing the top edge for the
-        // menu bar does not pull the line down.
+        // 必须有明确的停留才把绳子拉下来；否则只是去点菜单栏时蹭一下顶边就触发了。
         const int delay = std::max(600, plugin_->config().hoverDelayMs);
         if (now - hoverLineSince_ >= static_cast<uint64_t>(delay)) {
             Expand(false);
@@ -844,8 +846,8 @@ void RackWindow::UpdateHover()
 
     if (inside) {
         lastInside_ = now;
-        // The hotkey-opened rack becomes a normal interactive rack once the
-        // pointer reaches it; leaving it then retracts as usual.
+        // 快捷键打开的晾衣架，在指针真正进入后就变成普通可交互的晾衣架，
+        // 之后离开时按常规收起。
         hotkeyPinned_ = false;
     }
 
@@ -897,8 +899,8 @@ void RackWindow::SetClickThrough(bool enabled)
 
 void RackWindow::UpdateClickThrough(const RackHit& hit)
 {
-    /* Keep cards/notes/accessories interactive, but let the transparent gaps,
-       including the empty part of the rope strip, reach the window below. */
+    /* 卡片、便签、配件保持可交互，但透明缝隙（包括绳子空着的部分）
+       要让点击穿到下面的窗口。 */
     const bool interactive =
         expand_ > 0.9f && hit.part != RackPart::None &&
         (hit.part == RackPart::Card || hit.part == RackPart::Note ||
@@ -928,6 +930,14 @@ void RackWindow::UpdatePreview()
     UpdateClickThrough(hit);
     bool visualChanged = false;
 
+    /* 卡片上的锁定/关闭小控件：把光标压在哪个上告诉 view，做悬停高亮。 */
+    if (static_cast<int>(hit.part) != lastHoverPart_ || hit.index != lastHoverPartIndex_) {
+        lastHoverPart_ = static_cast<int>(hit.part);
+        lastHoverPartIndex_ = hit.index;
+        view_.SetHoverPart(lastHoverPart_, lastHoverPartIndex_);
+        visualChanged = true;
+    }
+
     if (index >= 0 && expand_ > 0.9f) {
         previewHideAt_ = 0;
         if (index != hovered_) {
@@ -945,7 +955,7 @@ void RackWindow::UpdatePreview()
             }
         }
         if (!preview_.showing() && now - hoveredSince_ >= kPreviewDelayMs &&
-            plugin_->HoverPreviewEnabled() && index >= 0 &&
+            plugin_->HoverPreviewEnabled() && !plugin_->ClipboardOpen() && index >= 0 &&
             index < static_cast<int>(plugin_->items().size())) {
             const Item& hoverItem = plugin_->items()[static_cast<size_t>(index)];
             const bool previewable =
@@ -1199,7 +1209,13 @@ void RackWindow::OpenItem(int index)
     if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
         return;
     }
-    util::OpenInShell(plugin_->items()[index].path);
+    /* 便签（只有文字、没有文件路径）没有可交给 shell 打开的对象；
+       ShellExecuteW 收到空路径会退化成打开资源管理器。 */
+    const std::wstring& path = plugin_->items()[index].path;
+    if (path.empty()) {
+        return;
+    }
+    util::OpenInShell(path);
 }
 
 void RackWindow::EditItemInPaint(int index)
@@ -1296,14 +1312,58 @@ void RackWindow::EditNote(int index)
         return;
     }
     DismissPreview();
-    std::wstring text = plugin_->items()[index].note;
-    if (NoteEditor::Edit(hwnd(), util::GetDllModule(), text, plugin_->theme().dark, text)) {
-        plugin_->SetItemNote(index, text, plugin_->items()[index].noteColor);
+    const Item& item = plugin_->items()[index];
+    const int noteColor = item.noteColor;
+    const std::wstring title = item.path.empty() ? L"便签" : L"给这张截图写一句用途";
+    RECT anchor{};
+    const D2D1_RECT_F card = CardScreenRect(index);
+    if (card.right > card.left && card.bottom > card.top) {
+        anchor.left = static_cast<LONG>(std::lround(card.left));
+        anchor.top = static_cast<LONG>(std::lround(card.top));
+        anchor.right = static_cast<LONG>(std::lround(card.right));
+        anchor.bottom = static_cast<LONG>(std::lround(card.bottom));
+    }
+    std::wstring text = item.note;
+    const bool noteCard = item.path.empty();
+    if (noteCard) {
+        /* 编辑器第一帧出来后（onShown）才把卡片藏掉，避免中间闪一下空档。 */
+        editingNote_ = true;
+        Expand(false);
+    }
+    Theme uiTheme = plugin_->host()
+                        ? Theme::HostUi(plugin_->host(), plugin_->host()->user)
+                        : Theme::MenuStyle(plugin_->theme().dark);
+    const bool saved = NoteEditor::Edit(
+        hwnd(), util::GetDllModule(), &plugin_->graphics(), uiTheme, title, anchor, text, text,
+        [this, index, noteCard]() {
+            if (!noteCard) {
+                return;
+            }
+            view_.SetEditingCard(index);
+            Render();
+        },
+        nullptr,
+        /* 便签已经飞回夹子：先把下面这张卡片画出来，编辑器再淡出，交接看不出缝。 */
+        [this, noteCard]() {
+            if (!noteCard) {
+                return;
+            }
+            view_.SetEditingCard(-1);
+            Render();
+        });
+    if (noteCard) {
+        view_.SetEditingCard(-1);
+        editingNote_ = false;
+    }
+    if (saved) {
+        if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
+            plugin_->SetItemNote(index, text, noteColor);
+        }
         hovered_ = -1;
         lastInside_ = rack::NowMs();
         Expand(true);
-        Render();
     }
+    Render();
     SetTopmost();
 }
 
@@ -1317,6 +1377,7 @@ void RackWindow::SetNoteColor(int index, int color)
 
 void RackWindow::ShowItemMenu(int index, POINT screen)
 {
+
     if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
         return;
     }
@@ -1359,8 +1420,6 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
                                    this, &RackWindow::MenuSelected);
         return;
     }
-
-    const Item& item = plugin_->items()[index];
 
     std::vector<MenuItem> items;
     auto action = [&](const wchar_t* label, int id) {
@@ -1513,7 +1572,8 @@ void RackWindow::HandleMenuCommand(int index, int command)
         RemoveItem(index);
     } else if (command == kMenuRecycle) {
         if (noteItem) {
-            plugin_->DestroyNoteText(menuItem.note);
+            /* 便签的正文就是轻雪里那条记录：销毁 = 删记录 + 摘牌 */
+            plugin_->DestroyNote(index);
             RemoveItem(index, false);
         } else if (RecyclePath(menuItem.path)) {
             RemoveItem(index, false);
@@ -1575,9 +1635,9 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
                 needsLayout_ = true;
             }
         }
-        /* The card image is only ~140 DIP wide. Downscale once with WIC Fant
-           close to its display size instead of letting D2D minify a 640px
-           thumbnail at draw time, which turns thin UI lines into mush. */
+        /* 卡片图只有约 140 DIP 宽。用 WIC Fant 先按接近显示尺寸缩小，
+           比绘制时让 D2D 缩小 640px 的缩略图更干净——那样会
+           把细线糊成一团。 */
         graphics_->images().Load(source, 192.0f * scale_, target, item.thumb);
     }
 }
@@ -1592,8 +1652,8 @@ void RackWindow::Paint(ID2D1RenderTarget* target)
         if (plugin_->host()->is_dark) {
             darkUi = plugin_->host()->is_dark(plugin_->host()->user) != 0;
         }
-        // The background role is the most reliable signal when the host's
-        // explicit dark flag is stale during startup/theme transitions.
+        // 宿主给的 dark 标记在启动或切换主题的瞬间可能是旧的，
+        // 这时「背景色角色」才是最可靠的判断依据。
         if (plugin_->host()->theme_color) {
             const uint32_t bg = plugin_->host()->theme_color(
                 plugin_->host()->user, SA_THEME_BG);
@@ -1607,7 +1667,7 @@ void RackWindow::Paint(ID2D1RenderTarget* target)
     const float swaySeconds =
         revealStart_ ? static_cast<float>(rack::NowMs() - revealStart_) / 1000.0f : 10.0f;
     view_.Draw(target, plugin_->items(), plugin_->theme(), expand_, swaySeconds, basketHover_,
-               paperPos_[0], paperPos_[1], paperPos_[2], cardHover_, cardHoverIndex_,
+               paperPos_, cardHover_, cardHoverIndex_,
                hovered_, mouseDown_ && !dragStarted_ ? pressed_ : -1,
                plugin_->HistoryCount(), plugin_->ClipboardCount());
 }
@@ -1669,11 +1729,23 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_SETCURSOR: {
         const RackHit hit = HitAtCursor();
-        if (hit.part != RackPart::None) {
+        /* 只有真正能点的东西才给手型：绳子本身只是装饰。
+           便签的夹子点了没任何效果，也不给点击提示（光标保持箭头）。 */
+        bool clickable = hit.part == RackPart::Card || hit.part == RackPart::Note ||
+                         hit.part == RackPart::Close || hit.part == RackPart::Lock ||
+                         hit.part == RackPart::Basket || hit.part == RackPart::Envelope;
+        if (hit.part == RackPart::Clip && plugin_ && hit.index >= 0 &&
+            hit.index < static_cast<int>(plugin_->items().size())) {
+            const Item& item = plugin_->items()[static_cast<size_t>(hit.index)];
+            clickable = item.kind == 0 && !item.path.empty();
+        }
+        if (clickable) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
-        break;
+        /* 落在窗口上但不可点：明确给箭头，别让下层窗口的光标透上来。 */
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
     }
 
     case WM_LBUTTONDOWN: {
@@ -1783,9 +1855,8 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                     item->rackOffsetX = desired;
                 }
             }
-            // Coalesce mouse-move paints. Painting the full-width layered
-            // window at raw 125-1000 Hz was what made the card stutter near
-            // the rope; 12 ms still tracks the pointer closely.
+            // 合并鼠标移动引发的重绘。全宽分层窗口按原始 125-1000Hz 重绘，
+            // 正是卡片在绳子附近抖动的原因；12ms 已经跟得住指针了。
             const uint64_t paintNow = rack::NowMs();
             if (lastCardDragPaint_ == 0 || paintNow - lastCardDragPaint_ >= 12) {
                 lastCardDragPaint_ = paintNow;
@@ -1908,7 +1979,8 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                                           static_cast<float>(point.y), scale_);
         if (hit.part == RackPart::Card && hit.index >= 0 &&
             hit.index < static_cast<int>(plugin_->items().size())) {
-            OpenItem(hit.index);
+            /* 双击与右键“打开”走同一条命令：便签进编辑器，图片/文件交给 shell。 */
+            HandleMenuCommand(hit.index, kMenuOpen);
         }
         return 0;
     }

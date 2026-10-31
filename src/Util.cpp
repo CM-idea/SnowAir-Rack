@@ -278,10 +278,9 @@ bool OpenInPaint(const std::wstring& path)
     const std::wstring args = L"\"" + path + L"\"";
 
     /*
-     * Windows 11 ships Paint as a Store app behind an execution alias. A bare
-     * "mspaint.exe" is not always resolvable through ShellExecute, so try the
-     * alias and the classic locations explicitly before falling back to the
-     * .png "edit" verb.
+     * Windows 11 的「画图」是商店应用，挂在执行别名后面；直接写
+     * "mspaint.exe" 交给 ShellExecute 不一定找得到。所以先试别名和常见
+     * 安装位置，最后再退回 .png 的 "edit" 动词。
      */
     std::vector<std::wstring> candidates;
     PWSTR localAppData = nullptr;
@@ -357,6 +356,36 @@ UINT DpiForMonitor(HMONITOR monitor)
 float ScaleForMonitor(HMONITOR monitor)
 {
     return static_cast<float>(DpiForMonitor(monitor)) / 96.0f;
+}
+
+HGLOBAL MakeDropFilesHandle(const std::wstring& path)
+{
+    const size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (!handle) {
+        return nullptr;
+    }
+    auto* drop = static_cast<DROPFILES*>(GlobalLock(handle));
+    if (!drop) {
+        GlobalFree(handle);
+        return nullptr;
+    }
+    drop->pFiles = sizeof(DROPFILES);
+    drop->fWide = TRUE;
+    wchar_t* text =
+        reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(drop) + sizeof(DROPFILES));
+    std::memcpy(text, path.c_str(), path.size() * sizeof(wchar_t));
+    text[path.size()] = L'\0';
+    text[path.size() + 1] = L'\0';
+    GlobalUnlock(handle);
+    return handle;
+}
+
+D2D1_COLOR_F Rgb(uint32_t rgb)
+{
+    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
+                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
+                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
 }
 
 D2D1_COLOR_F ColorFromArgb(uint32_t argb, D2D1_COLOR_F fallback)

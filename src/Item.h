@@ -11,6 +11,11 @@ struct Item {
     std::wstring sourcePath;  /* original SnowAir capture */
     std::wstring thumbPath;   /* 录屏封面（可为空） */
     std::wstring label;       /* 录屏/文件卡片上显示的文字 */
+    /*
+     * 便签属于轻雪的剪切板历史，插件只记条目 id；note 只是本次运行用的缓存，
+     * 不会写进 rack_items.json（见 ItemStore::Save）。
+     */
+    std::wstring noteId;
     std::wstring note;
     int noteColor = 0;
     float aspect = 1.0f;

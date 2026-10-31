@@ -267,6 +267,7 @@ void LayeredWindow::Render()
     if (FAILED(hr)) {
         return;
     }
+    AfterDraw(memoryDC_, bits_, width_, height_);
     Present();
 }
 
@@ -279,10 +280,46 @@ void LayeredWindow::Present()
     SIZE size{width_, height_};
     BLENDFUNCTION blend{};
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha = static_cast<BYTE>(rack::Clamp(opacity_, 0.0f, 1.0f) * 255.0f + 0.5f);
     blend.AlphaFormat = AC_SRC_ALPHA;
-    UpdateLayeredWindow(hwnd_, nullptr, nullptr, &size, memoryDC_, &source, 0, &blend,
-                        ULW_ALPHA);
+    /* 有目标位置时把「移动/改大小」和「换画面」放在同一次调用里完成，
+       中间不会出现系统拉伸旧画面的那一帧（动画会闪）。 */
+    POINT destination = presentAt_;
+    UpdateLayeredWindow(hwnd_, nullptr, hasPresentAt_ ? &destination : nullptr, &size,
+                        memoryDC_, &source, 0, &blend, ULW_ALPHA);
+}
+
+void LayeredWindow::SetOpacity(float alpha)
+{
+    opacity_ = rack::Clamp(alpha, 0.0f, 1.0f);
+}
+
+void LayeredWindow::MovePresent(int x, int y)
+{
+    if (!hwnd_) {
+        return;
+    }
+    if (!memoryDC_ || !dib_) {
+        MoveTo(x, y, width_, height_);
+        return;
+    }
+    presentAt_ = POINT{x, y};
+    hasPresentAt_ = true;
+    Present();
+    hasPresentAt_ = false;
+}
+
+void LayeredWindow::RenderAt(int x, int y, int w, int h)
+{
+    if (!hwnd_) {
+        return;
+    }
+    width_ = std::max(1, w);
+    height_ = std::max(1, h);
+    presentAt_ = POINT{x, y};
+    hasPresentAt_ = true;
+    Render();
+    hasPresentAt_ = false;
 }
 
 LRESULT LayeredWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)

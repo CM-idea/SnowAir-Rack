@@ -1,4 +1,5 @@
 #include "RackView.h"
+#include "NotePalette.h"
 #include "Graphics.h"
 #include "Util.h"
 
@@ -6,7 +7,7 @@ namespace {
 
 constexpr float kLineY = 14.0f;
 constexpr float kCardTop = 42.0f;
-/* Tendedero medium: photo max 136x104, card width 150, spacing +24. */
+/* 卡片规格：照片最大 136x104，卡片宽 150，卡片间距 24。 */
 constexpr float kPhotoMaxWidth = 136.0f;
 constexpr float kNoteCardWidth = 150.0f;
 constexpr float kNoteCardHeight = 136.0f;
@@ -18,37 +19,9 @@ constexpr float kNoteHeight = 24.0f;
 constexpr float kFrame = 4.0f;
 constexpr float kOuterPad = 24.0f;
 constexpr float kAccessoryWidth = 260.0f;
-/* Length of the capture/note flight onto the rope, shared by Layout, Draw and
-   HasArrival so the hand-off to the resting card happens on exactly one frame. */
+/* 截图/便签飞上绳子的时长，Layout、Draw 和 HasArrival 共用，
+   保证交接只发生在同一帧。 */
 constexpr float kArrivalSeconds = 0.65f;
-
-struct NotePalette {
-    D2D1_COLOR_F fill;
-    D2D1_COLOR_F ink;
-    D2D1_COLOR_F edge;
-    D2D1_COLOR_F fold;
-};
-
-NotePalette PaletteFor(int color, bool dark)
-{
-    switch (color % 3) {
-    case 1:
-        return dark ? NotePalette{D2D1::ColorF(0.36f, 0.52f, 0.44f), D2D1::ColorF(0.93f, 0.97f, 0.94f),
-                                   D2D1::ColorF(0.27f, 0.42f, 0.35f), D2D1::ColorF(0.28f, 0.43f, 0.36f)}
-                    : NotePalette{D2D1::ColorF(0.81f, 0.95f, 0.87f), D2D1::ColorF(0.08f, 0.31f, 0.23f),
-                                  D2D1::ColorF(0.66f, 0.87f, 0.76f), D2D1::ColorF(0.70f, 0.89f, 0.80f)};
-    case 2:
-        return dark ? NotePalette{D2D1::ColorF(0.47f, 0.43f, 0.62f), D2D1::ColorF(0.95f, 0.94f, 0.99f),
-                                   D2D1::ColorF(0.36f, 0.32f, 0.50f), D2D1::ColorF(0.38f, 0.34f, 0.52f)}
-                    : NotePalette{D2D1::ColorF(0.89f, 0.86f, 0.98f), D2D1::ColorF(0.23f, 0.17f, 0.39f),
-                                  D2D1::ColorF(0.79f, 0.75f, 0.93f), D2D1::ColorF(0.82f, 0.78f, 0.94f)};
-    default:
-        return dark ? NotePalette{D2D1::ColorF(0.62f, 0.55f, 0.34f), D2D1::ColorF(0.99f, 0.96f, 0.85f),
-                                   D2D1::ColorF(0.48f, 0.42f, 0.24f), D2D1::ColorF(0.50f, 0.44f, 0.26f)}
-                    : NotePalette{D2D1::ColorF(1.0f, 0.945f, 0.66f), D2D1::ColorF(0.35f, 0.29f, 0.07f),
-                                  D2D1::ColorF(0.91f, 0.84f, 0.48f), D2D1::ColorF(0.93f, 0.86f, 0.53f)};
-    }
-}
 
 D2D1_POINT_2F RotateAround(D2D1_POINT_2F point, D2D1_POINT_2F center, float degrees)
 {
@@ -70,7 +43,7 @@ float CardEntryOffset(const Item& item)
     if (age > 1.2f) {
         return 0.0f;
     }
-    /* Same drop spring as PicRope: response 0.42 s, damping 0.72, offset -46. */
+    /* 上绳落位用的弹簧：响应 0.42 s、阻尼 0.72、初始偏移 -46。 */
     constexpr float kResponse = 0.42f;
     constexpr float kDamping = 0.72f;
     const float natural = 2.0f * 3.14159265f / kResponse;
@@ -112,9 +85,8 @@ void RackView::LoadAssets(ID2D1RenderTarget* target)
     }
     assetsAttempted_ = true;
     const std::wstring dir = util::JoinPath(util::GetDllDir(), L"assets");
-    /* Decode each bitmap close to twice its on-screen size. Letting D2D
-       minify a 340 px envelope down to 70 px at draw time is what produced
-       the hard, stair-stepped edge. WIC Fant does that resize once here. */
+    /* 每张位图按接近实际显示尺寸的两倍解码。让 D2D 在绘制时把 340px 的
+       信封缩到 70px，边缘会出现明显的台阶；这里先用 WIC Fant 缩好。 */
     const float assetScale = std::max(1.0f, scale_);
     graphics_->images().Load(util::JoinPath(dir, L"basket.png"), 224.0f * assetScale,
                              target, basket_);
@@ -376,13 +348,12 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     for (float height : heights) {
         maxCardHeight = std::max(maxCardHeight, height);
     }
-    /* Collapsed cards sit above the window and slide down into view. */
+    /* 收起时卡片停在窗口上方，展开时滑进视野。 */
     const float slide =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) * -(maxCardHeight + 30.0f * s);
     float x = kOuterPad * s + (photoWidth - total) * 0.5f;
     const float y = cardTop + slide;
 
-    float contentBottom = 0.0f;
     cards_.reserve(items.size());
     for (size_t i = 0; i < items.size(); ++i) {
         CardBox box;
@@ -430,8 +401,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     (void)left;
     (void)right;
     bottom = std::max(bottom, lineY + sag + 136.0f * s);
-    // Collapsed rack is only the top hot-zone strip. Keeping a tall invisible
-    // window alive there was stealing clicks from the desktop.
+    // 收起状态只保留顶部那条热区。留一整块看不见的高窗口在那儿，
+    // 会把桌面上的点击吃掉。
     result.height = expandAmount < 0.3f
                         ? 60.0f * s
                         : std::max(240.0f * s, bottom + 28.0f * s);
@@ -493,9 +464,8 @@ void RackView::DrawShadow(ID2D1RenderTarget* target, const D2D1_RECT_F& rect, fl
 
 void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
                     const Theme& theme, float expandAmount, float swaySeconds,
-                    float basketHover, float paper0, float paper1, float paper2,
-                    float cardHover, int cardHoverIndex, int hovered, int pressed,
-                    int historyCount, int clipboardCount)
+                    float basketHover, float paper0, float cardHover, int cardHoverIndex,
+                    int hovered, int pressed, int historyCount, int clipboardCount)
 {
     if (!target || !graphics_) {
         return;
@@ -505,11 +475,9 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     const bool expanded = expandAmount > 0.01f;
     lastHovered_ = hovered;
 
-    /* Retire a finished flight before any card is painted. Clearing the index
-       inside DrawArrival used to leave the incoming card undrawn for one whole
-       frame: it was skipped by drawGroup (still "arriving") and then skipped
-       again by DrawArrival (already "landed"), which showed up as a one-frame
-       blink the moment the picture/note settled on the rope. */
+    /* 卡片开始绘制之前，先退休掉已经飞完的飞行。原来在 DrawArrival 里清索引，
+       会让新卡片整整一帧不画：drawGroup 因为「还在飞」跳过它，DrawArrival
+       又因为「已经落位」跳过它，结果图片/便签刚落到绳上时闪一帧。 */
     if (arrivalIndex_ >= 0 && (arrivalIndex_ >= static_cast<int>(cards_.size()) ||
                                !HasArrival())) {
         arrivalIndex_ = -1;
@@ -535,11 +503,11 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     }
 
     DrawLine(target, theme, s, expandAmount);
-    DrawAccessories(target, items, theme, s, expandAmount, basketHover, paper0, paper1,
-                    paper2, historyCount, clipboardCount);
+    DrawAccessories(target, theme, s, expandAmount, basketHover, paper0, historyCount,
+                    clipboardCount);
 
-    /* PicRope-style spring: a gentle angular impulse, ~0.95 s period and a
-       low damping ratio. This is slower and softer than a plain sine decay. */
+    /* 摆动用一次轻的角冲量做激励：周期约 0.95 s、阻尼比很低，
+       比直接衰减的正弦更慢更软。 */
     auto swayFor = [&](const Item& item) {
         float base = 0.0f;
         if (swaySeconds > 0.0f) {
@@ -555,8 +523,7 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         if (item.shakeStartMs != 0 && item.shakeAmp > 0.0f) {
             const float age = static_cast<float>(rack::NowMs() - item.shakeStartMs) / 1000.0f;
             if (age >= 0.0f && age < 1.2f) {
-                // Tendedero: ease out to the new angle over 0.30 s, then an
-                // interpolating spring (stiffness 38, damping 2.4) back to 0.
+                // 晃动：前 0.30 s 缓出到新角度，之后用弹簧（刚度 38、阻尼 2.4）回落到 0。
                 if (age < 0.30f) {
                     base += item.shakeAmp * rack::EaseOutCubic(age / 0.30f);
                 } else {
@@ -575,10 +542,10 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         return base;
     };
 
-    /* All shadows are painted first, otherwise a later card's shadow falls on
-       the white frame of the previous card. */
+    /* 阴影必须全部先画，否则后画的卡片阴影会盖到前一张的白边上。 */
     for (size_t i = 0; i < cards_.size() && i < items.size(); ++i) {
         if (static_cast<int>(i) == arrivalIndex_) continue;
+        if (static_cast<int>(i) == editingCard_) continue;
         CardBox box = cards_[i];
         ShiftCard(box, CardEntryOffset(items[i]));
         DrawCardShadow(target, box, s, static_cast<int>(i) == hovered);
@@ -605,10 +572,18 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         }
         const float hoverAmount =
             static_cast<int>(i) == cardHoverIndex ? cardHover : 0.0f;
-        DrawCard(target, items[i], box, theme, s, sway, hoverAmount, isHovered,
-                 static_cast<int>(i) == pressed);
+        /* 编辑中的便签：卡片本体交给编辑器动画，绳子上只留夹子。 */
+        const bool editing = static_cast<int>(i) == editingCard_;
+        if (!editing) {
+            const bool hotLock = hoverPart_ == static_cast<int>(RackPart::Lock) &&
+                                 hoverPartIndex_ == static_cast<int>(i);
+            const bool hotClose = hoverPart_ == static_cast<int>(RackPart::Close) &&
+                                  hoverPartIndex_ == static_cast<int>(i);
+            DrawCard(target, items[i], box, s, sway, hoverAmount, isHovered,
+                     static_cast<int>(i) == pressed, hotLock, hotClose);
+        }
         DrawPin(target, box, theme, s);
-        if (box.hasNote) {
+        if (box.hasNote && !editing) {
             DrawNote(target, items[i], box, theme, s, sway);
         }
         if (fadeLayer) {
@@ -616,8 +591,8 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         }
     };
 
-    /* Non-hovered cards first, then the hovered card so it sits above neighbours.
-       The clip is drawn after the card so it visibly grips the photo's top edge. */
+    /* 先画没被悬停的卡片，最后画悬停的那张，让它压在邻居上面；
+       夹子在卡片之后画，才像是真的夹住了照片上沿。 */
     for (size_t i = 0; i < cards_.size() && i < items.size(); ++i) {
         if (static_cast<int>(i) == hovered) {
             continue;
@@ -629,9 +604,9 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         drawGroup(static_cast<size_t>(hovered), true);
     }
 
-    DrawRemoved(target, theme, s);
+    DrawRemoved(target, s);
     if (arrivalIndex_ >= 0 && arrivalIndex_ < static_cast<int>(items.size())) {
-        DrawArrival(target, items[static_cast<size_t>(arrivalIndex_)], theme, s);
+        DrawArrival(target, items[static_cast<size_t>(arrivalIndex_)], s);
     }
     DrawCopyToast(target, s);
 }
@@ -675,8 +650,7 @@ bool RackView::HasArrival() const
            static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f < kArrivalSeconds;
 }
 
-void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, const Theme& theme,
-                           float s)
+void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
 {
     if (arrivalIndex_ < 0 || arrivalIndex_ >= static_cast<int>(cards_.size())) {
         arrivalIndex_ = -1;
@@ -684,8 +658,8 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, const Th
     }
     const float age = static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f;
     const CardBox& targetBox = cards_[static_cast<size_t>(arrivalIndex_)];
-    /* Never bail out without painting: Draw() already skipped this card in the
-       normal pass, so returning here would blink it out for one frame. */
+    /* 任何情况下都不能直接返回而不画：Draw() 已经把这卡从常规批次里跳过了，
+       这里 return 就会让它闪掉一帧。 */
     const float raw = rack::Clamp(age / kArrivalSeconds, 0.0f, 1.0f);
     const float t = raw < 0.5f ? 4.0f * raw * raw * raw
                                : 1.0f - std::pow(-2.0f * raw + 2.0f, 3.0f) * 0.5f;
@@ -710,7 +684,7 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, const Th
     const float inset = std::min(4.0f * s, kFrame * s * t);
     box.image = rack::Inset(box.card, inset, inset);
     const float spin = targetBox.angle * t;
-    DrawCard(target, item, box, theme, s, spin, 0.0f, false, false);
+    DrawCard(target, item, box, s, spin, 0.0f, false, false);
 }
 
 void RackView::BeginRemove(int index, const Item& item, bool toBasket)
@@ -726,7 +700,7 @@ void RackView::BeginRemove(int index, const Item& item, bool toBasket)
     removed_.push_back(std::move(removed));
 }
 
-void RackView::DrawRemoved(ID2D1RenderTarget* target, const Theme& theme, float s)
+void RackView::DrawRemoved(ID2D1RenderTarget* target, float s)
 {
     if (removed_.empty()) {
         return;
@@ -738,8 +712,8 @@ void RackView::DrawRemoved(ID2D1RenderTarget* target, const Theme& theme, float 
     for (auto it = removed_.begin(); it != removed_.end();) {
         const float age = static_cast<float>(now - it->removedMs) / 1000.0f;
         if (!it->toBasket) {
-            // Tendedero's fall: 0.55 s, 520 points, ease-in cubic, extra
-            // rotation and a linear fade — not an accelerated screen drop.
+            // 从绳上掉落：0.55 s、520 像素、缓入三次方，额外加一点旋转和线性淡出，
+            // 不做成自由落体那种加速下坠。
             constexpr float kFallSeconds = 0.55f;
             if (age > kFallSeconds) {
                 it = removed_.erase(it);
@@ -758,7 +732,7 @@ void RackView::DrawRemoved(ID2D1RenderTarget* target, const Theme& theme, float 
                                           D2D1::IdentityMatrix(), 1.0f - e),
                     layer.Get());
             }
-            DrawCard(target, it->item, box, theme, s, spin, 0.0f, false, false);
+            DrawCard(target, it->item, box, s, spin, 0.0f, false, false);
             if (layer) target->PopLayer();
             ++it;
             continue;
@@ -798,7 +772,7 @@ void RackView::DrawRemoved(ID2D1RenderTarget* target, const Theme& theme, float 
                                       D2D1::IdentityMatrix(), fade),
                 layer.Get());
         }
-        DrawCard(target, it->item, box, theme, s, spin, 0.0f, false, false);
+        DrawCard(target, it->item, box, s, spin, 0.0f, false, false);
         if (layer) {
             target->PopLayer();
         }
@@ -816,27 +790,27 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
     const float retract =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) *
         -(layout.lineY + layout.sag + 24.0f * s);
-    // PicRope rope colours and widths per theme.
+    // 各主题下绳子的颜色与线宽。
     D2D1_COLOR_F ropeColor{};
     D2D1_COLOR_F ropeHighlight{};
     float ropeWidth = 1.6f;
     switch (rack::ClampInt(theme.index, 0, 3)) {
-    case 1:  // 奶白, porcelain
+    case 1:  // 奶白
         ropeColor = D2D1::ColorF(0.68f, 0.69f, 0.69f);
         ropeHighlight = D2D1::ColorF(0.95f, 0.94f, 0.91f);
         ropeWidth = 1.9f;
         break;
-    case 2:  // 木棉, linen
+    case 2:  // 木棉
         ropeColor = D2D1::ColorF(0.73f, 0.65f, 0.54f);
         ropeHighlight = D2D1::ColorF(0.92f, 0.87f, 0.79f);
         ropeWidth = 2.3f;
         break;
-    case 3:  // 深沉, graphite
+    case 3:  // 深沉
         ropeColor = D2D1::ColorF(0.34f, 0.36f, 0.39f);
         ropeHighlight = D2D1::ColorF(0.58f, 0.61f, 0.64f);
         ropeWidth = 1.65f;
         break;
-    default:  // 银灰, classic
+    default:  // 银灰
         ropeColor = D2D1::ColorF(0.54f, 0.59f, 0.65f);
         ropeHighlight = D2D1::ColorF(0.78f, 0.81f, 0.85f);
         ropeWidth = 1.6f;
@@ -845,8 +819,8 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
     const float y = layout.lineY + retract;
     const float sag = layout.sag;
 
-    /* Tendedero fades the rope out over the first/last 8% so it feels like it
-       comes from beyond the screen, instead of ending in two hard dots. */
+    /* 绳子首尾各 8% 做淡出，看起来像从屏幕外延伸过来，
+       而不是两个硬邦邦的断点。 */
     auto makeFadeBrush = [&](const D2D1_COLOR_F& color,
                              ComPtr<ID2D1LinearGradientBrush>& out) -> bool {
         D2D1_GRADIENT_STOP stops[4]{};
@@ -921,8 +895,8 @@ void RackView::DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Them
 {
     const float cx = (box.card.left + box.card.right) * 0.5f;
     const float clipHeight = 24.0f * s;
-    /* Put the slot exactly on the rope, then let the body hang down over
-       enough of the white frame to actually grip the photo. */
+    /* 夹子的槽正好落在绳子上，再让夹身向下压住足够多的白边，
+       才像真的夹住了照片。 */
     DrawClipAt(target, cx, box.pinTop + lineRetract_ - clipHeight * kClipSlotRatio,
                theme, s);
 }
@@ -930,36 +904,36 @@ void RackView::DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Them
 void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const Theme& theme,
                           float s, float heightDips)
 {
-    /* Tendedero's peg is one rounded, metallic 9x26 plate, not a two-piece
-       clothespin. Keep that simplicity and the same soft horizontal finish. */
+    /* 夹子是整块圆角金属片（9x26），不是两瓣的晾衣夹：
+       轮廓简单，做一道柔和的高光即可。 */
     const float width = 8.0f * s;
     const float height = heightDips * s;
     const D2D1_RECT_F rect =
         D2D1::RectF(cx - width * 0.5f, top, cx + width * 0.5f, top + height);
 
-    // The peg belongs to the theme's hardware, not a single steel palette.
+    // 夹子用主题的金属色，而不是固定一套钢色。
     D2D1_COLOR_F peg[3]{};
     D2D1_COLOR_F pegEdge{};
     switch (rack::ClampInt(theme.index, 0, 3)) {
-    case 3:  // 深沉, PicRope graphite #575E66
+    case 3:  // 深沉，石墨灰 #575E66
         peg[0] = D2D1::ColorF(0.43f, 0.46f, 0.49f);
         peg[1] = D2D1::ColorF(0.34f, 0.37f, 0.40f);
         peg[2] = D2D1::ColorF(0.27f, 0.30f, 0.32f);
         pegEdge = D2D1::ColorF(0.26f, 0.29f, 0.31f);
         break;
-    case 2:  // 木棉, PicRope linen #DFC5A3 (light beech)
+    case 2:  // 木棉，亚麻米 #DFC5A3（浅榉木）
         peg[0] = D2D1::ColorF(0.92f, 0.84f, 0.74f);
         peg[1] = D2D1::ColorF(0.87f, 0.77f, 0.64f);
         peg[2] = D2D1::ColorF(0.80f, 0.69f, 0.54f);
         pegEdge = D2D1::ColorF(0.68f, 0.56f, 0.41f);
         break;
-    case 1:  // 奶白, PicRope porcelain #F3F0E8
+    case 1:  // 奶白，瓷白 #F3F0E8
         peg[0] = D2D1::ColorF(0.98f, 0.97f, 0.95f);
         peg[1] = D2D1::ColorF(0.95f, 0.94f, 0.91f);
         peg[2] = D2D1::ColorF(0.91f, 0.89f, 0.85f);
         pegEdge = D2D1::ColorF(0.76f, 0.75f, 0.71f);
         break;
-    default:  // 银灰, PicRope classic #DCE3EC
+    default:  // 银灰，经典银 #DCE3EC
         peg[0] = D2D1::ColorF(0.90f, 0.92f, 0.95f);
         peg[1] = D2D1::ColorF(0.86f, 0.89f, 0.93f);
         peg[2] = D2D1::ColorF(0.76f, 0.80f, 0.85f);
@@ -991,7 +965,7 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
 
     const bool wood = rack::ClampInt(theme.index, 0, 3) == 2;
     if (wood) {
-        // Rear jaw of the wooden clothes peg, offset a little to the right.
+        // 木夹子的后夹片，稍微偏右一点。
         ComPtr<ID2D1SolidColorBrush> rear;
         if (SUCCEEDED(target->CreateSolidColorBrush(
                     D2D1::ColorF(0.78f, 0.66f, 0.51f), rear.GetAddressOf()))) {
@@ -1014,7 +988,7 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
         ComPtr<ID2D1SolidColorBrush> grain;
         if (SUCCEEDED(target->CreateSolidColorBrush(
                 D2D1::ColorF(0.54f, 0.39f, 0.22f, 0.26f), grain.GetAddressOf()))) {
-            // One faint grain strand, not a striped/wood-grain pattern.
+            // 一道很淡的木纹，不要画成条纹木纹。
             const float gx = rect.left + 3.0f * s;
             target->DrawLine(D2D1::Point2F(gx, rect.top + 4.0f * s),
                              D2D1::Point2F(gx + 0.4f * s, rect.bottom - 5.0f * s),
@@ -1040,7 +1014,7 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
                          highlight.Get(), 0.7f * s);
     }
 
-    /* The middle slot reads as the spring/hinge, like Tendedero's peg. */
+    /* 中间那道槽当作夹子的弹簧轴。 */
     ComPtr<ID2D1SolidColorBrush> slot;
     if (SUCCEEDED(target->CreateSolidColorBrush(
             D2D1::ColorF(edge->GetColor().r, edge->GetColor().g, edge->GetColor().b, 0.72f),
@@ -1055,11 +1029,9 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
     }
 }
 
-void RackView::DrawAccessories(ID2D1RenderTarget* target,
-                               const std::vector<Item>& items, const Theme& theme, float s,
+void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, float s,
                                float expandAmount, float basketHover, float paper0,
-                               float paper1, float paper2, int historyCount,
-                               int clipboardCount)
+                               int historyCount, int clipboardCount)
 {
     const RackLayout& layout = layout_;
     const float lineSpan = std::max(1.0f, layout.lineEnd - layout.lineStart);
@@ -1074,8 +1046,7 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target,
     const float accessoriesRight = layout.width - kOuterPad * s;
     const float basketCenter = accessoriesRight - 78.0f * s;
     const float envelopeCenter = accessoriesRight - 196.0f * s;
-    /* Both count pills sit on one shared baseline, regardless of the envelope
-       and basket having different heights. */
+    /* 两个数量角标共用同一条基线，即使信封和篮子的高度不同。 */
     const float envelopeBottom =
         ropeYAt(envelopeCenter) + 8.0f * s + 70.0f * s * 376.0f / 340.0f;
     const float basketBottom = ropeYAt(basketCenter) - 14.0f * s + 112.0f * s;
@@ -1096,18 +1067,16 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target,
             D2D1::RectF(envelopeCenter - envelopeWidth * 0.5f, top,
                         envelopeCenter + envelopeWidth * 0.5f, top + envelopeHeight);
 
-        /* Exactly the user's layer order, bottom to top:
-           back -> clip -> letter -> front. The themed back already contains
-           its own paper, so the separate letter layer is only for the legacy
-           fallback artwork. */
+        /* 图层顺序（由下往上）：
+           背面 → 夹子 → 信纸 → 正面。带主题的背面本身已经包含纸张，
+           所以单独的「信纸」图层只给旧版素材兜底。 */
         target->DrawBitmap(envelopeBack->bitmap.Get(), dest, 1.0f,
                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 
         DrawClipAt(target, envelopeCenter,
                    ropeYAt(envelopeCenter) - 24.0f * s * kClipSlotRatio, theme, s);
 
-        // One shared sheet of stationery for every theme; only the envelope
-        // colour changes underneath it.
+        // 所有主题共用同一张信纸，换的只是它下面的信封配色。
         if (letter_.valid()) {
             const float amount = rack::Clamp(paper0, 0.0f, 1.05f);
             const float paperTop = top + (0.18f - 0.18f * amount) * envelopeHeight;
@@ -1131,8 +1100,8 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target,
                                    ? &basketTheme_[themeIndex]
                                    : &basket_;
     if (basket && basket->valid()) {
-        /* Keep the spring value signed: on leave it swings past zero and back,
-           which is what makes the basket settle naturally. */
+        /* 弹簧值要保留符号：离开时它会冲过 0 再荡回来，
+           篮子才像自然停住。 */
         const float basketHoverAmount = basketHover;
         const float basketSize = 112.0f * s;
         const float themeDrop = themeIndex == 1 ? 2.0f * s : 0.0f;
@@ -1301,8 +1270,8 @@ void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, flo
 }
 
 void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
-                        const Theme& theme, float s, float swayAngle, float hoverAmount,
-                        bool hovered, bool pressed)
+                        float s, float swayAngle, float hoverAmount, bool hovered,
+                        bool pressed, bool hotLock, bool hotClose)
 {
     const float radius = 12.0f * s;
     const float cardScale =
@@ -1314,8 +1283,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
     }
     const D2D1_POINT_2F pivot =
         D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
-    /* Scale around the clip point: the photo lifts slightly but the clip stays
-       fixed, matching PicRope's Surface scale-motion. */
+    /* 以夹子为原点缩放：照片轻微抬起，夹子本身不动。 */
     target->SetTransform(
         D2D1::Matrix3x2F::Scale(cardScale, cardScale, pivot) *
         D2D1::Matrix3x2F::Rotation(box.angle + swayAngle, pivot));
@@ -1389,8 +1357,8 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                 sink->EndFigure(D2D1_FIGURE_END_CLOSED);
                 sink->Close();
                 D2D1_GRADIENT_STOP stops[2] = {
-                    {0.0f, D2D1::ColorF(0xF4D476)},
-                    {1.0f, D2D1::ColorF(0xF7E3A7)},
+                    {0.0f, NotePaperTop()},
+                    {1.0f, NotePaperBottom()},
                 };
                 ComPtr<ID2D1GradientStopCollection> collection;
                 ComPtr<ID2D1LinearGradientBrush> noteFill;
@@ -1406,7 +1374,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         if (noteFormat_) {
             const D2D1_RECT_F textRect = rack::Inset(rect, 16.0f * s, 18.0f * s);
             ComPtr<ID2D1SolidColorBrush> ink;
-            if (SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0x5A462A),
+            if (SUCCEEDED(target->CreateSolidColorBrush(NotePaperInk(),
                                                         ink.GetAddressOf()))) {
                 target->DrawText(item.note.c_str(), static_cast<UINT32>(item.note.size()),
                                  noteFormat_.Get(), textRect, ink.Get(),
@@ -1470,21 +1438,31 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
             D2D1::Point2F(rect.right - 16.0f * s, rect.top + 16.0f * s);
         const D2D1_POINT_2F lockCenter =
             D2D1::Point2F(rect.left + 16.0f * s, rect.top + 16.0f * s);
-        ComPtr<ID2D1SolidColorBrush> fill;
-        ComPtr<ID2D1SolidColorBrush> edge;
+        ComPtr<ID2D1SolidColorBrush> circle;
         ComPtr<ID2D1SolidColorBrush> ink;
         const Theme ui = Theme::MenuStyle(uiDark_);
         if (SUCCEEDED(target->CreateSolidColorBrush(
                 D2D1::ColorF(ui.bg.r, ui.bg.g, ui.bg.b, 0.94f),
-                fill.GetAddressOf())) &&
-            SUCCEEDED(target->CreateSolidColorBrush(ui.border, edge.GetAddressOf())) &&
+                circle.GetAddressOf())) &&
             SUCCEEDED(target->CreateSolidColorBrush(ui.fg, ink.GetAddressOf()))) {
-            auto glass = [&](const D2D1_POINT_2F& c) {
-                target->FillEllipse(D2D1::Ellipse(c, size * 0.5f, size * 0.5f), fill.Get());
-                target->DrawEllipse(D2D1::Ellipse(c, size * 0.5f, size * 0.5f),
-                                    edge.Get(), 0.8f * s);
+            /* 悬停反馈只改颜色，不改大小、也不描边：常态是透明度偏低的实心圆片，
+               鼠标压上去就变实（锁定键回到卡片色，关闭键整颗变红）。 */
+            auto glass = [&](const D2D1_POINT_2F& c, bool hot, bool danger) {
+                const float radius = size * 0.5f;
+                if (hot) {
+                    if (danger) {
+                        circle->SetColor(D2D1::ColorF(0.898f, 0.282f, 0.302f, 0.98f));
+                    } else {
+                        circle->SetColor(D2D1::ColorF(ui.bg.r, ui.bg.g, ui.bg.b, 1.0f));
+                    }
+                } else {
+                    circle->SetColor(D2D1::ColorF(ui.bg.r, ui.bg.g, ui.bg.b, 0.70f));
+                }
+                target->FillEllipse(D2D1::Ellipse(c, radius, radius), circle.Get());
             };
-            glass(closeCenter);
+            glass(closeCenter, hotClose, true);
+            ink->SetColor(hotClose ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f)
+                                   : D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, 0.85f));
             if (iconClose_) {
                 DrawIcon(target, iconClose_.Get(), closeCenter, 6.0f * s, ink.Get());
             } else {
@@ -1497,7 +1475,8 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                                  ink.Get(), 1.4f * s);
             }
 
-            glass(lockCenter);
+            glass(lockCenter, hotLock, false);
+            ink->SetColor(D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, hotLock ? 1.0f : 0.85f));
             if (iconLock_ && iconUnlock_) {
                 DrawIcon(target, item.locked ? iconLock_.Get() : iconUnlock_.Get(),
                          lockCenter, 11.0f * s, ink.Get());
@@ -1537,7 +1516,7 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
     if (item.note.empty() || !box.hasNote) {
         return;
     }
-    const NotePalette palette = PaletteFor(item.noteColor, theme.dark);
+    const NotePalette palette = NotePaletteFor(item.noteColor, theme.dark);
     const D2D1_POINT_2F center =
         D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
 
@@ -1559,7 +1538,7 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
     target->FillRectangle(box.note, fill.Get());
     target->DrawRectangle(box.note, edge.Get(), 1.0f * s);
 
-    /* Folded bottom-right corner. */
+    /* 右下角折角。 */
     const float foldSize = 8.0f * s;
     ComPtr<ID2D1PathGeometry> path;
     ComPtr<ID2D1GeometrySink> sink;
@@ -1609,6 +1588,7 @@ RackHit RackView::HitTest(float x, float y, float scale) const
     }
 
     for (int i = static_cast<int>(cards_.size()) - 1; i >= 0; --i) {
+        if (i == editingCard_) continue; /* 编辑中的卡片已经藏起来了 */
         const CardBox& box = cards_[static_cast<size_t>(i)];
         const D2D1_POINT_2F pivot =
             D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
@@ -1637,7 +1617,9 @@ RackHit RackView::HitTest(float x, float y, float scale) const
             return hit;
         }
         {
-            /* 夹子：卡片顶部中间、绳子附近的一小块，点它把图片贴到桌面。 */
+            /* 夹子：卡片顶部中间、绳子附近的一小块。图片/录屏点它把内容贴到桌面；
+               便签没有可贴的东西——命中照样吃掉（不然会漏到下面那个窗口），
+               但光标和点击反馈在 RackWindow 里按卡片类型过滤。 */
             const float cx = (box.card.left + box.card.right) * 0.5f;
             const D2D1_RECT_F clipRect =
                 D2D1::RectF(cx - 10.0f * s, box.pinTop - 10.0f * s, cx + 10.0f * s,

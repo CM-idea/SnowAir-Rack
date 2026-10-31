@@ -21,6 +21,18 @@ const wchar_t* kDescAutoRetract = L"关闭后晾衣架常驻显示，不再自�
 const wchar_t* kLabelMaxItems = L"最多挂载数量";
 const wchar_t* kDescMaxItems = L"超出后最早的一张会自动落下";
 
+/* 便签在轻雪剪切板里的标签，同时也用它把便签和普通文本区分开。 */
+constexpr wchar_t kNoteTag[] = L"便签";
+
+std::wstring TrimNoteText(std::wstring text)
+{
+    while (!text.empty() &&
+           (text.back() == L'\0' || text.back() == L'\r' || text.back() == L'\n')) {
+        text.pop_back();
+    }
+    return text;
+}
+
 const SnowAirPlugin kDescriptor = {
     SNOWAIR_PLUGIN_API,
     L"晾衣架",
@@ -89,6 +101,8 @@ bool Plugin::Init(const SnowAirHost* host)
     config_.Load(host_, host_->user);
     theme_.Load(host_, host_->user);
     itemStore_.Load(items_);
+    /* 便签正文在轻雪：读完卡片引用后同步正文、迁移旧数据、丢掉已被删除的记录。 */
+    SyncNotes();
     nextId_ = 1;
     for (const auto& item : items_) {
         nextId_ = std::max(nextId_, item.id + 1);
@@ -112,13 +126,14 @@ bool Plugin::Init(const SnowAirHost* host)
         clipboard_->SetOnHangImage([this](const std::wstring& path) { OnHangImage(path); });
         clipboard_->SetOnHangEntry(
             [this](int kind, const std::wstring& label, const std::wstring& path,
-                   const std::wstring& thumb) { OnHangEntry(kind, label, path, thumb); });
+                   const std::wstring& thumb, const std::wstring& entryId) {
+                OnHangEntry(kind, label, path, thumb, entryId);
+            });
     }
 
     initialized_ = true;
     window_->OnConfigChanged();
-    /* Normal startup is silent. The host asks for the one-time install peek
-       only when it has just placed the plugin. */
+    /* 正常启动不打扰用户：只有宿主刚放好插件时才会请求那一次「看一眼」。 */
     RackLog(L"晾衣架 %s 已就绪（API %d）", SA_RACK_VERSION, SNOWAIR_PLUGIN_API);
     return true;
 }
@@ -190,8 +205,7 @@ void Plugin::OnCapture(const wchar_t* path)
     item.path = full;
     item.sourcePath = full;
     item.aspect = static_cast<float>(width) / static_cast<float>(height);
-    // The capture flight is the arrival animation now; do not also apply the
-    // older drop-in spring when the card lands.
+    // 截图飞上绳子现在由 arrival 动画负责，不要再叠一层旧的落位弹簧。
     item.addedMs = 0;
     if (host_->capture_rect && !manualHang_) {
         int cx = 0, cy = 0, cw = 0, ch = 0;
@@ -250,29 +264,38 @@ void Plugin::OnHangImage(const std::wstring& path)
         RemoveItemData(0);
     }
     if (window_) {
-        /* OnItemsChanged starts the arrival flight and expands the rack itself.
-           Expanding first rendered the new card at its final spot for a frame,
-           then yanked it back to the cursor, which read as a flicker. */
+        /* OnItemsChanged 会启动飞行并顺带展开绳子。之前先展开的话，新卡片会
+           有一帧出现在终点、再被拽回光标位置，看起来像闪了一下。 */
         window_->OnItemsChanged(true);
     }
     SaveItems();
 }
 
 void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
-                         const std::wstring& thumb)
+                         const std::wstring& thumb, const std::wstring& entryId)
 {
     if (!initialized_) return;
+    if (kind == SNOWAIR_ENTRY_TEXT) {
+        /* 文本条目本身就是轻雪的记录：卡片只记 id，正文从轻雪读，不另存一份。 */
+        if (entryId.empty()) {
+            OnHangText(label);
+            return;
+        }
+        if (FindNoteItem(entryId) >= 0) {
+            if (window_) window_->Expand(true);
+            return;
+        }
+        std::wstring text;
+        if (!ReadNoteRecord(entryId, text) || text.empty()) return;
+        AddNoteItem(text, entryId);
+        return;
+    }
+
     Item item;
     item.id = nextId_++;
     item.addedMs = 0;
     item.label = label;
-    if (kind == SNOWAIR_ENTRY_TEXT) {
-        if (label.empty()) return;
-        item.kind = 1; /* 便签 */
-        item.note = label;
-        item.noteColor = 2;
-        item.aspect = 1.1f;
-    } else if (kind == SNOWAIR_ENTRY_IMAGE) {
+    if (kind == SNOWAIR_ENTRY_IMAGE) {
         if (path.empty()) return;
         item.kind = 0;
         item.path = util::FullPath(path);
@@ -405,37 +428,149 @@ void Plugin::PinImageFile(const std::wstring& path)
 
 void Plugin::OnHangText(const std::wstring& text)
 {
-    if (!initialized_ || text.empty()) return;
+    if (!initialized_) return;
+    const std::wstring body = TrimNoteText(text);
+    if (body.empty()) return;
+    std::wstring noteId;
+    if (!CreateNoteRecord(body, noteId)) {
+        RackLog(L"便签没能写进轻雪，已放弃上绳");
+        return;
+    }
+    AddNoteItem(body, noteId);
+}
+
+void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId)
+{
     Item item;
     item.id = nextId_++;
     item.kind = 1; /* 便签 */
     item.note = text;
+    item.noteId = noteId;
     item.noteColor = 2; /* yellow sticky note */
     item.aspect = 1.1f;
     item.addedMs = 0;   /* no drop-in spring: avoids a flicker on landing */
     items_.push_back(std::move(item));
     while (static_cast<int>(items_.size()) > config_.maxItems) {
+        /* 超出上限：卡片落下，但轻雪里的记录保留 */
         RemoveItemData(0);
     }
     if (window_) {
         window_->OnItemsChanged(true);
     }
     SaveItems();
-    RackLog(L"Text note hung (items=%zu)", items_.size());
+    RackLog(L"便签上绳 (items=%zu)", items_.size());
 }
 
-void Plugin::DestroyNoteText(const std::wstring& text)
+bool Plugin::CreateNoteRecord(const std::wstring& text, std::wstring& noteId)
 {
-    if (!host_ || !host_->entry_count || !host_->entry_get || !host_->entry_delete) return;
-    host_->entry_refresh(host_->user);
-    const int count = host_->entry_count(host_->user);
-    for (int i = count - 1; i >= 0; --i) {
-        SnowAirEntry entry{};
-        if (!host_->entry_get(host_->user, i, &entry)) continue;
-        if (entry.kind == SNOWAIR_ENTRY_TEXT && text == entry.label) {
-            host_->entry_delete(host_->user, i);
+    noteId.clear();
+    if (!host_ || !host_->entry_create_text) return false;
+    wchar_t id[128]{};
+    if (!host_->entry_create_text(host_->user, text.c_str(), kNoteTag, id,
+                                  static_cast<int>(std::size(id)))) {
+        return false;
+    }
+    noteId = id;
+    if (host_->entry_refresh) host_->entry_refresh(host_->user);
+    return !noteId.empty();
+}
+
+bool Plugin::ReadNoteRecord(const std::wstring& noteId, std::wstring& text)
+{
+    text.clear();
+    if (!host_ || !host_->entry_text || noteId.empty()) return false;
+    wchar_t probe[512]{};
+    const int length = host_->entry_text(host_->user, noteId.c_str(), probe,
+                                         static_cast<int>(std::size(probe)));
+    if (length < 0) return false;
+    if (length < static_cast<int>(std::size(probe))) {
+        text.assign(probe, static_cast<size_t>(length));
+        return true;
+    }
+    std::wstring buffer(static_cast<size_t>(length) + 1, L'\0');
+    const int got = host_->entry_text(host_->user, noteId.c_str(), buffer.data(), length + 1);
+    if (got < 0) return false;
+    buffer.resize(static_cast<size_t>(std::min(got, length)));
+    text = std::move(buffer);
+    return true;
+}
+
+bool Plugin::UpdateNoteRecord(const std::wstring& noteId, const std::wstring& text)
+{
+    if (!host_ || !host_->entry_update_text || noteId.empty()) return false;
+    return host_->entry_update_text(host_->user, noteId.c_str(), text.c_str(), nullptr) != 0;
+}
+
+void Plugin::DeleteNoteRecord(const std::wstring& noteId)
+{
+    if (!host_ || !host_->entry_delete_id || noteId.empty()) return;
+    host_->entry_delete_id(host_->user, noteId.c_str());
+    if (host_->entry_refresh) host_->entry_refresh(host_->user);
+}
+
+int Plugin::FindNoteItem(const std::wstring& noteId) const
+{
+    if (noteId.empty()) return -1;
+    for (size_t i = 0; i < items_.size(); ++i) {
+        if (items_[i].kind == 1 && items_[i].noteId == noteId) {
+            return static_cast<int>(i);
         }
     }
+    return -1;
+}
+
+void Plugin::SyncNotes()
+{
+    bool changed = false;
+    for (auto it = items_.begin(); it != items_.end();) {
+        if (it->kind != 1) {
+            ++it;
+            continue;
+        }
+        if (it->noteId.empty()) {
+            /* 旧版本把正文存在本地：迁移成轻雪的记录，本地只留 id */
+            const std::wstring legacy = TrimNoteText(it->note);
+            if (legacy.empty()) {
+                it = items_.erase(it);
+                changed = true;
+                continue;
+            }
+            std::wstring noteId;
+            if (!CreateNoteRecord(legacy, noteId)) {
+                ++it; /* 写不进去就先留着，下次启动再试 */
+                continue;
+            }
+            it->noteId = noteId;
+            it->note = legacy;
+            changed = true;
+            ++it;
+            continue;
+        }
+        std::wstring text;
+        if (!ReadNoteRecord(it->noteId, text) || text.empty()) {
+            /* 轻雪那边的记录被删了：卡片跟着消失 */
+            RackLog(L"便签记录已不在轻雪，移除卡片 %s", it->noteId.c_str());
+            it = items_.erase(it);
+            changed = true;
+            continue;
+        }
+        if (it->note != text) {
+            it->note = text;
+            changed = true;
+        }
+        ++it;
+    }
+    if (changed) {
+        SaveItems();
+    }
+}
+
+void Plugin::DestroyNote(int index)
+{
+    if (index < 0 || index >= static_cast<int>(items_.size())) return;
+    const Item& item = items_[static_cast<size_t>(index)];
+    if (item.kind != 1) return;
+    DeleteNoteRecord(item.noteId);
 }
 
 void Plugin::OnQuickHang(const wchar_t* path)
@@ -586,6 +721,31 @@ void Plugin::SetItemNote(int index, const std::wstring& text, int color)
         return;
     }
     Item& item = items_[static_cast<size_t>(index)];
+    if (item.kind == 1) {
+        /* 便签：正文写回轻雪的那条记录，插件只留缓存。 */
+        const std::wstring body = TrimNoteText(text);
+        if (!UpdateNoteRecord(item.noteId, body)) {
+            /* 记录被删掉了就补一条，卡片保持可用 */
+            std::wstring noteId;
+            if (!CreateNoteRecord(body, noteId)) {
+                RackLog(L"便签保存失败：轻雪里写不进记录");
+                return;
+            }
+            item.noteId = noteId;
+        }
+        item.note = body;
+        item.noteColor = rack::ClampInt(color, 0, 2);
+        if (window_) {
+            if (item.note.empty()) {
+                window_->DismissPreview();
+            } else {
+                window_->RefreshPreview();
+            }
+            window_->RenderNow();
+        }
+        SaveItems();
+        return;
+    }
     item.note = text;
     item.noteColor = rack::ClampInt(color, 0, 2);
     const std::wstring key = item.sourcePath.empty() ? item.path : item.sourcePath;
@@ -673,6 +833,11 @@ bool Plugin::ClipboardOpen()
     return clipboard_ && clipboard_->isOpen();
 }
 
+bool Plugin::ClipboardContains(POINT screen)
+{
+    return clipboard_ && clipboard_->isOpen() && clipboard_->ContainsPoint(screen);
+}
+
 void Plugin::CloseMenu()
 {
     if (host_ && host_->close_menu) host_->close_menu(host_->user);
@@ -690,9 +855,8 @@ void Plugin::OpenClipboard(int screenX, int screenY)
     if (!clipboard_) {
         return;
     }
-    // Clicking the envelope toggles: a second click closes the open panel. The
-    // outside-click hook may already have closed it before the rack sees the
-    // click, so ignore an envelope click that follows a close immediately.
+    // 点信封是开关：再点一次收起面板。外面点击的钩子可能已经先把它关掉了，
+    // 所以紧跟在关闭之后的那次信封点击要忽略。
     if (clipboard_->isOpen()) {
         clipboard_->Close();
         return;

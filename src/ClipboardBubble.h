@@ -11,9 +11,8 @@
 #include <unordered_map>
 #include <vector>
 
-/* The envelope panel: SnowAir's own history (screenshots / recordings / other
-   files) and the clipboard history in one card list, filtered by category or
-   custom tag. Data and tags live in SnowAir; the plugin only draws. */
+/* 信封面板：把轻雪自己的历史（截图 / 录屏 / 文件）和剪贴板历史并成一张
+   卡片列表，按分类或自定义标签过滤。数据与标签都在轻雪，插件只负责绘制。 */
 class ClipboardBubble : public LayeredWindow {
 public:
     ClipboardBubble();
@@ -25,11 +24,13 @@ public:
     void Close();
     void ApplyTheme(const Theme& theme);
     bool showing() const { return visible() && !entries_.empty(); }
+    /* 屏幕点是否落在面板窗口上：晾衣架只在这块区域里把鼠标让给面板。 */
+    bool ContainsPoint(POINT screen) const;
     void SetOnClosed(std::function<void()> callback) { onClosed_ = std::move(callback); }
     void SetOnHangText(std::function<void(const std::wstring&)> callback) { onHangText_ = std::move(callback); }
     void SetOnHangImage(std::function<void(const std::wstring&)> callback) { onHangImage_ = std::move(callback); }
     void SetOnHangEntry(std::function<void(int, const std::wstring&, const std::wstring&,
-                                           const std::wstring&)> callback) {
+                                           const std::wstring&, const std::wstring&)> callback) {
         onHangEntry_ = std::move(callback);
     }
 
@@ -40,6 +41,9 @@ protected:
 private:
     struct Entry {
         std::wstring label;
+        /* 文本条目：id + 完整正文，只用于搜索（卡片上仍只显示 label）。 */
+        std::wstring id;
+        std::wstring text;
         std::wstring path;
         std::wstring thumb;
         std::wstring time;
@@ -91,7 +95,7 @@ private:
         ComPtr<ID2D1SolidColorBrush> onDanger;
     };
 
-    /* ---- data ---- */
+    /* ---- 数据 ---- */
     void LoadEntries();
     void LoadCategories();
     void SaveCategories();
@@ -101,7 +105,7 @@ private:
     void Reload(bool resetScroll);
     void ResizeAndMove();
 
-    /* ---- geometry (already scaled) ---- */
+    /* ---- 布局（已按缩放算好） ---- */
     float SearchTop() const;
     float ChipsTop() const;
     float ListTop() const;
@@ -112,7 +116,7 @@ private:
     float TextWidth(const std::wstring& text, IDWriteTextFormat* format) const;
     float RowTop(int row) const;
 
-    /* ---- hit tests ---- */
+    /* ---- 命中测试 ---- */
     int HitRow(float x, float y) const;
     int HitChip(float x, float y) const;
     int HitPlus(float x, float y) const;
@@ -122,13 +126,13 @@ private:
     int HitModalButton(float x, float y) const;
     std::wstring TypeTagFor(const Entry& entry) const;
 
-    /* ---- painting ---- */
+    /* ---- 绘制 ---- */
     void PaintHeader(ID2D1RenderTarget* target, const Brushes& b);
     void PaintCards(ID2D1RenderTarget* target, const Brushes& b);
     void PaintModals(ID2D1RenderTarget* target, const Brushes& b);
     void PaintEmptyState(ID2D1RenderTarget* target, const Brushes& b);
 
-    /* ---- interaction ---- */
+    /* ---- 交互 ---- */
     /* 分类与标签弹窗：完全套用 SnowAir「自定义标签」弹窗的布局与交互。
        标签以 chip 形式内联在输入框里，空格成词、退格删 chip。 */
     struct TagChipRect {
@@ -175,7 +179,7 @@ private:
     void EnsureRowVisible(int row);
     std::vector<int> ActionsFor(const Entry& entry) const;
 
-    /* ---- search edit ---- */
+    /* ---- 搜索框 ---- */
     HWND edit_ = nullptr;
     HFONT editFont_ = nullptr;
     HBRUSH editBrush_ = nullptr;
@@ -187,7 +191,7 @@ private:
     static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT message, WPARAM wParam,
                                            LPARAM lParam);
 
-    /* ---- modal input edit ---- */
+    /* ---- 弹窗输入框 ---- */
     HWND modalEdit_ = nullptr;
     WNDPROC modalEditOldProc_ = nullptr;
     void CreateModalEdit();
@@ -195,7 +199,7 @@ private:
     static LRESULT CALLBACK ModalEditProc(HWND hwnd, UINT message, WPARAM wParam,
                                           LPARAM lParam);
 
-    /* ---- note editor (multi-line) ---- */
+    /* ---- 便签编辑框（多行） ---- */
     HWND noteEdit_ = nullptr;
     WNDPROC noteEditOldProc_ = nullptr;
     bool noteEditorOpen_ = false;
@@ -204,12 +208,12 @@ private:
     static LRESULT CALLBACK NoteEditProc(HWND hwnd, UINT message, WPARAM wParam,
                                          LPARAM lParam);
 
-    /* ---- state ---- */
+    /* ---- 状态 ---- */
     std::function<void()> onClosed_;
     std::function<void(const std::wstring&)> onHangText_;
     std::function<void(const std::wstring&)> onHangImage_;
-    std::function<void(int, const std::wstring&, const std::wstring&, const std::wstring&)>
-        onHangEntry_;
+    std::function<void(int, const std::wstring&, const std::wstring&, const std::wstring&,
+                       const std::wstring&)> onHangEntry_;
     const SnowAirHost* host_ = nullptr;
     Theme theme_;
     float scale_ = 1.0f;
@@ -261,13 +265,13 @@ private:
     bool gearPressed_ = false;
     bool captured_ = false;
 
-    /* tag editor */
+    /* 标签编辑 */
     bool tagEditorOpen_ = false;
     int tagEditorEntry_ = -1;
     std::vector<std::wstring> tagSelection_;
     std::vector<int> editCats_;
 
-    /* category settings */
+    /* 分类设置 */
     struct Category {
         std::wstring name;
         int builtin = -1; /* 0..5 fixed chips, -1 = custom */
@@ -312,7 +316,7 @@ private:
     int deleteConfirm_ = -1;
     bool HitGear(float x, float y) const;
 
-    /* category editor */
+    /* 分类编辑 */
     bool categoryEditorOpen_ = false;
 
     std::unordered_map<std::wstring, ImageBitmap> thumbs_;

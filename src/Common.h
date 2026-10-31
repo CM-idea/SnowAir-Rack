@@ -38,7 +38,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-/* One global log sink, installed by Plugin::Init. Safe to call before init. */
+/* 全局日志出口，由 Plugin::Init 安装；初始化之前调用也安全。 */
 void RackLog(const wchar_t* format, ...);
 
 namespace rack {

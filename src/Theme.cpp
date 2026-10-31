@@ -3,13 +3,6 @@
 
 namespace {
 
-D2D1_COLOR_F Rgb(uint32_t rgb)
-{
-    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
-                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
-                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
-}
-
 } /* namespace */
 
 Theme Theme::Fallback(bool dark)
@@ -17,25 +10,25 @@ Theme Theme::Fallback(bool dark)
     Theme theme;
     theme.dark = dark;
     if (dark) {
-        theme.fg = Rgb(0xE9EAEE);
-        theme.fgSecondary = Rgb(0xB9BCC4);
-        theme.fgTertiary = Rgb(0x8A8E99);
-        theme.bg = Rgb(0x2A2B2F);
-        theme.canvas = Rgb(0x1D1E21);
-        theme.border = Rgb(0x474A52);
-        theme.accent = Rgb(0x6EA8FF);
-        theme.accentFg = Rgb(0x0E1116);
-        theme.success = Rgb(0x5BD18B);
+        theme.fg = util::Rgb(0xE9EAEE);
+        theme.fgSecondary = util::Rgb(0xB9BCC4);
+        theme.fgTertiary = util::Rgb(0x8A8E99);
+        theme.bg = util::Rgb(0x2A2B2F);
+        theme.canvas = util::Rgb(0x1D1E21);
+        theme.border = util::Rgb(0x474A52);
+        theme.accent = util::Rgb(0x6EA8FF);
+        theme.accentFg = util::Rgb(0x0E1116);
+        theme.success = util::Rgb(0x5BD18B);
     } else {
-        theme.fg = Rgb(0x1E2228);
-        theme.fgSecondary = Rgb(0x59616D);
-        theme.fgTertiary = Rgb(0x8A929E);
-        theme.bg = Rgb(0xFFFFFF);
-        theme.canvas = Rgb(0xF4F6F9);
-        theme.border = Rgb(0xD6DBE2);
-        theme.accent = Rgb(0x2F6FEB);
-        theme.accentFg = Rgb(0xFFFFFF);
-        theme.success = Rgb(0x1F9D55);
+        theme.fg = util::Rgb(0x1E2228);
+        theme.fgSecondary = util::Rgb(0x59616D);
+        theme.fgTertiary = util::Rgb(0x8A929E);
+        theme.bg = util::Rgb(0xFFFFFF);
+        theme.canvas = util::Rgb(0xF4F6F9);
+        theme.border = util::Rgb(0xD6DBE2);
+        theme.accent = util::Rgb(0x2F6FEB);
+        theme.accentFg = util::Rgb(0xFFFFFF);
+        theme.success = util::Rgb(0x1F9D55);
     }
     theme.contentBorder = theme.border;
     theme.card = theme.bg;
@@ -47,57 +40,56 @@ Theme Theme::RackTheme(int index)
     Theme theme;
     const int requested = std::clamp(index, 0, 3);
     theme.index = requested;
-    // UI order: 银灰, 奶白, 木棉, 深沉. Reuse the existing palettes in that
-    // order: silver/deep, paper, terracotta, graphite.
+    // 界面顺序是 银灰、奶白、木棉、深沉；这里把界面序号映射到原来的色板定义顺序。
     static const int palette[4] = {1, 0, 2, 3};
     switch (palette[requested]) {
     case 1: /* 石墨 */
         theme.dark = true;
-        theme.fg = Rgb(0xF2F3F5);
-        theme.fgSecondary = Rgb(0xA7ABB2);
-        theme.fgTertiary = Rgb(0x777C84);
-        theme.bg = Rgb(0x1D1F22);
-        theme.canvas = Rgb(0x131416);
-        theme.border = Rgb(0x373B40);
-        theme.accent = Rgb(0x6FA8FF);
-        theme.accentFg = Rgb(0x0B1220);
-        theme.success = Rgb(0x5BD18B);
+        theme.fg = util::Rgb(0xF2F3F5);
+        theme.fgSecondary = util::Rgb(0xA7ABB2);
+        theme.fgTertiary = util::Rgb(0x777C84);
+        theme.bg = util::Rgb(0x1D1F22);
+        theme.canvas = util::Rgb(0x131416);
+        theme.border = util::Rgb(0x373B40);
+        theme.accent = util::Rgb(0x6FA8FF);
+        theme.accentFg = util::Rgb(0x0B1220);
+        theme.success = util::Rgb(0x5BD18B);
         break;
     case 2: /* 赤陶 */
         theme.dark = false;
-        theme.fg = Rgb(0x332018);
-        theme.fgSecondary = Rgb(0x7B6154);
-        theme.fgTertiary = Rgb(0x9B8779);
-        theme.bg = Rgb(0xFFF8F0);
-        theme.canvas = Rgb(0xEFE2D4);
-        theme.border = Rgb(0xD8C1AE);
-        theme.accent = Rgb(0xB84A28);
-        theme.accentFg = Rgb(0xFFF8F0);
-        theme.success = Rgb(0x4E7A46);
+        theme.fg = util::Rgb(0x332018);
+        theme.fgSecondary = util::Rgb(0x7B6154);
+        theme.fgTertiary = util::Rgb(0x9B8779);
+        theme.bg = util::Rgb(0xFFF8F0);
+        theme.canvas = util::Rgb(0xEFE2D4);
+        theme.border = util::Rgb(0xD8C1AE);
+        theme.accent = util::Rgb(0xB84A28);
+        theme.accentFg = util::Rgb(0xFFF8F0);
+        theme.success = util::Rgb(0x4E7A46);
         break;
     case 3: /* 深海 */
         theme.dark = true;
-        theme.fg = Rgb(0xE8F5F2);
-        theme.fgSecondary = Rgb(0x9DBDB8);
-        theme.fgTertiary = Rgb(0x6E918C);
-        theme.bg = Rgb(0x123236);
-        theme.canvas = Rgb(0x0C2427);
-        theme.border = Rgb(0x2A4D51);
-        theme.accent = Rgb(0x5CC8B6);
-        theme.accentFg = Rgb(0x08201F);
-        theme.success = Rgb(0x6DD3A1);
+        theme.fg = util::Rgb(0xE8F5F2);
+        theme.fgSecondary = util::Rgb(0x9DBDB8);
+        theme.fgTertiary = util::Rgb(0x6E918C);
+        theme.bg = util::Rgb(0x123236);
+        theme.canvas = util::Rgb(0x0C2427);
+        theme.border = util::Rgb(0x2A4D51);
+        theme.accent = util::Rgb(0x5CC8B6);
+        theme.accentFg = util::Rgb(0x08201F);
+        theme.success = util::Rgb(0x6DD3A1);
         break;
     default: /* 纸白 */
         theme.dark = false;
-        theme.fg = Rgb(0x24211B);
-        theme.fgSecondary = Rgb(0x6B6257);
-        theme.fgTertiary = Rgb(0x948879);
-        theme.bg = Rgb(0xFFFCF5);
-        theme.canvas = Rgb(0xF4F0E6);
-        theme.border = Rgb(0xD9CFC0);
-        theme.accent = Rgb(0xB65C34);
-        theme.accentFg = Rgb(0xFFFCF5);
-        theme.success = Rgb(0x2F7D55);
+        theme.fg = util::Rgb(0x24211B);
+        theme.fgSecondary = util::Rgb(0x6B6257);
+        theme.fgTertiary = util::Rgb(0x948879);
+        theme.bg = util::Rgb(0xFFFCF5);
+        theme.canvas = util::Rgb(0xF4F0E6);
+        theme.border = util::Rgb(0xD9CFC0);
+        theme.accent = util::Rgb(0xB65C34);
+        theme.accentFg = util::Rgb(0xFFFCF5);
+        theme.success = util::Rgb(0x2F7D55);
         break;
     }
     theme.contentBorder = theme.border;
@@ -107,7 +99,7 @@ Theme Theme::RackTheme(int index)
 
 Theme Theme::MenuStyle(bool dark)
 {
-    // SnowAir's menu palette is encoded as 0xRRGGBBAA (alpha in the low byte).
+    // 轻雪的菜单色板按 0xRRGGBBAA 编码（alpha 在低字节）。
     auto argb = [](uint32_t v) {
         return D2D1::ColorF(static_cast<float>((v >> 24) & 0xFF) / 255.0f,
                             static_cast<float>((v >> 16) & 0xFF) / 255.0f,

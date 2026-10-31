@@ -9,8 +9,8 @@ class Graphics;
 class RackView;
 
 /*
- * Hover preview: a separate top-level layered window below the hovered card.
- * Shows the image large and the full note, scrollable with the wheel.
+ * 悬停预览：一块独立的分层窗口，压在被悬停卡片的下方；
+ * 大图显示，并带上完整便签正文，可以滚轮滚动。
  */
 class PreviewWindow : public LayeredWindow {
 public:

@@ -18,7 +18,7 @@ bool NoteStore::Load()
     }
 
     std::string text(bytes.begin(), bytes.end());
-    /* Accept files saved by editors that add a UTF-8 BOM. */
+    /* 兼容带 UTF-8 BOM 的编辑器保存出来的文件。 */
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
         static_cast<unsigned char>(text[1]) == 0xBB &&
         static_cast<unsigned char>(text[2]) == 0xBF) {

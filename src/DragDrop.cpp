@@ -8,28 +8,6 @@
 namespace dragdrop {
 namespace {
 
-HGLOBAL MakeDropHandle(const std::wstring& path)
-{
-    const size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);
-    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
-    if (!handle) {
-        return nullptr;
-    }
-    auto* drop = static_cast<DROPFILES*>(GlobalLock(handle));
-    if (!drop) {
-        GlobalFree(handle);
-        return nullptr;
-    }
-    drop->pFiles = sizeof(DROPFILES);
-    drop->fWide = TRUE;
-    wchar_t* text = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(drop) +
-                                               sizeof(DROPFILES));
-    std::memcpy(text, path.c_str(), path.size() * sizeof(wchar_t));
-    text[path.size()] = L'\0';
-    text[path.size() + 1] = L'\0';
-    GlobalUnlock(handle);
-    return handle;
-}
 
 HGLOBAL MakeBytesHandle(const std::vector<BYTE>& bytes)
 {
@@ -238,7 +216,7 @@ public:
         count_ = png ? 3 : 2;
     }
 
-    /* IUnknown */
+    /* IUnknown 接口 */
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
     {
         if (!out) {
@@ -267,7 +245,7 @@ public:
         return static_cast<ULONG>(value);
     }
 
-    /* IDataObject */
+    /* IDataObject 接口 */
     HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format, STGMEDIUM* medium) override
     {
         if (!format || !medium) {
@@ -306,7 +284,7 @@ public:
 
         HGLOBAL handle = nullptr;
         if (format->cfFormat == CF_HDROP) {
-            handle = MakeDropHandle(path_);
+            handle = util::MakeDropFilesHandle(path_);
         } else if (format->cfFormat == CF_UNICODETEXT) {
             const size_t bytes = (path_.size() + 1) * sizeof(wchar_t);
             handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
@@ -548,8 +526,8 @@ DWORD BeginDrag(const std::wstring& path, int cardWidth, int cardHeight,
         return DROPEFFECT_NONE;
     }
 
-    /* Keep OLE's own thumbnail out of the way; the layered window above is the
-       actual card, with per-pixel rounded corners. */
+    /* 把 OLE 自带的缩略图藏起来：真正显示的是上面那层分层窗口，
+       它有逐像素的圆角。 */
     HBITMAP invisible = nullptr;
     IDragSourceHelper* helper = nullptr;
     BITMAPINFO emptyInfo{};
@@ -575,9 +553,8 @@ DWORD BeginDrag(const std::wstring& path, int cardWidth, int cardHeight,
     }
 
     /*
-     * Only offer COPY. Offering MOVE lets Explorer move SnowAir's original
-     * screenshot file out of its output directory when the user drags it to a
-     * folder; the rack must never move or delete the host's file.
+     * 只给 COPY。给 MOVE 的话，用户把文件拖到文件夹时，Explorer 会真的把
+     * 轻雪的原图从输出目录移走；插件绝不能移动或删除宿主的文件。
      */
     DWORD effect = DROPEFFECT_NONE;
     HRESULT hr = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);

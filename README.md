@@ -13,7 +13,7 @@
 
 - 截图 / 图片上绳，点一下复制，拖出可直接粘贴
 - 剪切板面板：分类筛选、自定义分类、文本/图片上绳
-- 便签卡片：双击编辑、右键打开/另存为 TXT/销毁
+- 便签卡片：正文存在轻雪的剪切板历史里（标签「便签」），双击编辑、右键打开/另存为 TXT/销毁；销毁 会连轻雪里的那条记录一起删掉
 
 ## 构建（开发）
 
@@ -25,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
 ## 依赖
 
-SnowAir 插件 ABI 3，接口见 [`include/SnowAirPlugin.h`](include/SnowAirPlugin.h)，与 [SnowAir 仓库](https://github.com/CM-idea/SnowAir) 保持同步。
+SnowAir 插件 ABI 4，接口见 [`include/SnowAirPlugin.h`](include/SnowAirPlugin.h)，与 [SnowAir 仓库](https://github.com/CM-idea/SnowAir) 保持同步。
 
 
 ## 社区

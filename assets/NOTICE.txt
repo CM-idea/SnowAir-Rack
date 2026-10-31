@@ -1,0 +1,9 @@
+basket.png and envelope.png are downscaled derivatives of PicRope's
+basket-classic.png and envelope-classic.png.
+
+PicRope - https://github.com/Renly1994/PicRope
+Copyright (c) PicRope contributors
+Licensed under the MIT License (see the project's LICENSE).
+
+The images are bundled only as UI decoration for the SnowAir rack plugin.
+They are not SnowAir branding and may be replaced by SnowAir-owned artwork.

@@ -83,10 +83,14 @@ bool ItemStore::Load(std::vector<Item>& items) const
             item.noteColor = rack::ClampInt(static_cast<int>(color->number), 0, 2);
         }
         if (hasNote) item.note = util::Utf8ToWide(noteValue->text);
+        if (const json::Value* noteId = value.Get("noteId");
+            noteId && noteId->type == json::Type::String) {
+            item.noteId = util::Utf8ToWide(noteId->text);
+        }
 
         if (!hasPath) {
             /* 无路径：便签 / 纯文字录屏 / 纯文字文件 */
-            if (!hasNote && item.label.empty()) continue;
+            if (!hasNote && item.noteId.empty() && item.label.empty()) continue;
             item.aspect = 1.1f;
             items.push_back(std::move(item));
             continue;
@@ -115,7 +119,12 @@ bool ItemStore::Save(const std::vector<Item>& items) const
     output += "{\n  \"version\": 1,\n  \"items\": [\n";
     bool first = true;
     for (const auto& item : items) {
-        if (item.path.empty() && item.note.empty() && item.label.empty()) {
+        const bool noteCard = item.kind == 1;
+        if (item.path.empty() && !noteCard && item.note.empty() && item.label.empty()) {
+            continue;
+        }
+        /* 便签文本在轻雪里；本地只留 noteId，不写正文。 */
+        if (noteCard && item.noteId.empty()) {
             continue;
         }
         if (!first) output += ",\n";
@@ -131,7 +140,9 @@ bool ItemStore::Save(const std::vector<Item>& items) const
         output += ", \"locked\": ";
         output += item.locked ? "true" : "false";
         output += ", \"addedMs\": " + std::to_string(item.addedMs);
-        output += ", \"note\": " + json::Quote(util::WideToUtf8(item.note));
+        output += ", \"noteId\": " + json::Quote(util::WideToUtf8(item.noteId));
+        output += ", \"note\": ";
+        output += json::Quote(noteCard ? std::string() : util::WideToUtf8(item.note));
         output += ", \"noteColor\": " + std::to_string(item.noteColor);
         output += " }";
     }

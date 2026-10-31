@@ -38,6 +38,8 @@ constexpr float kThumbH = 48.0f;
 constexpr float kPanelH = 550.0f;
 constexpr UINT_PTR kCaretTimer = 0x51;
 constexpr int kTagBuffer = 8192;
+/* 搜索用的完整正文上限（字符）；卡片显示仍用宿主给的 240 字 label。 */
+constexpr int kSearchTextCap = 16384;
 
 const wchar_t* const kFixedChips[] = {L"全部", L"截图", L"文本", L"录屏", L"图片", L"文件"};
 constexpr int kFixedChipCount = 6;
@@ -46,13 +48,6 @@ std::wstring Lower(std::wstring text)
 {
     for (auto& ch : text) ch = static_cast<wchar_t>(towlower(ch));
     return text;
-}
-
-D2D1_COLOR_F Rgb(uint32_t rgb)
-{
-    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
-                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
-                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
 }
 
 std::wstring Trim(std::wstring text)
@@ -279,7 +274,7 @@ void ClipboardBubble::DrawGlyph(ID2D1RenderTarget* target, ID2D1PathGeometry* gl
 }
 
 /* ------------------------------------------------------------------ */
-/* data                                                                */
+/* 数据 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::LoadEntries()
@@ -309,9 +304,42 @@ void ClipboardBubble::LoadEntries()
         entry.createdAt = raw.created_at;
         entry.time = FormatWhen(raw.created_at);
         entry.tags = SplitLines(raw.tags);
+        /* 卡片上的 label 只有前 240 个字符（宿主截断过），搜索要能命中正文后半段，
+           所以文本条目额外把 id 和完整正文取回来。 */
+        if (host_->entry_id) {
+            std::vector<wchar_t> idBuffer(128, L'\0');
+            if (host_->entry_id(host_->user, i, idBuffer.data(),
+                                static_cast<int>(idBuffer.size())) > 0) {
+                entry.id = idBuffer.data();
+            }
+        }
+        if (entry.kind == SNOWAIR_ENTRY_TEXT && !entry.id.empty() && host_->entry_text) {
+            std::vector<wchar_t> textBuffer(kSearchTextCap, L'\0');
+            const int length = host_->entry_text(host_->user, entry.id.c_str(),
+                                                 textBuffer.data(),
+                                                 static_cast<int>(textBuffer.size()));
+            if (length > 0) {
+                const size_t keep = std::min<size_t>(
+                    static_cast<size_t>(length), textBuffer.size() - 1);
+                entry.text.assign(textBuffer.data(), keep);
+            }
+        }
         entries_.push_back(std::move(entry));
     }
     MeasureCards();
+}
+
+bool ClipboardBubble::ContainsPoint(POINT screen) const
+{
+    if (!hwnd()) {
+        return false;
+    }
+    RECT rect{};
+    if (!GetWindowRect(hwnd(), &rect)) {
+        return false;
+    }
+    return screen.x >= rect.left && screen.x < rect.right && screen.y >= rect.top &&
+           screen.y < rect.bottom;
 }
 
 std::wstring ClipboardBubble::EntryKey(const Entry& entry) const
@@ -503,6 +531,9 @@ void ClipboardBubble::RebuildShown()
         if (!match) continue;
         if (!needle.empty()) {
             bool hit = Lower(entry.label).find(needle) != std::wstring::npos;
+            if (!hit && !entry.text.empty()) {
+                hit = Lower(entry.text).find(needle) != std::wstring::npos;
+            }
             if (!hit) {
                 for (const auto& tag : entry.tags) {
                     if (Lower(tag).find(needle) != std::wstring::npos) {
@@ -604,7 +635,7 @@ void ClipboardBubble::ResizeAndMove()
 }
 
 /* ------------------------------------------------------------------ */
-/* geometry                                                            */
+/* 布局 */
 /* ------------------------------------------------------------------ */
 
 float ClipboardBubble::SearchTop() const
@@ -706,7 +737,7 @@ void ClipboardBubble::EnsureRowVisible(int row)
 }
 
 /* ------------------------------------------------------------------ */
-/* hit tests                                                           */
+/* 命中测试 */
 /* ------------------------------------------------------------------ */
 
 int ClipboardBubble::HitRow(float x, float y) const
@@ -1005,11 +1036,15 @@ std::wstring ClipboardBubble::TooltipAt(float x, float y, D2D1_RECT_F* anchor) c
                 RowTop(row) + rowHeights_[static_cast<size_t>(row)] - kCardPadY * s;
             const float top = bottom - kCardTagH * s;
             float cx = kPad * s + kCardPadX * s;
-            const float typeW = TextWidth(TypeTagFor(entry), tagFormat_.Get()) + 8.0f * s;
-            if (tagIndex == 0 && anchor) {
-                *anchor = D2D1::RectF(cx, top, cx + typeW, bottom);
+            const std::wstring typeTag = TypeTagFor(entry);
+            const float typeW =
+                typeTag.empty() ? 0.0f : TextWidth(typeTag, tagFormat_.Get()) + 8.0f * s;
+            if (typeW > 0.0f) {
+                if (tagIndex == 0 && anchor) {
+                    *anchor = D2D1::RectF(cx, top, cx + typeW, bottom);
+                }
+                cx += typeW + 6.0f * s;
             }
-            cx += typeW + 6.0f * s;
             for (int i = 0; i < static_cast<int>(entry.tags.size()); ++i) {
                 const float w =
                     TextWidth(entry.tags[static_cast<size_t>(i)], tagFormat_.Get()) +
@@ -1173,7 +1208,7 @@ void ClipboardBubble::PaintSettings(ID2D1RenderTarget* target, const Brushes& b)
                              hidden ? b.muted.Get() : b.fg.Get(),
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
-        /* toggle */
+        /* 开关 */
         const D2D1_RECT_F track = D2D1::RectF(row.right - 106.0f * s,
                                               (row.top + row.bottom) * 0.5f - 9.0f * s,
                                               row.right - 72.0f * s,
@@ -1471,10 +1506,13 @@ int ClipboardBubble::HitTagChip(float x, float y, int row) const
     const float plusW = 16.0f * s;
     const float tagLimit = right - plusW - 6.0f * s;
     const std::wstring typeTag = TypeTagFor(entry);
-    float w = TextWidth(typeTag, tagFormat_.Get()) + 8.0f * s;
-    if (cx + w > tagLimit) return -1;
-    if (x >= cx && x <= cx + w) return 0;
-    cx += w + 6.0f * s;
+    float w = 0.0f;
+    if (!typeTag.empty()) {
+        w = TextWidth(typeTag, tagFormat_.Get()) + 8.0f * s;
+        if (cx + w > tagLimit) return -1;
+        if (x >= cx && x <= cx + w) return 0;
+        cx += w + 6.0f * s;
+    }
     for (int i = 0; i < static_cast<int>(entry.tags.size()); ++i) {
         w = TextWidth(entry.tags[static_cast<size_t>(i)], tagFormat_.Get()) + 8.0f * s;
         if (cx + w > tagLimit) return -1;
@@ -1489,6 +1527,13 @@ int ClipboardBubble::HitTagChip(float x, float y, int row) const
 
 std::wstring ClipboardBubble::TypeTagFor(const Entry& entry) const
 {
+    /* 便签本身就是一条文本记录，已经带了「便签」标签；再挂一个「文字」类型标签
+       就是重复的，所以这类条目只显示用户标签（分类里仍然属于「文本」）。 */
+    for (const auto& tag : entry.tags) {
+        if (tag == L"便签") {
+            return std::wstring();
+        }
+    }
     switch (entry.kind) {
     case SNOWAIR_ENTRY_TEXT:
         return L"文字";
@@ -1502,7 +1547,7 @@ std::wstring ClipboardBubble::TypeTagFor(const Entry& entry) const
 }
 
 /* ------------------------------------------------------------------ */
-/* painting                                                            */
+/* 绘制 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::UpdateSearchEditVisibility()
@@ -1542,24 +1587,24 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
     make(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.35f), b.dim);
     make(theme_.contentBorder.a > 0.01f ? theme_.contentBorder : theme_.border,
          b.contentBorder);
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xF5F4F4), b.chipBg);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xF5F4F4), b.chipBg);
     /* 搜索框是主输入区，比面板明显一档；右侧 +/齿轮是辅助按钮，浅色下压到接近面板。 */
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xEDEDED), b.searchBg);
-    make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xF5F4F4), b.iconBg);
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.iconHover);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xEDEDED), b.searchBg);
+    make(theme_.dark ? util::Rgb(0x3A3A3A) : util::Rgb(0xF5F4F4), b.iconBg);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xE5E5E5), b.iconHover);
     /* 分类设置处于选中态时常驻一个更明显的底，图标同时变绿。 */
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.iconSelected);
-    make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.hoverBg);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xE5E5E5), b.iconSelected);
+    make(theme_.dark ? util::Rgb(0x3A3A3A) : util::Rgb(0xE5E5E5), b.hoverBg);
     /* 深色：面板 #262626、卡片 #1A1A1A，靠深浅差分层；浅色对应地用
        比白面板深一档的灰（#F5F4F4）填充卡片，而不是和面板同色只剩描边。 */
-    make(theme_.dark ? Rgb(0x1A1A1A) : Rgb(0xF5F4F4), b.cardBg);
-    make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.tagBg);
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xD4D4D4), b.tagHover);
-    make(theme_.dark ? Rgb(0x3A3A3A) : Rgb(0xE5E5E5), b.plusBg);
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xD4D4D4), b.plusHover);
-    make(theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xE5E5E5), b.selectedBg);
-    make(Rgb(0x34C759), b.success);
-    make(Rgb(0xEF4444), b.danger);
+    make(theme_.dark ? util::Rgb(0x1A1A1A) : util::Rgb(0xF5F4F4), b.cardBg);
+    make(theme_.dark ? util::Rgb(0x3A3A3A) : util::Rgb(0xE5E5E5), b.tagBg);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xD4D4D4), b.tagHover);
+    make(theme_.dark ? util::Rgb(0x3A3A3A) : util::Rgb(0xE5E5E5), b.plusBg);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xD4D4D4), b.plusHover);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xE5E5E5), b.selectedBg);
+    make(util::Rgb(0x34C759), b.success);
+    make(util::Rgb(0xEF4444), b.danger);
     auto lighten = [](D2D1_COLOR_F color, float delta) {
         color.r = std::min(1.0f, color.r + delta);
         color.g = std::min(1.0f, color.g + delta);
@@ -1568,14 +1613,14 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
     };
     /* 弹窗实心按钮的悬停色：在本体色上提亮一点，避免再用一套颜色。 */
     make(lighten(theme_.primary, 0.09f), b.primaryHover);
-    make(lighten(Rgb(0xEF4444), 0.09f), b.dangerHover);
+    make(lighten(util::Rgb(0xEF4444), 0.09f), b.dangerHover);
     /* 弹窗（新建/重命名/删除分类）用独立底色，和面板拉开层次。 */
-    make(theme_.dark ? Rgb(0x262626) : Rgb(0xFFFFFF), b.modalCard);
-    make(theme_.dark ? Rgb(0x4A4A4A) : theme_.border, b.modalBorder);
+    make(theme_.dark ? util::Rgb(0x262626) : util::Rgb(0xFFFFFF), b.modalCard);
+    make(theme_.dark ? util::Rgb(0x4A4A4A) : theme_.border, b.modalBorder);
     make(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f), b.modalShadow);
-    make(Rgb(0x34C759), b.insertion);
-    make(theme_.dark ? Rgb(0x333333) : Rgb(0xEFEFEF), b.disabledBg);
-    make(Rgb(0xFFFFFF), b.onDanger);
+    make(util::Rgb(0x34C759), b.insertion);
+    make(theme_.dark ? util::Rgb(0x333333) : util::Rgb(0xEFEFEF), b.disabledBg);
+    make(util::Rgb(0xFFFFFF), b.onDanger);
 
     const float oy = kArrowH * s;
     if (graphics_ && graphics_->d2d()) {
@@ -1658,7 +1703,7 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
         const float l = x;
         const float t = y;
         const float r = x + tipW;
-        const float b = y + tipH;
+        const float tipBottom = y + tipH;
         const float rad = 6.0f * s;
 
         ComPtr<ID2D1SolidColorBrush> fill;
@@ -1693,13 +1738,13 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
                 if (above) {
                     sink->AddLine(D2D1::Point2F(r - rad, t));
                     arcTo(r, t + rad);
-                    sink->AddLine(D2D1::Point2F(r, b - rad));
-                    arcTo(r - rad, b);
-                    sink->AddLine(D2D1::Point2F(apexX + triHalf, b));
-                    sink->AddLine(D2D1::Point2F(apexX, b + triH));
-                    sink->AddLine(D2D1::Point2F(apexX - triHalf, b));
-                    sink->AddLine(D2D1::Point2F(l + rad, b));
-                    arcTo(l, b - rad);
+                    sink->AddLine(D2D1::Point2F(r, tipBottom - rad));
+                    arcTo(r - rad, tipBottom);
+                    sink->AddLine(D2D1::Point2F(apexX + triHalf, tipBottom));
+                    sink->AddLine(D2D1::Point2F(apexX, tipBottom + triH));
+                    sink->AddLine(D2D1::Point2F(apexX - triHalf, tipBottom));
+                    sink->AddLine(D2D1::Point2F(l + rad, tipBottom));
+                    arcTo(l, tipBottom - rad);
                     sink->AddLine(D2D1::Point2F(l, t + rad));
                     arcTo(l + rad, t);
                 } else {
@@ -1708,10 +1753,10 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
                     sink->AddLine(D2D1::Point2F(apexX + triHalf, t));
                     sink->AddLine(D2D1::Point2F(r - rad, t));
                     arcTo(r, t + rad);
-                    sink->AddLine(D2D1::Point2F(r, b - rad));
-                    arcTo(r - rad, b);
-                    sink->AddLine(D2D1::Point2F(l + rad, b));
-                    arcTo(l, b - rad);
+                    sink->AddLine(D2D1::Point2F(r, tipBottom - rad));
+                    arcTo(r - rad, tipBottom);
+                    sink->AddLine(D2D1::Point2F(l + rad, tipBottom));
+                    arcTo(l, tipBottom - rad);
                     sink->AddLine(D2D1::Point2F(l, t + rad));
                     arcTo(l + rad, t);
                 }
@@ -1725,14 +1770,14 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
             target->DrawGeometry(bubble.Get(), edge.Get(), 1.0f * s);
         } else {
             const D2D1_ROUNDED_RECT rr =
-                D2D1::RoundedRect(D2D1::RectF(l, t, r, b), rad, rad);
+                D2D1::RoundedRect(D2D1::RectF(l, t, r, tipBottom), rad, rad);
             target->FillRoundedRectangle(rr, fill.Get());
             target->DrawRoundedRectangle(rr, edge.Get(), 1.0f * s);
         }
 
         target->DrawText(tooltipText_.c_str(),
                          static_cast<UINT32>(tooltipText_.size()), chipFormat_.Get(),
-                         D2D1::RectF(l, t, r, b), ink.Get(),
+                         D2D1::RectF(l, t, r, tipBottom), ink.Get(),
                          D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 }
@@ -1833,8 +1878,8 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
 
         const float headerTop = top + kCardHeaderTop * s;
         if (metaFormat_ && !entry.time.empty()) {
-            // Draw the time with its line box pinned to the top: centering it in
-            // the 22-DIP header leaves too much air above the text.
+            // 时间这一行贴着卡片顶部画：放进 22 DIP 的表头里垂直居中，
+            // 文字上方会空出一截。
             const D2D1_RECT_F timeRect = D2D1::RectF(
                 card.left + kCardPadX * s, headerTop - 2.0f * s,
                 card.right - kCardPadX * s - 110.0f * s, headerTop + 16.0f * s);
@@ -1981,7 +2026,7 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
             }
         }
 
-        /* tags: history-style chips (type tag, custom tags, then "+") */
+        /* 标签行：类型标签、自定义标签，最后是「+」 */
         const float tagTop = card.bottom - kCardPadY * s - kCardTagH * s;
         const float tagRight = card.right - kCardPadX * s;
         const float plusW = 16.0f * s;
@@ -2001,7 +2046,10 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
             cx += w + 6.0f * s;
         };
-        drawTagChip(TypeTagFor(entry), sameRow && hoveredTag_ == 0);
+        const std::wstring typeTag = TypeTagFor(entry);
+        if (!typeTag.empty()) {
+            drawTagChip(typeTag, sameRow && hoveredTag_ == 0);
+        }
         for (int i = 0; i < static_cast<int>(entry.tags.size()); ++i) {
             drawTagChip(entry.tags[static_cast<size_t>(i)], sameRow && hoveredTag_ == i + 1);
         }
@@ -2017,7 +2065,7 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
         }
     }
 
-    /* slim scroll indicator */
+    /* 细滚动条 */
     const float viewport = ListViewportHeight();
     if (rowsHeight_ > viewport + 1.0f && viewport > 10.0f) {
         const float trackTop = ListTop();
@@ -2242,7 +2290,7 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
 }
 
 /* ------------------------------------------------------------------ */
-/* open / close                                                        */
+/* 打开 / 关闭 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::Open(int screenX, int screenY, float scale, const Theme& theme)
@@ -2440,7 +2488,7 @@ void ClipboardBubble::PositionIme()
 }
 
 /* ------------------------------------------------------------------ */
-/* edits                                                               */
+/* 编辑框 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::CreateSearchEdit()
@@ -2589,7 +2637,7 @@ void ClipboardBubble::LayoutEditors()
 }
 
 /* ------------------------------------------------------------------ */
-/* interaction                                                         */
+/* 交互 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::OpenTagEditor(int entryIndex)
@@ -2900,7 +2948,7 @@ void ClipboardBubble::CommitTagText()
 }
 
 /* ------------------------------------------------------------------ */
-/* window message handling                                             */
+/* 窗口消息 */
 /* ------------------------------------------------------------------ */
 
 LRESULT CALLBACK ClipboardBubble::SearchEditProc(HWND hwnd, UINT message, WPARAM wParam,
@@ -2996,8 +3044,8 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                                  static_cast<BYTE>(theme_.fg.b * 255.0f)));
             const bool modalField = (source == modalEdit_ || source == noteEdit_);
             const D2D1_COLOR_F fill = modalField
-                                          ? (theme_.dark ? Rgb(0x262626) : Rgb(0xFFFFFF))
-                                          : (theme_.dark ? Rgb(0x4A4A4A) : Rgb(0xEDEDED));
+                                          ? (theme_.dark ? util::Rgb(0x262626) : util::Rgb(0xFFFFFF))
+                                          : (theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xEDEDED));
             const COLORREF bg = RGB(static_cast<BYTE>(fill.r * 255.0f),
                                     static_cast<BYTE>(fill.g * 255.0f),
                                     static_cast<BYTE>(fill.b * 255.0f));
@@ -3231,7 +3279,17 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                         break;
                     case 2:
                         if (onHangEntry_) {
-                            onHangEntry_(entry.kind, entry.label, entry.path, entry.thumb);
+                            /* 文本条目要把轻雪的记录 id 带上去：卡片只记 id，正文从轻雪读 */
+                            std::wstring entryId;
+                            if (host_ && host_->entry_id) {
+                                wchar_t id[128]{};
+                                if (host_->entry_id(host_->user, entryIndex, id,
+                                                    static_cast<int>(std::size(id)))) {
+                                    entryId = id;
+                                }
+                            }
+                            onHangEntry_(entry.kind, entry.label, entry.path, entry.thumb,
+                                         entryId);
                             Close();
                         } else if (entry.kind == SNOWAIR_ENTRY_TEXT && onHangText_) {
                             onHangText_(entry.label);
@@ -3547,7 +3605,7 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
 }
 
 /* ------------------------------------------------------------------ */
-/* fonts                                                               */
+/* 字体 */
 /* ------------------------------------------------------------------ */
 
 void ClipboardBubble::EnsureFormats(float scale)

@@ -47,8 +47,8 @@ public:
 
     void Draw(ID2D1RenderTarget* target, const std::vector<Item>& items, const Theme& theme,
               float expandAmount, float swaySeconds, float basketHover, float paper0,
-              float paper1, float paper2, float cardHover, int cardHoverIndex, int hovered,
-              int pressed, int historyCount, int clipboardCount);
+              float cardHover, int cardHoverIndex, int hovered, int pressed,
+              int historyCount, int clipboardCount);
 
     RackHit HitTest(float x, float y, float scale) const;
     const CardBox* Card(int index) const;
@@ -66,6 +66,13 @@ public:
         return false;
     }
     void SetDragging(int index) { dragging_ = index; }
+    /* 光标压在卡片哪个控件上（锁定/关闭），用来做悬停反馈。 */
+    void SetHoverPart(int part, int index) {
+        hoverPart_ = part;
+        hoverPartIndex_ = index;
+    }
+    /* 正在编辑器里的便签：卡片先藏起来，只留绳子上的夹子。 */
+    void SetEditingCard(int index) { editingCard_ = index; }
 
     const RackLayout& layout() const { return layout_; }
     bool hasLayout() const { return !cards_.empty(); }
@@ -77,8 +84,8 @@ private:
     void DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, float scale,
                         bool hovered);
     void DrawCard(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
-                  const Theme& theme, float scale, float swayAngle, float hoverAmount,
-                  bool hovered, bool pressed);
+                  float scale, float swayAngle, float hoverAmount, bool hovered,
+                  bool pressed, bool hotLock = false, bool hotClose = false);
     void DrawNote(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                   const Theme& theme, float scale, float swayAngle);
     void DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Theme& theme,
@@ -88,22 +95,20 @@ private:
                        float scale);
     void DrawClipAt(ID2D1RenderTarget* target, float centerX, float clipTop, const Theme& theme,
                     float scale, float heightDips = 24.0f);
-    void DrawAccessories(ID2D1RenderTarget* target, const std::vector<Item>& items,
-                         const Theme& theme, float scale, float expandAmount,
-                         float basketHover, float paper0, float paper1, float paper2,
-                         int historyCount, int clipboardCount);
+    void DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, float scale,
+                         float expandAmount, float basketHover, float paper0, int historyCount,
+                         int clipboardCount);
     void DrawCountBadge(ID2D1RenderTarget* target, float centerX, float top, int count,
                         float scale);
     void DrawCopyToast(ID2D1RenderTarget* target, float scale);
-    void DrawArrival(ID2D1RenderTarget* target, const Item& item, const Theme& theme,
-                     float scale);
+    void DrawArrival(ID2D1RenderTarget* target, const Item& item, float scale);
     void LoadIconFont();
     void BuildIconGlyph(uint32_t codepoint, ComPtr<ID2D1PathGeometry>& out);
     void DrawIcon(ID2D1RenderTarget* target, ID2D1PathGeometry* glyph,
                   D2D1_POINT_2F center, float size, ID2D1Brush* brush);
     void DrawLine(ID2D1RenderTarget* target, const Theme& theme, float scale,
                   float expandAmount);
-    void DrawRemoved(ID2D1RenderTarget* target, const Theme& theme, float scale);
+    void DrawRemoved(ID2D1RenderTarget* target, float scale);
 
     Graphics* graphics_ = nullptr;
     ComPtr<IDWriteTextFormat> noteFormat_;
@@ -139,6 +144,9 @@ private:
     float lineRetract_ = 0.0f;
     float cardScale_ = 1.0f;
     int lastHovered_ = -1;
+    int hoverPart_ = 0;
+    int hoverPartIndex_ = -1;
+    int editingCard_ = -1;
     int arrivalIndex_ = -1;
     uint64_t arrivalStartMs_ = 0;
     D2D1_POINT_2F arrivalStart_{};

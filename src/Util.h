@@ -35,6 +35,11 @@ std::wstring Utf8ToWide(const std::string& text);
 UINT DpiForMonitor(HMONITOR monitor);
 float ScaleForMonitor(HMONITOR monitor);
 
+/* 单个文件路径的 CF_HDROP 数据块（调用方负责 GlobalFree / 交给剪贴板）。 */
+HGLOBAL MakeDropFilesHandle(const std::wstring& path);
+
+/* 0xRRGGBB -> 不透明颜色。 */
+D2D1_COLOR_F Rgb(uint32_t rgb);
 D2D1_COLOR_F ColorFromArgb(uint32_t argb, D2D1_COLOR_F fallback);
 D2D1_COLOR_F WithAlpha(const D2D1_COLOR_F& color, float alpha);
 

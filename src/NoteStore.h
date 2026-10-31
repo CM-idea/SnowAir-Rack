@@ -10,10 +10,9 @@ struct NoteEntry {
 };
 
 /*
- * Notes are the only thing we persist. Screenshots themselves remain SnowAir's
- * files; the plugin never owns them.
+ * 便签是这里唯一持久化下来的内容；截图本身是轻雪的文件，插件从不持有。
  *
- * File: <data>\rack.json  (UTF-8)
+ * 文件：<data>\rack.json（UTF-8）
  * {
  *   "version": 1,
  *   "notes": [ { "path": "C:\\...\\shot.png", "text": "...", "color": 0 } ]

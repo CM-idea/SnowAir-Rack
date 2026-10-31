@@ -78,7 +78,7 @@ bool SetHandleData(UINT format, HGLOBAL handle)
         GlobalFree(handle);
         return false;
     }
-    /* Clipboard owns the handle now. */
+    /* 句柄已经交给剪贴板，这里不能再释放。 */
     return true;
 }
 
@@ -144,29 +144,6 @@ HGLOBAL MakeDibHandle(const DecodedImage& image)
     return handle;
 }
 
-HGLOBAL MakeDropHandle(const std::wstring& path)
-{
-    const size_t bytes = sizeof(DROPFILES) + (path.size() + 2) * sizeof(wchar_t);
-    HGLOBAL handle = AllocGlobal(bytes);
-    if (!handle) {
-        return nullptr;
-    }
-    auto* drop = static_cast<DROPFILES*>(GlobalLock(handle));
-    if (!drop) {
-        GlobalFree(handle);
-        return nullptr;
-    }
-    drop->pFiles = sizeof(DROPFILES);
-    drop->fWide = TRUE;
-    wchar_t* text = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(drop) +
-                                               sizeof(DROPFILES));
-    std::memcpy(text, path.c_str(), path.size() * sizeof(wchar_t));
-    text[path.size()] = L'\0';
-    text[path.size() + 1] = L'\0';
-    GlobalUnlock(handle);
-    return handle;
-}
-
 } /* namespace */
 
 bool CopyText(const std::wstring& text)
@@ -200,7 +177,7 @@ bool CopyFilePath(const std::wstring& path)
     }
     bool ok = false;
     if (EmptyClipboard()) {
-        ok = SetClipboardData(CF_HDROP, MakeDropHandle(path)) != nullptr;
+        ok = SetClipboardData(CF_HDROP, util::MakeDropFilesHandle(path)) != nullptr;
     }
     CloseClipboard();
     return ok;
@@ -243,7 +220,7 @@ bool CopyImage(const std::wstring& path)
                 any |= SetHandleData(imagePng, MakePngHandle(png));
             }
         }
-        any |= SetHandleData(CF_HDROP, MakeDropHandle(path));
+        any |= SetHandleData(CF_HDROP, util::MakeDropFilesHandle(path));
         ok = any;
     }
 

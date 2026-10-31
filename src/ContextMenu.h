@@ -18,11 +18,11 @@ struct MenuItem {
 };
 
 /*
- * Self-drawn context menu.
+ * 自绘右键菜单。
  *
- * SnowAir's rack window is WS_EX_NOACTIVATE; a native TrackPopupMenu on such a
- * window can appear but does not reliably receive clicks. Drawing our own menu
- * keeps activation out of the picture and matches the rack's visual language.
+ * 晾衣架窗口带 WS_EX_NOACTIVATE，在这种窗口上弹原生 TrackPopupMenu
+ * 虽然能显示出来，但收不到点击。自绘菜单绕开了激活问题，
+ * 视觉上也和晾衣架保持一致。
  */
 class ContextMenu : public LayeredWindow {
 public:

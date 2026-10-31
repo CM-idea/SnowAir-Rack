@@ -131,8 +131,8 @@ private:
     float envelopeHover_ = 0.0f;
     float envelopeHoverTarget_ = 0.0f;
     float envelopeHoverVelocity_ = 0.0f;
-    float paperPos_[3] = {0.0f, 0.0f, 0.0f};
-    float paperVelocity_[3] = {0.0f, 0.0f, 0.0f};
+    float paperPos_ = 0.0f;
+    float paperVelocity_ = 0.0f;
     uint64_t envelopeEnterMs_ = 0;
     float cardHover_ = 0.0f;
     float cardHoverTarget_ = 0.0f;
@@ -180,6 +180,10 @@ private:
     POINT pressPoint_{};
 
     int clickItemId_ = -1;
+    int lastHoverPart_ = -1;
+    int lastHoverPartIndex_ = -1;
+    /* 便签编辑器开着时绳子保持展开，不自动收回。 */
+    bool editingNote_ = false;
 
     int previewIndex_ = -1;
     uint64_t previewHideAt_ = 0;
