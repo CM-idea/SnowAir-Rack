@@ -1124,7 +1124,27 @@ void RackView::DrawCountBadge(ID2D1RenderTarget* target, float centerX, float to
     if (!badgeFormat_) {
         return;
     }
-    const float width = 28.0f * s;
+    /* 三位数以上要显示成 999+，胶囊跟着文字加宽；两位数以内保持原来的尺寸。 */
+    wchar_t label[8]{};
+    if (count > 999) {
+        wcscpy_s(label, L"999+");
+    } else {
+        swprintf_s(label, L"%d", count);
+    }
+
+    float textWidth = 0.0f;
+    if (graphics_ && graphics_->dwrite()) {
+        ComPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(graphics_->dwrite()->CreateTextLayout(
+                label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), 120.0f * s,
+                18.0f * s, layout.GetAddressOf()))) {
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(layout->GetMetrics(&metrics))) {
+                textWidth = metrics.widthIncludingTrailingWhitespace;
+            }
+        }
+    }
+    const float width = std::max(28.0f * s, textWidth + 10.0f * s);
     const float height = 18.0f * s;
     D2D1_RECT_F rect =
         D2D1::RectF(centerX - width * 0.5f, top, centerX + width * 0.5f, top + height);
@@ -1144,12 +1164,6 @@ void RackView::DrawCountBadge(ID2D1RenderTarget* target, float centerX, float to
     target->DrawRoundedRectangle(D2D1::RoundedRect(rect, 9.0f * s, 9.0f * s), border.Get(),
                                  0.8f * s);
 
-    wchar_t label[8]{};
-    if (count > 99) {
-        wcscpy_s(label, L"99+");
-    } else {
-        swprintf_s(label, L"%d", count);
-    }
     target->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), rect,
                      text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
