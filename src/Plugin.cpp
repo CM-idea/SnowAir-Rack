@@ -798,18 +798,15 @@ Item* Plugin::ItemById(int id)
     return index >= 0 ? &items_[static_cast<size_t>(index)] : nullptr;
 }
 
+/* 记录由轻雪统一负责（它默认就在记，没有开关），这里只负责读数量。 */
 int Plugin::HistoryCount()
 {
-    return config_.collectImages && host_ && host_->history_count
-               ? host_->history_count(host_->user)
-               : 0;
+    return host_ && host_->history_count ? host_->history_count(host_->user) : 0;
 }
 
 int Plugin::ClipboardCount()
 {
-    return config_.collectClipboard && host_ && host_->clipboard_count
-               ? host_->clipboard_count(host_->user)
-               : 0;
+    return host_ && host_->clipboard_count ? host_->clipboard_count(host_->user) : 0;
 }
 
 bool Plugin::HoverPreviewEnabled()

@@ -9,8 +9,6 @@ void RackConfig::Load(const SnowAirHost* host, void* user)
         enabled = host->config_get_bool(user, config_keys::kEnabled, true);
         autoCapture = host->config_get_bool(user, config_keys::kAutoCapture, true);
         autoRetract = host->config_get_bool(user, config_keys::kAutoRetract, true);
-        collectImages = host->config_get_bool(user, config_keys::kCollectImages, true);
-        collectClipboard = host->config_get_bool(user, config_keys::kCollectClipboard, true);
     }
     if (host->config_get_int) {
         hoverDelayMs = host->config_get_int(user, config_keys::kHoverDelay, 250);
