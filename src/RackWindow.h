@@ -24,6 +24,12 @@ public:
     void Expand(bool peek);
     void ToggleVisibility();
     void Collapse();
+    /* 展开期间监听屏幕顶边的点击：点一下就收回。 */
+    void SetTopBarWatch(bool enabled);
+    bool IsTopBarPoint(POINT screen) const;
+    static LRESULT CALLBACK TopBarHookProc(int code, WPARAM wParam, LPARAM lParam);
+    static RackWindow* topBarOwner_;
+    HHOOK topBarHook_ = nullptr;
     bool expanded() const { return expand_ > 0.5f; }
 
     void Reposition();
@@ -147,6 +153,8 @@ private:
     uint64_t lastInside_ = 0;
     uint64_t hoverLineSince_ = 0;
     bool lineHover_ = false;
+    /* 刚在顶栏点过一下：指针离开顶边之前不再自动展开。 */
+    bool topBarSuppressed_ = false;
 
     int hovered_ = -1;
     uint64_t hoveredSince_ = 0;

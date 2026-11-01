@@ -18,6 +18,9 @@ constexpr int kAnimDurationMs = 170;
 constexpr int kPreviewDelayMs = 320;
 constexpr int kPreviewHideDelayMs = 180;
 constexpr int64_t kPeekDurationMs = 3000;
+/* 屏幕最上面这一条：点一下就收回，和「停在这里拉下来」用的是同一块区域。 */
+constexpr float kTopBarBand = 24.0f;
+constexpr UINT kMsgTopBarClick = WM_APP + 2;
 
 bool RecyclePath(const std::wstring& path)
 {
@@ -125,6 +128,7 @@ void RackWindow::Shutdown()
         KillTimer(hwnd(), kTimerEditWatch);
     }
     editingWatchActive_ = false;
+    SetTopBarWatch(false);
     menu_.Close();
     batchMenu_.Close();
     menu_.Destroy();
@@ -273,6 +277,63 @@ void RackWindow::Expand(bool peek)
     if (hwnd()) {
         SetTimer(hwnd(), kTimerAnim, 16, nullptr);
     }
+}
+
+RackWindow* RackWindow::topBarOwner_ = nullptr;
+
+void RackWindow::SetTopBarWatch(bool enabled)
+{
+    if (!hwnd()) {
+        return;
+    }
+    if (enabled == (topBarHook_ != nullptr)) {
+        return;
+    }
+    if (enabled) {
+        topBarOwner_ = this;
+        topBarHook_ = SetWindowsHookExW(WH_MOUSE_LL, &RackWindow::TopBarHookProc,
+                                        util::GetDllModule(), 0);
+        if (!topBarHook_) {
+            topBarOwner_ = nullptr;
+            RackLog(L"RackWindow: 顶栏点击监测装不上（%lu）", GetLastError());
+        }
+    } else {
+        if (topBarHook_) {
+            UnhookWindowsHookEx(topBarHook_);
+            topBarHook_ = nullptr;
+        }
+        if (topBarOwner_ == this) {
+            topBarOwner_ = nullptr;
+        }
+    }
+}
+
+bool RackWindow::IsTopBarPoint(POINT screen) const
+{
+    if (expand_ <= 0.5f) {
+        return false;
+    }
+    const HMONITOR monitor = MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return false;
+    }
+    const LONG band = static_cast<LONG>(std::lround(kTopBarBand * scale_));
+    return screen.y >= info.rcMonitor.top && screen.y < info.rcMonitor.top + band &&
+           screen.x >= info.rcMonitor.left && screen.x < info.rcMonitor.right;
+}
+
+LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN) &&
+        topBarOwner_ && topBarOwner_->hwnd()) {
+        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (mouse && topBarOwner_->IsTopBarPoint(mouse->pt)) {
+            PostMessageW(topBarOwner_->hwnd(), kMsgTopBarClick, 0, 0);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 void RackWindow::NormalizeLoadedSpacing()
@@ -541,6 +602,9 @@ void RackWindow::Animate()
     Reposition();
     Render();
 
+    /* 只在展开时挂钩子：收起状态点顶边是「拉下来」，不该再收回。 */
+    SetTopBarWatch(expand_ > 0.9f);
+
     const bool hoverSettled =
         std::abs(basketHover_ - basketHoverTarget_) < 0.003f &&
         std::abs(cardHover_ - cardHoverTarget_) < 0.003f && paperSettled;
@@ -742,6 +806,7 @@ void RackWindow::Tick()
         Render();
     } else if (IsFullscreenOn(monitor_)) {
         DismissPreview();
+        SetTopBarWatch(false);
         Hide();
         hiddenForFullscreen_ = true;
         expanding_ = false;
@@ -826,11 +891,16 @@ void RackWindow::UpdateHover()
     POINT cursor{};
     GetCursorPos(&cursor);
     const bool overLine = CursorOverLine();
+    /* 顶栏点击收回之后，指针往往还停在顶边上：在它离开之前不要再自动拉下来，
+       否则一松手就又弹回来了。 */
+    if (!overLine) {
+        topBarSuppressed_ = false;
+    }
     const bool overContent = CursorOverContent();
     const bool overPreview = PointOverPreview(cursor);
     const bool inside = overLine || overContent || overPreview;
 
-    if (overLine && expand_ < 0.3f) {
+    if (overLine && !topBarSuppressed_ && expand_ < 0.3f) {
         if (!lineHover_) {
             lineHover_ = true;
             hoverLineSince_ = now;
@@ -1723,6 +1793,15 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             break;
         }
         break;
+
+    case kMsgTopBarClick:
+        /* 顶栏被点了一下：用户已经用完，立即收回。
+           便签编辑器开着时不动——那时候绳子本来就要一直展开。 */
+        topBarSuppressed_ = true;
+        if (expand_ > 0.5f && !editingNote_) {
+            Collapse();
+        }
+        return 0;
 
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
