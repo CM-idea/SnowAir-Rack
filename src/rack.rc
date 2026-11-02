@@ -3,8 +3,8 @@
 101 ICON "res\\rack.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION 0,1,1,0
+ PRODUCTVERSION 0,1,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -17,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "SnowAir"
             VALUE "FileDescription", "SnowAir Rack plugin"
-            VALUE "FileVersion", "0.1.0.0"
+            VALUE "FileVersion", "0.1.1.0"
             VALUE "InternalName", "rack"
             VALUE "OriginalFilename", "rack.dll"
             VALUE "ProductName", "SnowAir-Rack"
-            VALUE "ProductVersion", "0.1.0.0"
+            VALUE "ProductVersion", "0.1.1.0"
         END
     END
     BLOCK "VarFileInfo"
