@@ -81,6 +81,7 @@ $lines = @(
     'windowscodecs.lib'
     'shlwapi.lib'
     'shell32.lib'
+    'version.lib'
     'ole32.lib'
     'oleaut32.lib'
     'user32.lib'

@@ -183,6 +183,15 @@ bool CopyFilePath(const std::wstring& path)
     return ok;
 }
 
+HGLOBAL MakeDibFromFile(const std::wstring& path)
+{
+    DecodedImage image;
+    if (!DecodeBgra(path, image)) {
+        return nullptr;
+    }
+    return MakeDibHandle(image);
+}
+
 bool CopyImage(const std::wstring& path)
 {
     if (!util::FileExists(path)) {

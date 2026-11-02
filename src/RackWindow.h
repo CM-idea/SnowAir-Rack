@@ -24,6 +24,13 @@ public:
     void Expand(bool peek);
     void ToggleVisibility();
     void Collapse();
+    /* 让某张卡片晃一下：重复上绳时提示「已经挂在这儿了」。 */
+    void ShakeCard(int index);
+    /* 从左往右检查最小间距，挨太近就用缓动推开。 */
+    void NormalizeSpacing(float ms);
+    /* 拖拽期间让绳子对鼠标透明：OLE 每次移动都要做命中测试，
+       一块全宽分层窗口挡在指针下面会明显拖慢拖拽。 */
+    void SetDragTransparent(bool on);
     /* 展开期间监听屏幕顶边的点击：点一下就收回。 */
     void SetTopBarWatch(bool enabled);
     bool IsTopBarPoint(POINT screen) const;
@@ -131,6 +138,8 @@ private:
     uint64_t animStart_ = 0;
     uint64_t revealStart_ = 0;
     uint64_t swingUntil_ = 0;
+    /* 单张卡片晃动的时间线，和整体摆动分开。 */
+    uint64_t shakeUntil_ = 0;
     float basketHover_ = 0.0f;
     float basketHoverTarget_ = 0.0f;
     float basketHoverVelocity_ = 0.0f;
@@ -173,6 +182,7 @@ private:
         float from = 0.0f;
         float to = 0.0f;
         uint64_t start = 0;
+        float ms = 180.0f;
     };
     std::vector<OffsetAnim> offsetAnims_;
     int pendingAdjustId_ = -1;

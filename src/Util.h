@@ -21,6 +21,9 @@ bool ReadFileBytes(const std::wstring& path, std::vector<BYTE>& out);
 bool WriteFileBytes(const std::wstring& path, const void* data, size_t size);
 
 uint64_t FileWriteTime(const std::wstring& path);
+/* 文件内容指纹（FNV-1a 64，超过 32MB 只取首尾各 16MB）：
+   用来判断「是不是同一个文件」，不依赖路径。 */
+uint64_t FileContentHash(const std::wstring& path);
 std::wstring TimestampName();
 std::wstring FullPath(const std::wstring& path);
 bool SamePath(const std::wstring& a, const std::wstring& b);

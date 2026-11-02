@@ -34,6 +34,8 @@ struct Item {
     bool ownsFile = false;    /* true for edited cache copies */
     uint64_t addedMs = 0;
     uint64_t mtime = 0;
+    /* 文件内容指纹：路径变了也能认出是同一个文件；0 = 还没算/算不出。 */
+    uint64_t contentHash = 0;
     bool editing = false;
     uint64_t editStartedMs = 0;
     std::wstring editPath;

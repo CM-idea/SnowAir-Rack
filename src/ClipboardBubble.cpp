@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cwctype>
 #include <filesystem>
+#include <set>
 
 namespace {
 
@@ -277,6 +278,40 @@ void ClipboardBubble::DrawGlyph(ID2D1RenderTarget* target, ID2D1PathGeometry* gl
 /* 数据 */
 /* ------------------------------------------------------------------ */
 
+std::wstring ClipboardBubble::EntryContentKey(const Entry& entry)
+{
+    if (entry.kind == SNOWAIR_ENTRY_TEXT) {
+        return L"t|" + (entry.text.empty() ? entry.label : entry.text);
+    }
+    if (entry.kind == SNOWAIR_ENTRY_IMAGE && !entry.path.empty()) {
+        const auto cached = contentHashes_.find(entry.path);
+        if (cached != contentHashes_.end()) {
+            return L"i|" + std::to_wstring(cached->second);
+        }
+        /* 只在文件不太大时读内容算指纹；超大文件退回路径，避免拖慢面板。 */
+        constexpr uint64_t kMaxHashBytes = 32ull * 1024 * 1024;
+        std::vector<BYTE> bytes;
+        uint64_t hash = 0;
+        if (util::ReadFileBytes(entry.path, bytes) && !bytes.empty() &&
+            bytes.size() <= kMaxHashBytes) {
+            hash = 1469598103934665603ull; /* FNV-1a 64 */
+            for (BYTE value : bytes) {
+                hash ^= value;
+                hash *= 1099511628211ull;
+            }
+        }
+        if (hash == 0) {
+            return L"p|" + entry.path;
+        }
+        contentHashes_[entry.path] = hash;
+        return L"i|" + std::to_wstring(hash);
+    }
+    if (!entry.path.empty()) {
+        return L"p|" + entry.path;
+    }
+    return L"l|" + entry.label;
+}
+
 void ClipboardBubble::LoadEntries()
 {
     entries_.clear();
@@ -289,10 +324,12 @@ void ClipboardBubble::LoadEntries()
     const int count = host_->entry_count(host_->user);
     if (count <= 0) return;
     entries_.reserve(static_cast<size_t>(count));
+    std::set<std::wstring> seen;
     for (int i = 0; i < count; ++i) {
         SnowAirEntry raw{};
         if (!host_->entry_get(host_->user, i, &raw)) continue;
         Entry entry;
+        entry.hostIndex = i;
         entry.label = raw.label;
         entry.path = raw.path;
         entry.thumb = raw.thumb;
@@ -323,6 +360,13 @@ void ClipboardBubble::LoadEntries()
                     static_cast<size_t>(length), textBuffer.size() - 1);
                 entry.text.assign(textBuffer.data(), keep);
             }
+        }
+        /* 同一个内容只保留最新的一条（列表是新的在前，所以先遇到的留下）。
+           图片按文件内容识别：同一张图即使存在电脑上不同位置，也只出现一次，
+           并且由新的那条占据靠前的位置；文本按正文、其它按路径/名称。 */
+        const std::wstring key = EntryContentKey(entry);
+        if (!seen.insert(key).second) {
+            continue;
         }
         entries_.push_back(std::move(entry));
     }
@@ -2683,7 +2727,9 @@ void ClipboardBubble::CloseTagEditor(bool save)
     if (save && entryIndex >= 0 && entryIndex < static_cast<int>(entries_.size())) {
         const std::wstring joined = JoinLines(tagSelection_);
         if (host_ && host_->entry_tags_set) {
-            host_->entry_tags_set(host_->user, entryIndex, joined.c_str());
+            host_->entry_tags_set(host_->user,
+                                  entries_[static_cast<size_t>(entryIndex)].hostIndex,
+                                  joined.c_str());
         }
         entries_[static_cast<size_t>(entryIndex)].tags = tagSelection_;
         {
@@ -3271,11 +3317,11 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                 if (action < static_cast<int>(actions.size())) {
                     switch (actions[static_cast<size_t>(action)]) {
                     case 0:
-                        if (host_ && host_->entry_copy) host_->entry_copy(host_->user, entryIndex);
+                        if (host_ && host_->entry_copy) host_->entry_copy(host_->user, entry.hostIndex);
                         Close();
                         break;
                     case 1:
-                        if (host_ && host_->entry_reveal) host_->entry_reveal(host_->user, entryIndex);
+                        if (host_ && host_->entry_reveal) host_->entry_reveal(host_->user, entry.hostIndex);
                         break;
                     case 2:
                         if (onHangEntry_) {
@@ -3283,7 +3329,7 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                             std::wstring entryId;
                             if (host_ && host_->entry_id) {
                                 wchar_t id[128]{};
-                                if (host_->entry_id(host_->user, entryIndex, id,
+                                if (host_->entry_id(host_->user, entry.hostIndex, id,
                                                     static_cast<int>(std::size(id)))) {
                                     entryId = id;
                                 }
@@ -3299,12 +3345,12 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                             onHangImage_(entry.path);
                             Close();
                         } else if (host_ && host_->entry_hang &&
-                                   host_->entry_hang(host_->user, entryIndex)) {
+                                   host_->entry_hang(host_->user, entry.hostIndex)) {
                             Close();
                         }
                         break;
                     default:
-                        if (host_ && host_->entry_delete) host_->entry_delete(host_->user, entryIndex);
+                        if (host_ && host_->entry_delete) host_->entry_delete(host_->user, entry.hostIndex);
                         LoadEntries();
                         RefreshCategories();
                         Reload(true);

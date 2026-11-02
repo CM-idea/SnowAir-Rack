@@ -50,6 +50,10 @@ public:
               float cardHover, int cardHoverIndex, int hovered, int pressed,
               int historyCount, int clipboardCount);
 
+    /* 拖拽时跟手的卡片图：用和绳子上完全相同的画法渲染到一张 DIB，
+       调用方负责 DeleteObject。 */
+    HBITMAP MakeDragGhost(const Item& item, int width, int height, SIZE* sizeOut);
+
     RackHit HitTest(float x, float y, float scale) const;
     const CardBox* Card(int index) const;
     float DefaultGap() const { return 24.0f * scale_ * cardScale_; }
@@ -59,6 +63,12 @@ public:
     void BeginArrival(int index);
     void SetArrivalStart(float x, float y, float w = 0.0f, float h = 0.0f);
     bool HasArrival() const;
+    /* 掉落/飞行动画实际需要的高度（相对窗口顶部）；用它决定窗口多高，
+       不要为了动画把整个工作区都做成窗口，那会让每帧上传的位图非常大。 */
+    float AnimationHeight() const;
+    /* 卡片位置是否还在弹簧里往目标位置收（用于决定要不要继续跑动画）。 */
+    bool HasSliding() const { return sliding_; }
+
     bool HasFalling() const {
         for (const auto& item : removed_) {
             if (!item.toBasket) return true;
@@ -90,6 +100,10 @@ private:
                   const Theme& theme, float scale, float swayAngle);
     void DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Theme& theme,
                  float scale);
+    /* 文件卡片左下角：文件夹图标 + 类型/数量文字。 */
+    void DrawFileBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card, const Item& item,
+                       float scale);
+
     /* 卡片左下角的类型角标：2=录屏，3=文件。 */
     void DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card, int kind,
                        float scale);
@@ -114,11 +128,13 @@ private:
     ComPtr<IDWriteTextFormat> noteFormat_;
     ComPtr<IDWriteTextFormat> placeholderFormat_;
     ComPtr<IDWriteTextFormat> badgeFormat_;
+    ComPtr<IDWriteTextFormat> fileTagFormat_;
     ComPtr<IDWriteTextFormat> toastFormat_;
     ComPtr<IDWriteFontFace> iconFace_;
     ComPtr<ID2D1PathGeometry> iconLock_;
     ComPtr<ID2D1PathGeometry> iconUnlock_;
     ComPtr<ID2D1PathGeometry> iconClose_;
+    ComPtr<ID2D1PathGeometry> iconFolder_;
     ImageBitmap basket_;
     ImageBitmap basketTheme_[4];
     ImageBitmap envelope_;
@@ -139,6 +155,20 @@ private:
     RackLayout layout_;
     D2D1_RECT_F basketRect_{};
     D2D1_RECT_F envelopeRect_{};
+    /* 每张卡片的「显示位置」：目标位置由布局按索引算出，实际位置用弹簧追过去。
+       叉掉一张后，后面卡片的目标位置整体左移，弹簧把它平滑带过去。 */
+    struct SlotSpring {
+        int id = 0;
+        float pos = 0.0f;
+        float velocity = 0.0f;
+        float target = 0.0f;
+        uint64_t holdUntil = 0;
+        bool primed = false;
+    };
+    std::vector<SlotSpring> slots_;
+    uint64_t lastLayoutMs_ = 0;
+    bool sliding_ = false;
+
     float scale_ = 1.0f;
     float formatScale_ = 0.0f;
     float lineRetract_ = 0.0f;

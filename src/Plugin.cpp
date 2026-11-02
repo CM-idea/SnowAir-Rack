@@ -110,6 +110,40 @@ bool Plugin::Init(const SnowAirHost* host)
     while (static_cast<int>(items_.size()) > config_.maxItems) {
         items_.erase(items_.begin());
     }
+    /* 启动时把历史遗留的重复卡片收一收：同样的内容只留最早那张。 */
+    {
+        std::vector<Item> unique;
+        unique.reserve(items_.size());
+        int dropped = 0;
+        for (auto& item : items_) {
+            bool duplicated = false;
+            for (const auto& kept : unique) {
+                if (kept.kind != item.kind) continue;
+                if (item.kind == 1) {
+                    duplicated = !item.note.empty() && kept.note == item.note;
+                } else if (!item.path.empty()) {
+                    duplicated = util::SamePath(kept.path, item.path) ||
+                                 (item.contentHash != 0 && kept.contentHash == item.contentHash);
+                } else {
+                    duplicated = !item.label.empty() && kept.label == item.label;
+                }
+                if (duplicated) break;
+            }
+            if (duplicated) {
+                ++dropped;
+            } else {
+                unique.push_back(std::move(item));
+            }
+        }
+        /* 注意：上面的 move 已经把 items_ 里的元素搬空了，这里必须无条件换回来，
+           否则剩下的会是「空壳」，保存出去就等于把卡片全删了。 */
+        items_ = std::move(unique);
+        if (dropped > 0) {
+            RackLog(L"启动去重：移除 %d 张重复卡片", dropped);
+        }
+    }
+    /* 老数据没有内容指纹：把补算的结果写回去，下次启动就不用再算。 */
+    SaveItems();
 
     window_ = std::make_unique<RackWindow>();
     if (!window_->Init(this, graphics_.get())) {
@@ -185,11 +219,10 @@ void Plugin::OnCapture(const wchar_t* path)
         return;
     }
 
-    for (const auto& existing : items_) {
+    for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
+        const Item& existing = items_[static_cast<size_t>(i)];
         if (util::SamePath(existing.path, full) || util::SamePath(existing.sourcePath, full)) {
-            if (window_) {
-                window_->Expand(true);
-            }
+            NudgeExistingItem(i);
             return;
         }
     }
@@ -217,6 +250,7 @@ void Plugin::OnCapture(const wchar_t* path)
         }
     }
     item.mtime = util::FileWriteTime(full);
+    item.contentHash = util::FileContentHash(full);
     if (const NoteEntry* note = notes_.Find(full)) {
         item.note = note->text;
         item.noteColor = note->color;
@@ -225,6 +259,12 @@ void Plugin::OnCapture(const wchar_t* path)
     if (window_) {
         window_->DismissPreview();
     }
+    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+        NudgeExistingItem(duplicate);
+        return;
+    }
+
     items_.push_back(std::move(item));
     while (static_cast<int>(items_.size()) > config_.maxItems) {
         RemoveItemData(0);
@@ -240,9 +280,9 @@ void Plugin::OnHangImage(const std::wstring& path)
 {
     if (!initialized_ || path.empty()) return;
     const std::wstring full = util::FullPath(path);
-    for (const auto& existing : items_) {
-        if (util::SamePath(existing.path, full)) {
-            if (window_) window_->Expand(true);
+    for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
+        if (util::SamePath(items_[static_cast<size_t>(i)].path, full)) {
+            NudgeExistingItem(i);
             return;
         }
     }
@@ -259,6 +299,13 @@ void Plugin::OnHangImage(const std::wstring& path)
     item.aspect = aspect;
     item.addedMs = 0;
     item.mtime = util::FileWriteTime(full);
+    item.contentHash = util::FileContentHash(full);
+    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+        NudgeExistingItem(duplicate);
+        return;
+    }
+
     items_.push_back(std::move(item));
     while (static_cast<int>(items_.size()) > config_.maxItems) {
         RemoveItemData(0);
@@ -281,8 +328,8 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
             OnHangText(label);
             return;
         }
-        if (FindNoteItem(entryId) >= 0) {
-            if (window_) window_->Expand(true);
+        if (const int existing = FindNoteItem(entryId); existing >= 0) {
+            NudgeExistingItem(existing);
             return;
         }
         std::wstring text;
@@ -301,12 +348,8 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         item.path = util::FullPath(path);
         item.sourcePath = item.path;
         item.mtime = util::FileWriteTime(item.path);
-        for (const auto& existing : items_) {
-            if (existing.kind == 0 && util::SamePath(existing.path, item.path)) {
-                if (window_) window_->Expand(true);
-                return;
-            }
-        }
+    item.contentHash = util::FileContentHash(item.path);
+
         UINT width = 0, height = 0;
         if (graphics_ && SUCCEEDED(graphics_->images().GetSize(item.path, width, height)) &&
             width > 0 && height > 0) {
@@ -322,6 +365,7 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
             item.path = util::FullPath(path);
             item.sourcePath = item.path;
             item.mtime = util::FileWriteTime(item.path);
+    item.contentHash = util::FileContentHash(item.path);
         }
         const std::wstring cover = thumb.empty() ? std::wstring() : util::FullPath(thumb);
         if (!cover.empty() && util::FileExists(cover)) {
@@ -333,13 +377,7 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
                 item.aspect = static_cast<float>(width) / static_cast<float>(height);
             }
         }
-        for (const auto& existing : items_) {
-            if (existing.kind == 2 && !item.path.empty() &&
-                util::SamePath(existing.path, item.path)) {
-                if (window_) window_->Expand(true);
-                return;
-            }
-        }
+
     } else {
         /* 文件 / 其他：纯色卡片 + 文件夹图标，文字用条目名。 */
         item.kind = 3;
@@ -348,11 +386,18 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
             item.path = util::FullPath(path);
             item.sourcePath = item.path;
             item.mtime = util::FileWriteTime(item.path);
+    item.contentHash = util::FileContentHash(item.path);
         }
         if (item.label.empty() && !item.path.empty()) {
             item.label = std::filesystem::path(item.path).filename().wstring();
         }
         if (item.label.empty()) return;
+    }
+
+    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+        NudgeExistingItem(duplicate);
+        return;
     }
 
     items_.push_back(std::move(item));
@@ -431,6 +476,16 @@ void Plugin::OnHangText(const std::wstring& text)
     if (!initialized_) return;
     const std::wstring body = TrimNoteText(text);
     if (body.empty()) return;
+    /* 同样内容的便签已经在绳子上：晃一下，不再挂第二张。 */
+    {
+        Item probe;
+        probe.kind = 1;
+        probe.note = body;
+        if (const int existing = FindDuplicateItem(probe); existing >= 0) {
+            NudgeExistingItem(existing);
+            return;
+        }
+    }
     std::wstring noteId;
     if (!CreateNoteRecord(body, noteId)) {
         RackLog(L"便签没能写进轻雪，已放弃上绳");
@@ -449,6 +504,12 @@ void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId)
     item.noteColor = 2; /* yellow sticky note */
     item.aspect = 1.1f;
     item.addedMs = 0;   /* no drop-in spring: avoids a flicker on landing */
+    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+        NudgeExistingItem(duplicate);
+        return;
+    }
+
     items_.push_back(std::move(item));
     while (static_cast<int>(items_.size()) > config_.maxItems) {
         /* 超出上限：卡片落下，但轻雪里的记录保留 */
@@ -506,6 +567,42 @@ void Plugin::DeleteNoteRecord(const std::wstring& noteId)
     if (!host_ || !host_->entry_delete_id || noteId.empty()) return;
     host_->entry_delete_id(host_->user, noteId.c_str());
     if (host_->entry_refresh) host_->entry_refresh(host_->user);
+}
+
+int Plugin::FindDuplicateItem(const Item& item) const
+{
+    for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
+        const Item& existing = items_[static_cast<size_t>(i)];
+        if (existing.kind != item.kind) {
+            continue;
+        }
+        if (item.kind == 1) {
+            /* 便签比正文：同样的文字不重复挂。 */
+            if (!item.note.empty() && existing.note == item.note) {
+                return i;
+            }
+        } else if (!item.path.empty()) {
+            if (util::SamePath(existing.path, item.path)) {
+                return i;
+            }
+            /* 路径不同但内容指纹相同：同一张图放在不同位置，也算重复。 */
+            if (item.contentHash != 0 && existing.contentHash == item.contentHash) {
+                return i;
+            }
+        } else if (!item.label.empty() && existing.label == item.label) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void Plugin::NudgeExistingItem(int index)
+{
+    if (!window_ || index < 0) {
+        return;
+    }
+    window_->Expand(true);
+    window_->ShakeCard(index);
 }
 
 int Plugin::FindNoteItem(const std::wstring& noteId) const
@@ -575,6 +672,7 @@ void Plugin::DestroyNote(int index)
 
 void Plugin::OnQuickHang(const wchar_t* path)
 {
+    /* 只记路径，不复制文件：图片本身归轻雪所有，插件不另存一份。 */
     const bool autoCapture = config_.autoCapture;
     config_.autoCapture = true;
     manualHang_ = true;

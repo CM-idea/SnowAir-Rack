@@ -86,6 +86,10 @@ private:
     bool UpdateNoteRecord(const std::wstring& noteId, const std::wstring& text);
     void DeleteNoteRecord(const std::wstring& noteId);
     int FindNoteItem(const std::wstring& noteId) const;
+    /* 同一套「重复上绳」判定：便签比正文，其它比路径，没有路径时比标题。 */
+    int FindDuplicateItem(const Item& item) const;
+    /* 重复时的反馈：展开绳子 + 让那张卡片晃一下。 */
+    void NudgeExistingItem(int index);
 
     std::unique_ptr<RackWindow> window_;
     std::unique_ptr<ClipboardBubble> clipboard_;

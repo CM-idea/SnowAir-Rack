@@ -12,7 +12,8 @@ bool ItemStore::Load(std::vector<Item>& items) const
 {
     items.clear();
     std::vector<BYTE> bytes;
-    if (!util::ReadFileBytes(FilePath(), bytes) || bytes.empty()) {
+    const bool loaded = util::ReadFileBytes(FilePath(), bytes);
+    if (!loaded || bytes.empty()) {
         return true;
     }
     std::string text(bytes.begin(), bytes.end());
@@ -78,6 +79,10 @@ bool ItemStore::Load(std::vector<Item>& items) const
             added && added->type == json::Type::Number) {
             item.addedMs = static_cast<uint64_t>(added->number);
         }
+        if (const json::Value* hashValue = value.Get("hash");
+            hashValue && hashValue->type == json::Type::String && !hashValue->text.empty()) {
+            item.contentHash = _wcstoui64(util::Utf8ToWide(hashValue->text).c_str(), nullptr, 16);
+        }
         if (const json::Value* color = value.Get("noteColor");
             color && color->type == json::Type::Number) {
             item.noteColor = rack::ClampInt(static_cast<int>(color->number), 0, 2);
@@ -103,11 +108,14 @@ bool ItemStore::Load(std::vector<Item>& items) const
             const std::wstring sourcePath = util::Utf8ToWide(source->text);
             if (!sourcePath.empty()) item.sourcePath = sourcePath;
         }
-        if (!util::FileExists(item.path) && !hasNote && item.label.empty()) {
-            continue;
-        }
+        /* 文件暂时找不到也保留卡片：宁可显示「无法读取」，
+           也不要让它悄悄从绳子上消失（用户会以为记录被清空）。 */
         if (item.path.empty()) item.aspect = 1.1f;
         item.mtime = util::FileWriteTime(item.path);
+        /* 老数据没有指纹：补算一次，之后就能靠内容认文件。 */
+        if (item.contentHash == 0 && util::FileExists(item.path)) {
+            item.contentHash = util::FileContentHash(item.path);
+        }
         items.push_back(std::move(item));
     }
     return true;
@@ -144,12 +152,23 @@ bool ItemStore::Save(const std::vector<Item>& items) const
         output += ", \"note\": ";
         output += json::Quote(noteCard ? std::string() : util::WideToUtf8(item.note));
         output += ", \"noteColor\": " + std::to_string(item.noteColor);
+        {
+            wchar_t hashText[32]{};
+            swprintf_s(hashText, L"%016llX", static_cast<unsigned long long>(item.contentHash));
+            output += ", \"hash\": " + json::Quote(util::WideToUtf8(hashText));
+        }
         output += " }";
     }
     output += "\n  ]\n}\n";
 
     const std::wstring target = FilePath();
     const std::wstring temp = target + L".tmp";
+    /* 覆盖之前先把上一版留成 .bak：万一哪次写坏了还能捞回来。 */
+    if (util::FileExists(target)) {
+        const std::wstring backup = target + L".bak";
+        DeleteFileW(backup.c_str());
+        CopyFileW(target.c_str(), backup.c_str(), FALSE);
+    }
     if (!util::WriteFileBytes(temp, output.data(), output.size())) {
         RackLog(L"ItemStore: failed to write %s", temp.c_str());
         return false;

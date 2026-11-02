@@ -1,6 +1,9 @@
 #include "DragDrop.h"
+#include "Clipboard.h"
 #include "Util.h"
 
+#include <filesystem>
+#include <fstream>
 #include <shlobj.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -151,6 +154,105 @@ HBITMAP MakeDragBitmap(const std::wstring& path, int cardWidth, int cardHeight,
     return bitmap;
 }
 
+/* 文本卡片拖拽时用的示意图：便签纸色 + 正文前三行。 */
+HBITMAP MakeTextDragBitmap(const std::wstring& text, int cardWidth, int cardHeight,
+                           float frameWidth, SIZE* sizeOut)
+{
+    if (cardWidth < 24 || cardHeight < 24) {
+        return nullptr;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = cardWidth;
+    info.bmiHeader.biHeight = -cardHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bitmap || !pixels) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        return nullptr;
+    }
+    auto* dst = static_cast<BYTE*>(pixels);
+    std::memset(dst, 0, static_cast<size_t>(cardWidth) * cardHeight * 4);
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+    RECT paper{0, 0, cardWidth, cardHeight};
+    HBRUSH brush = CreateSolidBrush(RGB(0xF4, 0xD4, 0x76));
+    FillRect(dc, &paper, brush);
+    DeleteObject(brush);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(0x5A, 0x46, 0x2A));
+    const float scaleFactor = std::max(0.6f, frameWidth / 4.0f);
+    const int fontHeight = -static_cast<int>(13.0f * scaleFactor + 0.5f);
+    HFONT font = CreateFontW(fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                             L"Microsoft YaHei UI");
+    HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+    RECT textRect{static_cast<LONG>(12.0f * scaleFactor), static_cast<LONG>(10.0f * scaleFactor),
+                  cardWidth - static_cast<LONG>(12.0f * scaleFactor),
+                  cardHeight - static_cast<LONG>(10.0f * scaleFactor)};
+    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &textRect,
+              DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_END_ELLIPSIS);
+    if (oldFont) {
+        SelectObject(dc, oldFont);
+    }
+    if (font) {
+        DeleteObject(font);
+    }
+    SelectObject(dc, oldBitmap);
+    DeleteDC(dc);
+
+    /* 圆角之外、以及半覆盖的边缘按覆盖率预乘 alpha（OLE 拖拽图要求预乘）。 */
+    const double radius = 12.0 * frameWidth / 4.0;
+    auto insideRounded = [&](double x, double y) {
+        if (x < 0.0 || y < 0.0 || x >= cardWidth || y >= cardHeight) {
+            return false;
+        }
+        const double cx = std::min(std::max(x, radius), cardWidth - radius);
+        const double cy = std::min(std::max(y, radius), cardHeight - radius);
+        const double dx = x - cx;
+        const double dy = y - cy;
+        return dx * dx + dy * dy <= radius * radius;
+    };
+    for (int y = 0; y < cardHeight; ++y) {
+        for (int x = 0; x < cardWidth; ++x) {
+            double coverage = 0.0;
+            for (int sy = 0; sy < 2; ++sy) {
+                for (int sx = 0; sx < 2; ++sx) {
+                    if (insideRounded(x + (sx + 0.5) * 0.5, y + (sy + 0.5) * 0.5)) {
+                        coverage += 0.25;
+                    }
+                }
+            }
+            BYTE* pixel = dst + (static_cast<size_t>(y) * cardWidth + x) * 4;
+            if (coverage <= 0.0) {
+                pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0;
+                continue;
+            }
+            pixel[0] = static_cast<BYTE>(pixel[0] * coverage);
+            pixel[1] = static_cast<BYTE>(pixel[1] * coverage);
+            pixel[2] = static_cast<BYTE>(pixel[2] * coverage);
+            pixel[3] = static_cast<BYTE>(255.0 * coverage);
+        }
+    }
+    if (sizeOut) {
+        sizeOut->cx = cardWidth;
+        sizeOut->cy = cardHeight;
+    }
+    return bitmap;
+}
+
 HWND CreateDragPreview(HBITMAP bitmap, int width, int height)
 {
     static bool registered = false;
@@ -206,14 +308,20 @@ public:
     {
         util::ReadFileBytes(path, png_);
 
-        const UINT drop = CF_HDROP;
+        /* 先给位图，再给文件，最后给 PNG 字节：
+           设计软件（Illustrator 等）优先取 CF_DIB，粘进去的是图片本身，
+           而不会把路径当成文本来排版；资源管理器这类只要文件的仍拿 CF_HDROP。 */
         const UINT png = RegisterClipboardFormatW(L"PNG");
-        const UINT text = CF_UNICODETEXT;
+        const UINT pngMime = RegisterClipboardFormatW(L"image/png");
 
-        formats_[0] = MakeFormat(drop);
-        formats_[1] = MakeFormat(png);
-        formats_[2] = MakeFormat(text);
-        count_ = png ? 3 : 2;
+        formats_[count_++] = MakeFormat(CF_DIB);
+        formats_[count_++] = MakeFormat(CF_HDROP);
+        if (png) {
+            formats_[count_++] = MakeFormat(png);
+        }
+        if (pngMime) {
+            formats_[count_++] = MakeFormat(pngMime);
+        }
     }
 
     /* IUnknown 接口 */
@@ -283,23 +391,18 @@ public:
         }
 
         HGLOBAL handle = nullptr;
-        if (format->cfFormat == CF_HDROP) {
+        if (format->cfFormat == CF_DIB) {
+            if (!dib_) {
+                dib_ = clipboard::MakeDibFromFile(path_);
+            }
+            if (dib_) {
+                handle = OleDuplicateData(dib_, CF_DIB, GMEM_MOVEABLE);
+            }
+        } else if (format->cfFormat == CF_HDROP) {
             handle = util::MakeDropFilesHandle(path_);
-        } else if (format->cfFormat == CF_UNICODETEXT) {
-            const size_t bytes = (path_.size() + 1) * sizeof(wchar_t);
-            handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
-            if (handle) {
-                void* target = GlobalLock(handle);
-                if (target) {
-                    std::memcpy(target, path_.c_str(), path_.size() * sizeof(wchar_t));
-                    GlobalUnlock(handle);
-                }
-            }
-        } else {
-            UINT png = RegisterClipboardFormatW(L"PNG");
-            if (format->cfFormat == png) {
-                handle = MakeBytesHandle(png_);
-            }
+        } else if (format->cfFormat == RegisterClipboardFormatW(L"PNG") ||
+                   format->cfFormat == RegisterClipboardFormatW(L"image/png")) {
+            handle = MakeBytesHandle(png_);
         }
 
         if (!handle) {
@@ -323,9 +426,10 @@ public:
             return E_INVALIDARG;
         }
         const UINT png = RegisterClipboardFormatW(L"PNG");
-        bool known = format->cfFormat == CF_HDROP ||
-                     format->cfFormat == CF_UNICODETEXT ||
-                     (png != 0 && format->cfFormat == png);
+        const UINT pngMime = RegisterClipboardFormatW(L"image/png");
+        bool known = format->cfFormat == CF_DIB || format->cfFormat == CF_HDROP ||
+                     (png != 0 && format->cfFormat == png) ||
+                     (pngMime != 0 && format->cfFormat == pngMime);
         bool supported = known && (format->tymed & TYMED_HGLOBAL);
         for (const ExtraFormat& extra : extra_) {
             if (extra.format.cfFormat == format->cfFormat &&
@@ -371,6 +475,7 @@ public:
         if (direction != DATADIR_GET) {
             return E_NOTIMPL;
         }
+
         std::vector<FORMATETC> all(formats_, formats_ + count_);
         for (const ExtraFormat& extra : extra_) {
             all.push_back(extra.format);
@@ -404,6 +509,10 @@ private:
         for (ExtraFormat& extra : extra_) {
             ReleaseStgMedium(&extra.medium);
         }
+        if (dib_) {
+            GlobalFree(dib_);
+            dib_ = nullptr;
+        }
     }
 
     static FORMATETC MakeFormat(UINT format)
@@ -420,14 +529,277 @@ private:
     LONG ref_ = 1;
     std::wstring path_;
     std::vector<BYTE> png_;
-    FORMATETC formats_[3]{};
+    FORMATETC formats_[4]{};
+    HGLOBAL dib_ = nullptr;
     UINT count_ = 0;
     std::vector<ExtraFormat> extra_;
 };
 
+/* 便签正文的拖拽数据对象：只提供文本，设计软件收到的是文字本身。 */
+class RackTextDataObject final : public IDataObject {
+public:
+    explicit RackTextDataObject(std::wstring text) : text_(std::move(text)) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
+    {
+        if (!out) {
+            return E_POINTER;
+        }
+        *out = nullptr;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *out = static_cast<IDataObject*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return static_cast<ULONG>(InterlockedIncrement(&ref_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG value = InterlockedDecrement(&ref_);
+        if (value == 0) {
+            delete this;
+        }
+        return static_cast<ULONG>(value);
+    }
+
+    HRESULT STDMETHODCALLTYPE GetData(FORMATETC* format, STGMEDIUM* medium) override
+    {
+        if (!format || !medium) {
+            return E_INVALIDARG;
+        }
+        if (format->lindex != -1 && format->lindex != 0) {
+            return DV_E_FORMATETC;
+        }
+        if (!(format->tymed & TYMED_HGLOBAL)) {
+            return DV_E_FORMATETC;
+        }
+        HGLOBAL handle = nullptr;
+        if (format->cfFormat == CF_UNICODETEXT) {
+            const size_t bytes = (text_.size() + 1) * sizeof(wchar_t);
+            handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+            if (handle) {
+                void* target = GlobalLock(handle);
+                if (target) {
+                    std::memcpy(target, text_.c_str(), text_.size() * sizeof(wchar_t));
+                    GlobalUnlock(handle);
+                }
+            }
+        } else if (format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT) {
+            const int need = WideCharToMultiByte(CP_ACP, 0, text_.c_str(),
+                                                 static_cast<int>(text_.size()), nullptr, 0,
+                                                 nullptr, nullptr);
+            handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                                 static_cast<size_t>(need) + 1);
+            if (handle) {
+                auto* target = static_cast<char*>(GlobalLock(handle));
+                if (target) {
+                    WideCharToMultiByte(CP_ACP, 0, text_.c_str(),
+                                        static_cast<int>(text_.size()), target, need, nullptr,
+                                        nullptr);
+                    target[need] = '\0';
+                    GlobalUnlock(handle);
+                }
+            }
+        } else {
+            return DV_E_FORMATETC;
+        }
+        if (!handle) {
+            return STG_E_MEDIUMFULL;
+        }
+        medium->tymed = TYMED_HGLOBAL;
+        medium->hGlobal = handle;
+        medium->pUnkForRelease = nullptr;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC*, STGMEDIUM*) override
+    {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC* format) override
+    {
+        if (!format) {
+            return E_INVALIDARG;
+        }
+        const bool known = format->cfFormat == CF_UNICODETEXT ||
+                           format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT;
+        if (!known || !(format->tymed & TYMED_HGLOBAL) ||
+            (format->lindex != -1 && format->lindex != 0)) {
+            return DV_E_FORMATETC;
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC*, FORMATETC* out) override
+    {
+        if (out) {
+            *out = {};
+            out->ptd = nullptr;
+            out->dwAspect = DVASPECT_CONTENT;
+            out->lindex = -1;
+            out->tymed = TYMED_HGLOBAL;
+        }
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetData(FORMATETC*, STGMEDIUM*, BOOL) override
+    {
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC** out) override
+    {
+        if (!out) {
+            return E_POINTER;
+        }
+        if (direction != DATADIR_GET) {
+            return E_NOTIMPL;
+        }
+        FORMATETC formats[2]{};
+        formats[0].cfFormat = CF_UNICODETEXT;
+        formats[1].cfFormat = CF_TEXT;
+        for (FORMATETC& format : formats) {
+            format.ptd = nullptr;
+            format.dwAspect = DVASPECT_CONTENT;
+            format.lindex = -1;
+            format.tymed = TYMED_HGLOBAL;
+        }
+        return SHCreateStdEnumFmtEtc(2, formats, out);
+    }
+
+    HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override
+    {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+
+    HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override
+    {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+
+    HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA**) override
+    {
+        return OLE_E_ADVISENOTSUPPORTED;
+    }
+
+private:
+    ~RackTextDataObject() = default;
+
+    LONG ref_ = 1;
+    std::wstring text_;
+};
+
+
+/* 桌面文件夹（用户桌面 + 公共桌面）。 */
+std::wstring DesktopFolderPath()
+{
+    PWSTR raw = nullptr;
+    std::wstring folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &raw)) && raw) {
+        folder = raw;
+    }
+    if (raw) {
+        CoTaskMemFree(raw);
+    }
+    return folder;
+}
+
+/* 从 ShellWindows 的 IDispatch 里取出它当前显示的文件夹路径。 */
+std::wstring FolderFromShellDispatch(IDispatch* dispatch)
+{
+    if (!dispatch) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IServiceProvider> provider;
+    if (FAILED(dispatch->QueryInterface(IID_PPV_ARGS(&provider))) || !provider) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IShellBrowser> browser;
+    if (FAILED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) ||
+        !browser) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IShellView> view;
+    if (FAILED(browser->QueryActiveShellView(&view)) || !view) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IFolderView2> folderView;
+    if (FAILED(view.As(&folderView)) || !folderView) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IShellFolder> folder;
+    if (FAILED(folderView->GetFolder(IID_PPV_ARGS(&folder))) || !folder) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IPersistFolder2> persist;
+    if (FAILED(folder.As(&persist)) || !persist) {
+        return std::wstring();
+    }
+    PIDLIST_ABSOLUTE current = nullptr;
+    if (FAILED(persist->GetCurFolder(&current)) || !current) {
+        return std::wstring();
+    }
+    PWSTR name = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(SHGetNameFromIDList(current, SIGDN_FILESYSPATH, &name)) && name) {
+        result = name;
+        CoTaskMemFree(name);
+    }
+    CoTaskMemFree(current);
+    return result;
+}
+
+/* 光标落点对应的文件夹：桌面，或某个资源管理器窗口当前打开的目录。 */
+std::wstring FolderUnderCursor(POINT cursor)
+{
+    HWND window = WindowFromPoint(cursor);
+    if (!window) {
+        return std::wstring();
+    }
+    const HWND top = GetAncestor(window, GA_ROOT);
+    wchar_t name[64]{};
+    if (top && GetClassNameW(top, name, static_cast<int>(std::size(name))) > 0) {
+        if (_wcsicmp(name, L"Progman") == 0 || _wcsicmp(name, L"WorkerW") == 0) {
+            return DesktopFolderPath();
+        }
+    }
+    if (!top) {
+        return std::wstring();
+    }
+    Microsoft::WRL::ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+                                IID_PPV_ARGS(&windows))) ||
+        !windows) {
+        return std::wstring();
+    }
+    VARIANT variant{};
+    VariantInit(&variant);
+    variant.vt = VT_I4;
+    variant.lVal = static_cast<LONG>(reinterpret_cast<LONG_PTR>(top));
+    long shellHwnd = 0;
+    Microsoft::WRL::ComPtr<IDispatch> dispatch;
+    if (FAILED(windows->FindWindowSW(&variant, &variant, SWC_BROWSER, &shellHwnd,
+                                     SWFO_NEEDDISPATCH, &dispatch)) ||
+        !dispatch) {
+        return std::wstring();
+    }
+    return FolderFromShellDispatch(dispatch.Get());
+}
+
 class RackDropSource final : public IDropSource {
 public:
-    explicit RackDropSource(HWND preview) : preview_(preview) {}
+    /* rack 用来判断「有没有拖回绳子区域」：出去了再拖回来就取消这次拖拽，
+       原卡片留在绳子上并晃一下，而不是把内容丢给桌面复制一份。 */
+    RackDropSource(HWND preview, RECT returnBand, DragOutcome* scene, std::wstring sourceFolder)
+        : preview_(preview), returnBand_(returnBand), scene_(scene),
+          sourceFolder_(std::move(sourceFolder)) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
     {
@@ -462,7 +834,33 @@ public:
         if (escapePressed) {
             return DRAGDROP_S_CANCEL;
         }
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const bool insideRack = PtInRect(&returnBand_, cursor) != FALSE;
+        if (!insideRack) {
+            leftRack_ = true;
+        }
         if (!(keyState & MK_LBUTTON)) {
+            /* 松手时落在绳子区域：按「反悔」处理，取消这次拖拽。
+               注意只在松手这一刻判断——拖动过程中经过绳子不会打断用户。 */
+            if (insideRack && leftRack_) {
+                if (scene_) {
+                    scene_->returnedToRack = true;
+                }
+                return DRAGDROP_S_CANCEL;
+            }
+            /* 落在「源文件所在的同一个文件夹」里（包括桌面）：不是复制，取消这次拖拽。
+               否则资源管理器会复制到同目录，弹出「源文件名和目标文件名相同」。 */
+            const std::wstring targetFolder = FolderUnderCursor(cursor);
+            if (!targetFolder.empty() && !sourceFolder_.empty() &&
+                util::SamePath(targetFolder, sourceFolder_)) {
+                if (scene_) {
+                    scene_->sameFolder = true;
+                    scene_->desktop = util::SamePath(targetFolder, DesktopFolderPath());
+                    scene_->point = cursor;
+                }
+                return DRAGDROP_S_CANCEL;
+            }
             return DRAGDROP_S_DROP;
         }
         return S_OK;
@@ -475,10 +873,15 @@ public:
             GetCursorPos(&cursor);
             RECT rect{};
             GetWindowRect(preview_, &rect);
-            SetWindowPos(preview_, HWND_TOPMOST,
-                         cursor.x - (rect.right - rect.left) / 2,
-                         cursor.y - (rect.bottom - rect.top) / 2, 0, 0,
-                         SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            const int x = cursor.x - (rect.right - rect.left) / 2;
+            const int y = cursor.y - (rect.bottom - rect.top) / 2;
+            /* 预览窗口创建时已经置顶：这里只平移，不再每次 SetWindowPos(HWND_TOPMOST)。
+               反复请求置顶会触发窗口管理器重排，拖拽就会发涩。 */
+            if (x == rect.left && y == rect.top) {
+                return DRAGDROP_S_USEDEFAULTCURSORS;
+            }
+            SetWindowPos(preview_, nullptr, x, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
         return DRAGDROP_S_USEDEFAULTCURSORS;
     }
@@ -486,17 +889,82 @@ public:
 private:
     ~RackDropSource() = default;
     HWND preview_ = nullptr;
+    RECT returnBand_{};
+    DragOutcome* scene_ = nullptr;
+    std::wstring sourceFolder_;
+    bool leftRack_ = false;
     LONG ref_ = 1;
 };
 
 } /* namespace */
 
-DWORD BeginDrag(const std::wstring& path, int cardWidth, int cardHeight,
-                float frameWidth, bool* dropped)
+bool RepositionDesktopIcon(const std::wstring& path, POINT screenPoint)
 {
-    if (dropped) {
-        *dropped = false;
+    const std::wstring name = std::filesystem::path(path).filename().wstring();
+    if (name.empty()) {
+        return false;
     }
+    Microsoft::WRL::ComPtr<IShellWindows> windows;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL,
+                                IID_PPV_ARGS(&windows))) ||
+        !windows) {
+        return false;
+    }
+    VARIANT empty{};
+    VariantInit(&empty);
+    long shellHwnd = 0;
+    Microsoft::WRL::ComPtr<IDispatch> dispatch;
+    if (FAILED(windows->FindWindowSW(&empty, &empty, SWC_DESKTOP, &shellHwnd,
+                                     SWFO_NEEDDISPATCH, &dispatch)) ||
+        !dispatch) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IServiceProvider> provider;
+    if (FAILED(dispatch.As(&provider)) || !provider) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IShellBrowser> browser;
+    if (FAILED(provider->QueryService(SID_STopLevelBrowser, IID_PPV_ARGS(&browser))) ||
+        !browser) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IShellView> view;
+    if (FAILED(browser->QueryActiveShellView(&view)) || !view) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IFolderView2> folderView;
+    if (FAILED(view.As(&folderView)) || !folderView) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IShellFolder> folder;
+    if (FAILED(folderView->GetFolder(IID_PPV_ARGS(&folder))) || !folder) {
+        return false;
+    }
+    PIDLIST_RELATIVE relative = nullptr;
+    const HRESULT parsed = folder->ParseDisplayName(
+        reinterpret_cast<HWND>(static_cast<LONG_PTR>(shellHwnd)), nullptr,
+        const_cast<LPWSTR>(name.c_str()), nullptr, &relative, nullptr);
+    if (FAILED(parsed) || !relative) {
+        return false;
+    }
+    HWND viewHwnd = nullptr;
+    view->GetWindow(&viewHwnd);
+    POINT client = screenPoint;
+    if (viewHwnd) {
+        ScreenToClient(viewHwnd, &client);
+    }
+    PCUITEMID_CHILD items[1] = {relative};
+    const HRESULT placed =
+        folderView->SelectAndPositionItems(1, items, &client, SVSI_POSITIONITEM | SVSI_SELECT);
+    CoTaskMemFree(relative);
+    return SUCCEEDED(placed);
+}
+
+DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWidth, int cardHeight,
+                float frameWidth, bool* dropped, DragOutcome* outcome)
+{
+    if (dropped) *dropped = false;
+    if (outcome) *outcome = DragOutcome{};
     if (!util::FileExists(path)) {
         return DROPEFFECT_NONE;
     }
@@ -509,7 +977,9 @@ DWORD BeginDrag(const std::wstring& path, int cardWidth, int cardHeight,
                            : nullptr;
 
     auto* data = new (std::nothrow) RackDataObject(path);
-    auto* source = new (std::nothrow) RackDropSource(dragPreview);
+    auto* source = new (std::nothrow) RackDropSource(
+        dragPreview, returnBand, outcome,
+        std::filesystem::path(path).parent_path().wstring());
     if (!data || !source) {
         if (data) {
             data->Release();
@@ -556,6 +1026,94 @@ DWORD BeginDrag(const std::wstring& path, int cardWidth, int cardHeight,
      * 只给 COPY。给 MOVE 的话，用户把文件拖到文件夹时，Explorer 会真的把
      * 轻雪的原图从输出目录移走；插件绝不能移动或删除宿主的文件。
      */
+    DWORD effect = DROPEFFECT_NONE;
+    /* 只允许复制：移动由我们自己在「落点在桌面」时完成，
+       免得拖到别的文件夹时把用户的文件搬走。 */
+    HRESULT hr = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
+    if (helper) {
+        helper->Release();
+    }
+    if (invisible) {
+        DeleteObject(invisible);
+    }
+    if (dragPreview) {
+        DestroyWindow(dragPreview);
+    }
+    if (dragBitmap) {
+        DeleteObject(dragBitmap);
+    }
+    data->Release();
+    source->Release();
+
+    if (FAILED(hr) && hr != DRAGDROP_S_DROP && hr != DRAGDROP_S_CANCEL) {
+        RackLog(L"DragDrop: DoDragDrop failed 0x%08X", static_cast<unsigned>(hr));
+        return DROPEFFECT_NONE;
+    }
+    if (dropped) {
+        *dropped = effect != DROPEFFECT_NONE;
+    }
+    return effect;
+}
+
+DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMAP ghost,
+                    SIZE ghostSize,
+                    int cardWidth, int cardHeight, float frameWidth, bool* dropped, DragOutcome* outcome)
+{
+    if (dropped) *dropped = false;
+    if (outcome) *outcome = DragOutcome{};
+    if (text.empty()) {
+        if (ghost) {
+            DeleteObject(ghost);
+        }
+        return DROPEFFECT_NONE;
+    }
+
+    SIZE dragSize = ghostSize;
+    HBITMAP dragBitmap = ghost;
+    if (!dragBitmap) {
+        dragBitmap = MakeTextDragBitmap(text, cardWidth, cardHeight, frameWidth, &dragSize);
+    }
+    HWND dragPreview = dragBitmap ? CreateDragPreview(dragBitmap, dragSize.cx, dragSize.cy)
+                                  : nullptr;
+
+    auto* data = new (std::nothrow) RackTextDataObject(text);
+    auto* source = new (std::nothrow) RackDropSource(dragPreview, returnBand, outcome, std::wstring());
+    if (!data || !source) {
+        if (data) {
+            data->Release();
+        }
+        if (source) {
+            source->Release();
+        }
+        if (dragPreview) {
+            DestroyWindow(dragPreview);
+        }
+        if (dragBitmap) {
+            DeleteObject(dragBitmap);
+        }
+        return DROPEFFECT_NONE;
+    }
+
+    /* 和图片拖拽一样：把 OLE 自带的缩略图藏起来，用上面那层分层窗口显示卡片。 */
+    HBITMAP invisible = nullptr;
+    IDragSourceHelper* helper = nullptr;
+    BITMAPINFO emptyInfo{};
+    emptyInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    emptyInfo.bmiHeader.biWidth = 1;
+    emptyInfo.bmiHeader.biHeight = -1;
+    emptyInfo.bmiHeader.biPlanes = 1;
+    emptyInfo.bmiHeader.biBitCount = 32;
+    void* emptyBits = nullptr;
+    invisible = CreateDIBSection(nullptr, &emptyInfo, DIB_RGB_COLORS, &emptyBits, nullptr, 0);
+    if (invisible && SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr,
+                                                CLSCTX_INPROC_SERVER,
+                                                IID_PPV_ARGS(&helper)))) {
+        SHDRAGIMAGE image{};
+        image.sizeDragImage = {1, 1};
+        image.hbmpDragImage = invisible;
+        helper->InitializeFromBitmap(&image, data);
+    }
+
     DWORD effect = DROPEFFECT_NONE;
     HRESULT hr = DoDragDrop(data, source, DROPEFFECT_COPY, &effect);
     if (helper) {

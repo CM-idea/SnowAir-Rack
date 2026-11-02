@@ -48,6 +48,7 @@ private:
         std::wstring thumb;
         std::wstring time;
         std::vector<std::wstring> tags;
+        int hostIndex = -1; /* 在宿主条目列表里的下标（去重后仍要照它调用宿主接口） */
         int kind = 0;     /* SNOWAIR_ENTRY_* */
         int source = 0;   /* SNOWAIR_SOURCE_* */
         int width = 0;
@@ -97,6 +98,9 @@ private:
 
     /* ---- 数据 ---- */
     void LoadEntries();
+    /* 去重用的内容键：文本按正文，图片按文件内容指纹，其它按路径。 */
+    std::wstring EntryContentKey(const Entry& entry);
+    std::unordered_map<std::wstring, uint64_t> contentHashes_;
     void LoadCategories();
     void SaveCategories();
     void RefreshCategories();

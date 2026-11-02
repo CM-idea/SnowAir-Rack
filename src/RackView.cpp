@@ -2,6 +2,9 @@
 #include "NotePalette.h"
 #include "Graphics.h"
 #include "Util.h"
+#include <cwctype>
+#include <filesystem>
+#include <map>
 
 namespace {
 
@@ -22,6 +25,202 @@ constexpr float kAccessoryWidth = 260.0f;
 /* 截图/便签飞上绳子的时长，Layout、Draw 和 HasArrival 共用，
    保证交接只发生在同一帧。 */
 constexpr float kArrivalSeconds = 0.65f;
+/* 卡片位置的目标变了之后，先停这么久再开始靠拢。 */
+constexpr uint64_t kCloseHoldMs = 140;
+
+/* 弹簧积分器：位置和目标之间的阻尼弹簧，卡片靠拢/让位用它。
+   参数和参考实现一致（response 大一点更慢，damping 越小越弹）。 */
+void SlideSpring(float& position, float& velocity, float target, float dt, float response,
+                 float damping)
+{
+    if (dt <= 0.0f) {
+        return;
+    }
+    const float natural = 2.0f * 3.14159265f / response;
+    const float decay = natural * damping;
+    const float damped = natural * std::sqrt(std::max(0.0f, 1.0f - damping * damping));
+    if (damped <= 0.0f) {
+        position = target;
+        velocity = 0.0f;
+        return;
+    }
+    const float offset = position - target;
+    const float sine = std::sin(damped * dt);
+    const float cosine = std::cos(damped * dt);
+    const float envelope = std::exp(-decay * dt);
+    const float coefficient = (velocity + decay * offset) / damped;
+    position = target + envelope * (offset * cosine + coefficient * sine);
+    velocity = envelope * (velocity * cosine - (decay * coefficient + damped * offset) * sine);
+    if (std::abs(position - target) < 0.0015f && std::abs(velocity) < 0.01f) {
+        position = target;
+        velocity = 0.0f;
+    }
+}
+
+/* 文件卡片标题里带着「等 N 个」：取出来显示成「N 个文件」，取不到按单个处理。 */
+int FileCountFromLabel(const std::wstring& label)
+{
+    const std::wstring marker = L" 等 ";
+    const size_t pos = label.find(marker);
+    if (pos == std::wstring::npos) {
+        return 1;
+    }
+    size_t index = pos + marker.size();
+    int value = 0;
+    bool found = false;
+    while (index < label.size() && label[index] >= L'0' && label[index] <= L'9') {
+        value = value * 10 + (label[index] - L'0');
+        ++index;
+        found = true;
+    }
+    return found && value > 0 ? value : 1;
+}
+
+std::wstring ReadRegistryString(HKEY root, const std::wstring& key, const wchar_t* value)
+{
+    HKEY handle = nullptr;
+    if (RegOpenKeyExW(root, key.c_str(), 0, KEY_READ, &handle) != ERROR_SUCCESS) {
+        return std::wstring();
+    }
+    wchar_t buffer[1024]{};
+    DWORD size = sizeof(buffer);
+    DWORD type = 0;
+    const LONG status =
+        RegQueryValueExW(handle, value, nullptr, &type, reinterpret_cast<LPBYTE>(buffer), &size);
+    RegCloseKey(handle);
+    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        return std::wstring();
+    }
+    std::wstring text(buffer);
+    while (!text.empty() && (text.back() == L'\0' || text.back() == L' ')) {
+        text.pop_back();
+    }
+    return text;
+}
+
+/* 可执行文件的「文件说明」（版本信息里的 FileDescription），没有就退回文件名。 */
+std::wstring ExeDisplayName(const std::wstring& exePath)
+{
+    std::wstring description;
+    DWORD unused = 0;
+    const DWORD bytes = GetFileVersionInfoSizeW(exePath.c_str(), &unused);
+    if (bytes > 0) {
+        std::vector<BYTE> data(bytes);
+        if (GetFileVersionInfoW(exePath.c_str(), 0, bytes, data.data())) {
+            struct Translation {
+                WORD language;
+                WORD codepage;
+            };
+            Translation* translations = nullptr;
+            UINT length = 0;
+            if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation",
+                               reinterpret_cast<void**>(&translations), &length) &&
+                length >= sizeof(Translation)) {
+                for (UINT i = 0; i < length / sizeof(Translation) && description.empty(); ++i) {
+                    wchar_t query[128]{};
+                    swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\FileDescription",
+                               translations[i].language, translations[i].codepage);
+                    wchar_t* text = nullptr;
+                    UINT size = 0;
+                    if (VerQueryValueW(data.data(), query, reinterpret_cast<void**>(&text),
+                                       &size) &&
+                        text && size > 1) {
+                        description = text;
+                    }
+                }
+            }
+        }
+    }
+    if (description.empty()) {
+        description = std::filesystem::path(exePath).stem().wstring();
+        for (auto& ch : description) {
+            ch = static_cast<wchar_t>(towupper(ch));
+        }
+    }
+    return description;
+}
+
+/* 从「.docx」的默认打开命令里取出程序名：WPS Office / Word / 记事本…… */
+std::wstring FileDescriptionOfAssociation(const std::wstring& extension)
+{
+    std::wstring progId = ReadRegistryString(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" + extension +
+            L"\\UserChoice",
+        L"ProgId");
+    if (progId.empty()) {
+        progId = ReadRegistryString(HKEY_CLASSES_ROOT, extension, L"");
+    }
+    if (progId.empty()) {
+        return std::wstring();
+    }
+    std::wstring command = ReadRegistryString(HKEY_CLASSES_ROOT, progId + L"\\shell\\open\\command", L"");
+    if (command.empty()) {
+        return std::wstring();
+    }
+    /* 命令形如 "\"C:\\...\\wps.exe\" \"%1\""，取第一段。 */
+    std::wstring exePath = command;
+    const size_t quote = exePath.find(L'"');
+    if (quote != std::wstring::npos) {
+        const size_t closing = exePath.find(L'"', quote + 1);
+        if (closing != std::wstring::npos) {
+            exePath = exePath.substr(quote + 1, closing - quote - 1);
+        }
+    } else {
+        const size_t space = exePath.find(L' ');
+        if (space != std::wstring::npos) {
+            exePath = exePath.substr(0, space);
+        }
+    }
+    if (exePath.empty() || !std::filesystem::exists(exePath)) {
+        return std::wstring();
+    }
+    return ExeDisplayName(exePath);
+}
+
+/* 扩展名默认交给哪个程序打开：.docx → WPS / Word，用来在文件夹图标右边标注类型。 */
+std::wstring AppNameForExtension(const std::wstring& extension)
+{
+    if (extension.empty()) {
+        return std::wstring();
+    }
+    static std::map<std::wstring, std::wstring> cache;
+    const auto cached = cache.find(extension);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+
+    /* 先问系统默认程序；WPS 这类走启动器的关联常常查不到，再退回注册表里的
+       打开命令，最后用可执行文件名。 */
+    std::wstring name;
+    wchar_t buffer[512]{};
+    DWORD length = static_cast<DWORD>(sizeof(buffer) / sizeof(wchar_t));
+    if (SUCCEEDED(AssocQueryStringW(ASSOCF_NOTRUNCATE, ASSOCSTR_FRIENDLYAPPNAME,
+                                    extension.c_str(), nullptr, buffer, &length)) &&
+        buffer[0] != L'\0') {
+        name = buffer;
+    }
+    if (name.empty()) {
+        name = FileDescriptionOfAssociation(extension);
+    }
+    /* 「WPS Office」这类产品后缀去掉，只留名字。 */
+    const std::wstring office = L" Office";
+    if (name.size() > office.size() &&
+        name.compare(name.size() - office.size(), office.size(), office) == 0) {
+        name.erase(name.size() - office.size());
+    }
+    if (name.empty()) {
+        name = extension;
+        if (!name.empty() && name[0] == L'.') {
+            name.erase(0, 1);
+        }
+        for (auto& ch : name) {
+            ch = static_cast<wchar_t>(towupper(ch));
+        }
+    }
+    cache[extension] = name;
+    return name;
+}
 
 D2D1_POINT_2F RotateAround(D2D1_POINT_2F point, D2D1_POINT_2F center, float degrees)
 {
@@ -135,6 +334,7 @@ void RackView::LoadIconFont()
     BuildIconGlyph(0xE641, iconLock_);
     BuildIconGlyph(0xE643, iconUnlock_);
     BuildIconGlyph(0xE624, iconClose_);
+    BuildIconGlyph(0xE61C, iconFolder_); /* 文件夹（和剪切板面板同一个字形） */
 }
 
 void RackView::BuildIconGlyph(uint32_t codepoint, ComPtr<ID2D1PathGeometry>& out)
@@ -221,6 +421,11 @@ void RackView::EnsureFormats(float scale)
     noteFormat_ = makeFormat(10.0f * scale);
     placeholderFormat_ = makeFormat(9.0f * scale);
     badgeFormat_ = makeFormat(10.0f * scale);
+    fileTagFormat_ = makeFormat(10.0f * scale);
+    if (fileTagFormat_) {
+        fileTagFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        fileTagFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
     if (badgeFormat_) {
         badgeFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         badgeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -326,7 +531,7 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
 
     float gap = kGap * cs;
     if (total > maxContent && items.size() > 1) {
-        gap = std::max(3.0f * s, (maxContent - total) / static_cast<float>(items.size() - 1) +
+        gap = std::max(10.0f * s, (maxContent - total) / static_cast<float>(items.size() - 1) +
                                      gap);
         total = 0.0f;
         for (float width : widths) {
@@ -354,12 +559,53 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     float x = kOuterPad * s + (photoWidth - total) * 0.5f;
     const float y = cardTop + slide;
 
+    /* 显示位置用弹簧追目标：目标由布局按索引算出，叉掉/插入一张后，
+       其它卡片的目标整体平移，弹簧把它们平滑带过去。 */
+    const uint64_t nowMs = rack::NowMs();
+    float dt = 0.0f;
+    if (lastLayoutMs_ != 0 && nowMs > lastLayoutMs_) {
+        dt = std::min(0.05f, static_cast<float>(nowMs - lastLayoutMs_) / 1000.0f);
+    }
+    lastLayoutMs_ = nowMs;
+    sliding_ = false;
+    auto slotFor = [&](int id) -> SlotSpring& {
+        for (auto& slot : slots_) {
+            if (slot.id == id) {
+                return slot;
+            }
+        }
+        SlotSpring fresh;
+        fresh.id = id;
+        slots_.push_back(fresh);
+        return slots_.back();
+    };
+
     cards_.reserve(items.size());
     for (size_t i = 0; i < items.size(); ++i) {
         CardBox box;
         const float w = widths[i];
         const float offset = items[i].rackOffsetX;
-        box.card = D2D1::RectF(x + offset, y, x + w + offset, y + heights[i]);
+        SlotSpring& slot = slotFor(items[i].id);
+        if (!slot.primed) {
+            slot.pos = x;
+            slot.target = x;
+            slot.velocity = 0.0f;
+            slot.primed = true;
+        } else {
+            /* 目标位置变了（有卡片被叉掉/新挂上来）先原地停一下，
+               再交给弹簧慢慢追过去：先愣一下、再靠拢。 */
+            if (std::abs(slot.target - x) > 0.5f) {
+                slot.target = x;
+                slot.holdUntil = nowMs + kCloseHoldMs;
+            }
+            if (nowMs >= slot.holdUntil && dt > 0.0f) {
+                SlideSpring(slot.pos, slot.velocity, x, dt, 0.55f, 0.78f);
+            }
+            if (std::abs(slot.pos - x) > 0.15f || std::abs(slot.velocity) > 0.8f) {
+                sliding_ = true;
+            }
+        }
+        box.card = D2D1::RectF(slot.pos + offset, y, slot.pos + w + offset, y + heights[i]);
         box.image = rack::Inset(box.card, kFrame * cs, kFrame * cs);
         const bool hasNote = !items[i].note.empty() && !items[i].path.empty();
         box.hasNote = hasNote;
@@ -377,6 +623,17 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
         box.angle = static_cast<float>(variant - 4) * 0.6f;
         cards_.push_back(box);
         x += w + gap;
+    }
+
+    /* 已经不在绳子上的卡片，弹簧状态也跟着清掉。 */
+    for (auto it = slots_.begin(); it != slots_.end();) {
+        const bool alive =
+            std::any_of(items.begin(), items.end(), [&](const Item& item) { return item.id == it->id; });
+        if (alive) {
+            ++it;
+        } else {
+            it = slots_.erase(it);
+        }
     }
 
     float top = lineY - 2.0f * s;
@@ -648,6 +905,21 @@ bool RackView::HasArrival() const
 {
     return arrivalIndex_ >= 0 &&
            static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f < kArrivalSeconds;
+}
+
+float RackView::AnimationHeight() const
+{
+    const float s = scale_;
+    float bottom = 0.0f;
+    if (HasFalling()) {
+        /* 掉落的卡片从绳子上方一直落到绳下约 520 DIP。 */
+        bottom = std::max(bottom, layout_.lineY + layout_.sag + 160.0f * s + 560.0f * s);
+    }
+    if (HasArrival()) {
+        const float half = std::max(arrivalH_, 120.0f * s) * 0.5f;
+        bottom = std::max(bottom, arrivalStart_.y + half + 32.0f * s);
+    }
+    return bottom;
 }
 
 void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
@@ -1272,6 +1544,52 @@ void RackView::DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
     }
 }
 
+void RackView::DrawFileBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
+                             const Item& item, float s)
+{
+    const float iconSize = 13.0f * s;
+    const D2D1_RECT_F icon = D2D1::RectF(card.left + 9.0f * s, card.bottom - 9.0f * s - iconSize,
+                                         card.left + 9.0f * s + iconSize,
+                                         card.bottom - 9.0f * s);
+    ComPtr<ID2D1SolidColorBrush> iconInk;
+    ComPtr<ID2D1SolidColorBrush> textInk;
+    if (FAILED(target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.90f),
+                                             iconInk.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.68f),
+                                             textInk.GetAddressOf()))) {
+        return;
+    }
+    /* 文件夹用字体图标（和剪切板面板同一个字形），比原来的角标大一档。 */
+    if (iconFolder_) {
+        DrawIcon(target, iconFolder_.Get(),
+                 D2D1::Point2F((icon.left + icon.right) * 0.5f,
+                               (icon.top + icon.bottom) * 0.5f),
+                 iconSize, iconInk.Get());
+    }
+
+    if (!fileTagFormat_) {
+        return;
+    }
+    const int count = FileCountFromLabel(item.label);
+    std::wstring text;
+    if (count > 1) {
+        text = std::to_wstring(count) + L" 个文件";
+    } else {
+        text = AppNameForExtension(std::filesystem::path(item.path).extension().wstring());
+    }
+    if (text.empty()) {
+        return;
+    }
+    const float textLeft = icon.right + 5.0f * s;
+    const float textRight = card.right - 9.0f * s;
+    if (textRight <= textLeft) {
+        return;
+    }
+    target->DrawText(text.c_str(), static_cast<UINT32>(text.size()), fileTagFormat_.Get(),
+                     D2D1::RectF(textLeft, icon.top, textRight, icon.bottom), textInk.Get(),
+                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
 void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, float s,
                               bool hovered)
 {
@@ -1341,7 +1659,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                     rack::Inset(inner, 10.0f * s, 12.0f * s), ink.Get(),
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
-            DrawTypeBadge(target, inner, item.kind, s);
+            DrawFileBadge(target, inner, item, s);
         }
     } else {
         if (!isNoteCard) {
@@ -1582,6 +1900,65 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
     }
 
     target->SetTransform(D2D1::Matrix3x2F::Identity());
+}
+
+HBITMAP RackView::MakeDragGhost(const Item& item, int width, int height, SIZE* sizeOut)
+{
+    if (!graphics_ || !graphics_->d2d() || width < 8 || height < 8) {
+        return nullptr;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap) {
+        return nullptr;
+    }
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+
+    ComPtr<ID2D1DCRenderTarget> target;
+    const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    RECT bounds{0, 0, width, height};
+    HRESULT hr = graphics_->d2d()->CreateDCRenderTarget(&properties, target.GetAddressOf());
+    if (SUCCEEDED(hr)) {
+        hr = target->BindDC(dc, &bounds);
+    }
+    if (SUCCEEDED(hr)) {
+        CardBox box;
+        box.card = D2D1::RectF(0.0f, 0.0f, static_cast<float>(width),
+                               static_cast<float>(height));
+        box.image = box.card;
+        box.pinTop = 0.0f;
+        box.angle = 0.0f;
+        target->BeginDraw();
+        target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        /* 直接复用绳子上那套绘制：纸色渐变、形状、字号与内边距全都一致。 */
+        DrawCard(target.Get(), item, box, scale_, 0.0f, 0.0f, false, false);
+        hr = target->EndDraw();
+    }
+    SelectObject(dc, oldBitmap);
+    DeleteDC(dc);
+    if (FAILED(hr)) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    if (sizeOut) {
+        sizeOut->cx = width;
+        sizeOut->cy = height;
+    }
+    return bitmap;
 }
 
 RackHit RackView::HitTest(float x, float y, float scale) const

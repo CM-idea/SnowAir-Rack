@@ -221,6 +221,31 @@ bool WriteFileBytes(const std::wstring& path, const void* data, size_t size)
     return ok;
 }
 
+uint64_t FileContentHash(const std::wstring& path)
+{
+    std::vector<BYTE> bytes;
+    if (!ReadFileBytes(path, bytes) || bytes.empty()) {
+        return 0;
+    }
+    constexpr size_t kChunk = 16u * 1024u * 1024u;
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&hash](const BYTE* data, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            hash ^= data[i];
+            hash *= 1099511628211ull;
+        }
+    };
+    if (bytes.size() <= kChunk * 2) {
+        mix(bytes.data(), bytes.size());
+    } else {
+        mix(bytes.data(), kChunk);
+        mix(bytes.data() + bytes.size() - kChunk, kChunk);
+    }
+    hash ^= static_cast<uint64_t>(bytes.size());
+    hash *= 1099511628211ull;
+    return hash;
+}
+
 uint64_t FileWriteTime(const std::wstring& path)
 {
     WIN32_FILE_ATTRIBUTE_DATA data{};
