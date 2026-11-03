@@ -55,11 +55,17 @@ bool ItemStore::Load(std::vector<Item>& items) const
             tp && tp->type == json::Type::String) {
             thumbPath = util::Utf8ToWide(tp->text);
         }
+        std::wstring svgId;
+        if (const json::Value* sp = value.Get("svgId");
+            sp && sp->type == json::Type::String) {
+            svgId = util::Utf8ToWide(sp->text);
+        }
         const bool hasPath = path && path->type == json::Type::String && !path->text.empty();
         Item item;
         item.kind = hasKind ? kind : (hasPath ? 0 : 1);
         item.label = label;
         if (!thumbPath.empty()) item.thumbPath = util::FullPath(thumbPath);
+        item.svgId = svgId;
         if (const json::Value* id = value.Get("id"); id && id->type == json::Type::Number) {
             item.id = static_cast<int>(id->number);
         }
@@ -141,6 +147,7 @@ bool ItemStore::Save(const std::vector<Item>& items) const
         output += ", \"path\": " + json::Quote(util::WideToUtf8(item.path));
         output += ", \"sourcePath\": " + json::Quote(util::WideToUtf8(item.sourcePath));
         output += ", \"thumbPath\": " + json::Quote(util::WideToUtf8(item.thumbPath));
+        output += ", \"svgId\": " + json::Quote(util::WideToUtf8(item.svgId));
         output += ", \"label\": " + json::Quote(util::WideToUtf8(item.label));
         output += ", \"id\": " + std::to_string(item.id);
         output += ", \"aspect\": " + std::to_string(item.aspect);

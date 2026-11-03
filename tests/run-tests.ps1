@@ -50,8 +50,11 @@ try {
     if ($text -notmatch 'Capture added') {
         throw 'HostSim did not report a capture'
     }
-    if ($text -notmatch '0\.1\.0') {
-        throw 'HostSim log does not contain the plugin version'
+    # Read the version from Version.h instead of hard-coding it.
+    $versionMatch = Select-String -Path (Join-Path $repo 'src\Version.h') -Pattern 'SA_RACK_VERSION\s+L"([^"]+)"'
+    $version = $versionMatch.Matches[0].Groups[1].Value
+    if ($text -notmatch [regex]::Escape($version)) {
+        throw "HostSim log does not contain the plugin version $version"
     }
     Write-Host 'HostSim smoke test OK' -ForegroundColor Green
     Write-Host 'All checks passed.' -ForegroundColor Green

@@ -19,11 +19,28 @@ constexpr int kAnimDurationMs = 170;
 constexpr int kPreviewDelayMs = 320;
 constexpr int kPreviewHideDelayMs = 180;
 constexpr int64_t kPeekDurationMs = 3000;
-/* 叉掉卡片后先停这么久再开始靠拢，避免「瞬间贴上去」的生硬感。 */
+/* 移除卡片后先延迟该时长再开始靠拢，避免瞬间贴合的僵硬感。 */
 constexpr uint64_t kCloseDelayMs = 130;
 /* 屏幕最上面这一条：点一下就收回，和「停在这里拉下来」用的是同一块区域。 */
 constexpr float kTopBarBand = 24.0f;
 constexpr UINT kMsgTopBarClick = WM_APP + 2;
+
+void SendPasteShortcut()
+{
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event('V', 0, 0, 0);
+    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+}
+
+/* 有些输入框要先点一下才拿到焦点/插入符，粘贴前在落点补一次左键单击。 */
+void ClickAt(POINT point)
+{
+    SetCursorPos(point.x, point.y);
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+    Sleep(20);
+    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+}
 
 bool RecyclePath(const std::wstring& path)
 {
@@ -96,6 +113,8 @@ bool RackWindow::Init(Plugin* plugin, Graphics* graphics)
         RackLog(L"RackWindow: view initialization failed");
         return false;
     }
+    historyDisabled_ = plugin_->HistoryDisabled();
+    view_.SetHistoryDisabled(historyDisabled_);
     if (!preview_.Init(graphics)) {
         RackLog(L"RackWindow: preview initialization failed");
         return false;
@@ -129,6 +148,7 @@ void RackWindow::Shutdown()
         KillTimer(hwnd(), kTimerClick);
         KillTimer(hwnd(), kTimerLongPress);
         KillTimer(hwnd(), kTimerEditWatch);
+        KillTimer(hwnd(), kTimerFakeCursor);
     }
     editingWatchActive_ = false;
     SetTopBarWatch(false);
@@ -150,7 +170,7 @@ void RackWindow::OnItemsChanged(bool added)
         batchMenu_.Close();
         menuOpen_ = false;
         if (view_.HasRemoved()) {
-            // 等最后一张卡片飞进篮子再收起。
+            // 等最后一张卡片移入篮子再收起。
             hideWhenRemovalsDone_ = true;
             EnsureVisible();
             if (expand_ < 0.9f) {
@@ -235,6 +255,7 @@ void RackWindow::OnConfigChanged()
         }
         return;
     }
+    RefreshHistoryDisabled();
     if (!monitor_) {
         monitor_ = CursorMonitor();
     }
@@ -245,6 +266,30 @@ void RackWindow::OnConfigChanged()
         Expand(false);
     }
     Render();
+}
+
+/* 轻雪的「停用历史记录」不在插件设置里，宿主切换时也不会回调插件；
+   每 50 ms 的轮询里跟一下。变了就重新布局：篮子隐藏，信封右移到它的槽位。 */
+void RackWindow::RefreshHistoryDisabled()
+{
+    if (!plugin_) {
+        return;
+    }
+    const bool disabled = plugin_->HistoryDisabled();
+    if (disabled == historyDisabled_) {
+        return;
+    }
+    historyDisabled_ = disabled;
+    view_.SetHistoryDisabled(disabled);
+    basketHover_ = 0.0f;
+    basketHoverVelocity_ = 0.0f;
+    basketHoverTarget_ = 0.0f;
+    if (hwnd()) {
+        Reposition();
+        Render();
+        /* 信封从旧槽位滑到新槽位：和卡片一样由 16 ms 的动画定时器推进。 */
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
 }
 
 void RackWindow::OnThemeChanged()
@@ -341,38 +386,14 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
 
 void RackWindow::NormalizeLoadedSpacing()
 {
-    if (!plugin_) {
-        return;
-    }
-    struct Entry {
-        float left = 0.0f;
-        int index = -1;
-    };
-    std::vector<Entry> order;
-    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
-        if (const CardBox* box = view_.Card(i)) {
-            order.push_back({box->card.left, i});
-        }
-    }
-    std::sort(order.begin(), order.end(),
-              [](const Entry& a, const Entry& b) { return a.left < b.left; });
-    const float gap = view_.DefaultGap();
-    float previousRight = 0.0f;
-    bool first = true;
+    if (!plugin_) return;
+    /* 启动时清掉旧的手动偏移：水平位置只由布局决定。 */
     bool changed = false;
-    for (const auto& entry : order) {
-        const CardBox* box = view_.Card(entry.index);
-        if (!box) continue;
-        const float width = box->card.right - box->card.left;
-        float left = box->card.left;
-        if (!first && left - previousRight < gap) {
-            const float shift = gap - (left - previousRight);
-            plugin_->items()[entry.index].rackOffsetX += shift;
-            left += shift;
+    for (auto& item : plugin_->items()) {
+        if (std::abs(item.rackOffsetX) > 0.35f) {
+            item.rackOffsetX = 0.0f;
             changed = true;
         }
-        previousRight = left + width;
-        first = false;
     }
     if (changed) {
         plugin_->SaveItems();
@@ -380,21 +401,13 @@ void RackWindow::NormalizeLoadedSpacing()
     }
 }
 
+
 void RackWindow::FinishCardDrag(int id)
 {
-    if (!plugin_) {
-        return;
-    }
-    const int index = plugin_->IndexById(id);
-    if (index < 0 || index >= static_cast<int>(plugin_->items().size())) {
-        return;
-    }
-    Item& dragged = plugin_->items()[index];
-    const CardBox* draggedBox = view_.Card(index);
-    if (!draggedBox) {
-        return;
-    }
-
+    (void)id;
+    if (!plugin_) return;
+    /* 水平拖动不再保留自由 offset，而是按松手时的左右顺序重新排卡片；
+       布局仍然是唯一间距来源，所以不会叠、不会被旧偏移推散。 */
     struct Entry {
         float left = 0.0f;
         int index = -1;
@@ -405,75 +418,28 @@ void RackWindow::FinishCardDrag(int id)
             order.push_back({box->card.left, i});
         }
     }
+    if (order.empty()) return;
     std::sort(order.begin(), order.end(),
               [](const Entry& a, const Entry& b) { return a.left < b.left; });
-    int position = -1;
-    for (int i = 0; i < static_cast<int>(order.size()); ++i) {
-        if (order[i].index == index) {
-            position = i;
-            break;
+    std::vector<Item> reordered;
+    reordered.reserve(order.size());
+    for (const Entry& entry : order) {
+        if (entry.index >= 0 && entry.index < static_cast<int>(plugin_->items().size())) {
+            reordered.push_back(plugin_->items()[static_cast<size_t>(entry.index)]);
         }
     }
-    if (position < 0) {
-        return;
+    if (reordered.size() != plugin_->items().size()) return;
+    for (auto& item : reordered) {
+        item.rackOffsetX = 0.0f;
     }
-
-    const float gap = view_.DefaultGap();
-    std::vector<std::pair<int, float>> changes;
-    // 严格从左往右重排：每张卡和它前面那张保持各自的默认间距，
-    // 这样无论拖动过程中有几张卡被挪过，都不会留下重叠。
-    float previousRight = 0.0f;
-    bool first = true;
-    for (const auto& entry : order) {
-        const CardBox* box = view_.Card(entry.index);
-        if (!box) continue;
-        float left = box->card.left;
-        const float width = box->card.right - box->card.left;
-        if (!first) {
-            const float actualGap = left - previousRight;
-            if (actualGap < gap) {
-                const float shift = gap - actualGap;
-                changes.push_back({entry.index, shift});
-                left += shift;
-            }
-        }
-        previousRight = left + width;
-        first = false;
-    }
-
-    float draggedTarget = dragged.rackOffsetX;
-    const float width = draggedBox->card.right - draggedBox->card.left;
-    const float baseLeft = draggedBox->card.left - dragged.rackOffsetX;
-    const float margin = 24.0f * scale_;
-    const float maxLeft = view_.layout().width - width - margin;
-    const float wantedLeft = baseLeft + draggedTarget;
-    draggedTarget += rack::Clamp(wantedLeft, margin, std::max(margin, maxLeft)) - wantedLeft;
-    // 只有不冲突的情况才吸附到磁吸中心。
-    if (changes.empty() && std::abs(draggedTarget) <= 36.0f * scale_) {
-        draggedTarget = 0.0f;
-    }
-    if (std::abs(draggedTarget - dragged.rackOffsetX) > 0.35f) {
-        changes.push_back({index, draggedTarget - dragged.rackOffsetX});
-    }
-
+    plugin_->items() = std::move(reordered);
     offsetAnims_.clear();
-    const uint64_t now = rack::NowMs();
-    for (const auto& change : changes) {
-        if (change.first < 0 || change.first >= static_cast<int>(plugin_->items().size())) {
-            continue;
-        }
-        Item& item = plugin_->items()[change.first];
-        const float target = item.rackOffsetX + change.second;
-        if (std::abs(target - item.rackOffsetX) < 0.35f) {
-            continue;
-        }
-        offsetAnims_.push_back({item.id, item.rackOffsetX, target, now});
-        item.shakeStartMs = now;
-        item.shakeAmp = 2.2f;
-    }
-    if (!offsetAnims_.empty()) {
-        swingUntil_ = std::max(swingUntil_, now + 1250);
-        if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    plugin_->SaveItems();
+    needsLayout_ = true;
+    if (hwnd()) {
+        Reposition();
+        Render();
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
     }
 }
 
@@ -513,7 +479,7 @@ void RackWindow::ShakeCard(int index)
     Item& item = plugin_->items()[static_cast<size_t>(index)];
     const uint64_t now = rack::NowMs();
     item.shakeStartMs = now;
-    item.shakeAmp = 4.5f; /* 比「让位」时的轻晃明显，一眼看出「已经挂上了」 */
+    item.shakeAmp = 4.5f; /* 比「让位」时的轻晃明显，明确提示「已经挂上了」 */
     shakeUntil_ = std::max(shakeUntil_, now + 1200);
     if (hwnd()) {
         SetTimer(hwnd(), kTimerAnim, 16, nullptr);
@@ -632,7 +598,7 @@ void RackWindow::Animate()
     StepSpring(basketHover_, basketHoverVelocity_, basketHoverTarget_, dt, 0.50f, 0.50f);
     StepSpring(cardHover_, cardHoverVelocity_, cardHoverTarget_, dt, 0.30f, 0.60f);
 
-    /* 信封里那张纸只有一层，弹簧也就只跟一个值。 */
+    /* 信封里那张纸只有一层，弹簧仅跟踪一个值。 */
     const float paperTarget = envelopeHoverTarget_ > 0.5f ? 1.0f : 0.0f;
     StepSpring(paperPos_, paperVelocity_, paperTarget, dt, 0.38f, 0.80f);
     const bool paperSettled = std::abs(paperPos_ - paperTarget) < 0.003f;
@@ -673,47 +639,8 @@ void RackWindow::Animate()
 
 void RackWindow::NormalizeSpacing(float ms)
 {
-    if (!plugin_ || !hwnd()) {
-        return;
-    }
-    struct Entry {
-        float left = 0.0f;
-        int index = -1;
-    };
-    std::vector<Entry> order;
-    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
-        if (const CardBox* box = view_.Card(i)) {
-            order.push_back({box->card.left, i});
-        }
-    }
-    std::sort(order.begin(), order.end(),
-              [](const Entry& a, const Entry& b) { return a.left < b.left; });
-
-    const float gap = view_.DefaultGap();
-    const uint64_t now = rack::NowMs();
-    float previousRight = 0.0f;
-    bool first = true;
-    bool changed = false;
-    for (const auto& entry : order) {
-        const CardBox* box = view_.Card(entry.index);
-        if (!box) continue;
-        float left = box->card.left;
-        const float width = box->card.right - box->card.left;
-        if (!first && left - previousRight < gap) {
-            const float shift = gap - (left - previousRight);
-            Item& item = plugin_->items()[static_cast<size_t>(entry.index)];
-            item.rackOffsetX += shift;
-            offsetAnims_.push_back({item.id, item.rackOffsetX - shift, item.rackOffsetX, now,
-                                    ms});
-            left += shift;
-            changed = true;
-        }
-        previousRight = left + width;
-        first = false;
-    }
-    if (changed) {
-        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
-    }
+    /* 布局负责所有水平位置；不再在动画过程中改 `rackOffsetX`，避免和弹簧冲突。 */
+    (void)ms;
 }
 
 void RackWindow::Reposition()
@@ -739,7 +666,7 @@ void RackWindow::Reposition()
     const int width = std::max(1, static_cast<int>(std::lround(layout.width)));
     int height = std::max(1, static_cast<int>(std::lround(layout.height)));
     if (view_.HasFalling() || view_.HasArrival()) {
-        /* 只加高到动画真正会用到的位置：整块工作区做窗口时，每帧要上传
+        /* 只加高到动画真正会用到的位置：整个工作区作为窗口时，每帧要上传
            2560x1032 的位图，拖动时会明显卡顿。 */
         const int needed = static_cast<int>(std::ceil(view_.AnimationHeight()));
         const int limit = static_cast<int>(work.bottom - work.top);
@@ -801,6 +728,7 @@ void RackWindow::Tick()
         lastInside_ = rack::NowMs();
         return;
     }
+    RefreshHistoryDisabled();
     plugin_->SyncHostTheme();
     if (menuOpen_) {
         return;
@@ -822,7 +750,7 @@ void RackWindow::Tick()
         hostMenuWasOpen_ = true;
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
-        // 弹窗是独立窗口：让它外面的点击穿到桌面，而不是被全宽的晾衣架窗口吃掉。
+        // 弹窗是独立窗口：让它外面的点击穿到桌面，而不是被全宽的晾衣架窗口拦截。
         SetClickThrough(true);
         lastInside_ = rack::NowMs();
         return;
@@ -831,10 +759,10 @@ void RackWindow::Tick()
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
         lastInside_ = rack::NowMs();
-        /* 面板只在自己那块区域里优先：搜索条和绳子有重叠，重叠处让给面板，
-           否则面板上的点击会被全宽的绳子窗口吃掉。面板之外（绳子上挂着的
-           卡片）仍然由晾衣架接管 —— 之前整窗穿透，面板没盖住的卡片上的
-           点击会漏到下面那个窗口，正好被面板挡着，很容易误触。 */
+        /* 面板仅在自身区域内优先：搜索条和绳子有重叠，重叠处让给面板，
+           否则面板上的点击会被全宽的绳子窗口拦截。面板之外（绳子上挂着的
+           卡片）仍然由晾衣架接管 —— 此前窗口整体穿透，面板没盖住的卡片上的
+           点击会传递到下层窗口，正好被面板挡着，很容易误触。 */
         POINT cursor{};
         GetCursorPos(&cursor);
         if (plugin_->ClipboardContains(cursor)) {
@@ -1350,7 +1278,12 @@ void RackWindow::CopyItem(int index)
         return;
     }
     const Item& copyItem = plugin_->items()[index];
-    if (copyItem.kind == 1) {
+    /* SVG 卡片复制的是 SVG 代码本身，粘贴到 Figma / Illustrator 里是矢量；
+       不另存 .svg 文件。 */
+    const std::wstring svgText = plugin_->SvgText(index);
+    if (!svgText.empty()) {
+        clipboard::CopyText(svgText);
+    } else if (copyItem.kind == 1) {
         clipboard::CopyText(copyItem.note);
     } else if (copyItem.kind == 0) {
         clipboard::CopyImage(copyItem.path);
@@ -1464,10 +1397,28 @@ void RackWindow::RemoveItem(int index, bool toBasket)
     if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
         return;
     }
+    /* 篮子被「停用历史记录」藏起来时没有可落的地方，卡片改成从绳上掉落。 */
+    if (toBasket && (historyDisabled_ || plugin_->HistoryDisabled())) {
+        toBasket = false;
+    }
     view_.BeginRemove(index, plugin_->items()[index], toBasket);
     SetTimer(hwnd(), kTimerAnim, 16, nullptr);
     plugin_->RemoveItemAt(index);
-    /* 位置动画由 RackView 的弹簧负责（目标位置按索引算，卡片自己追过去），
+    /* 移除一张卡片后，剩下的卡片回到布局的均匀槽位；否则旧的手动 offset 会让
+       两边卡片看起来反而向两边分开/继续叠着。 */
+    offsetAnims_.clear();
+    const uint64_t now = rack::NowMs();
+    bool hadOffset = false;
+    for (auto& item : plugin_->items()) {
+        if (std::abs(item.rackOffsetX) > 0.35f) {
+            offsetAnims_.push_back({item.id, item.rackOffsetX, 0.0f, now, 180.0f});
+            hadOffset = true;
+        }
+    }
+    if (hadOffset) {
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
+    /* 位置动画由 RackView 的弹簧负责（目标位置按索引算，卡片通过弹簧平滑过渡），
        这里只要保证让位动画在跑。 */
     Reposition();
     Render();
@@ -1509,7 +1460,7 @@ void RackWindow::EditNote(int index)
             Render();
         },
         nullptr,
-        /* 便签已经飞回夹子：先把下面这张卡片画出来，编辑器再淡出，交接看不出缝。 */
+        /* 便签已经返回夹子：先把下面这张卡片画出来，编辑器再淡出，交接看不出缝。 */
         [this, noteCard]() {
             if (!noteCard) {
                 return;
@@ -1578,8 +1529,8 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         main[n - 1].submenu = batch;
         main[n - 1].submenu_count = 4;
         add(L"", 0, SNOWAIR_MENU_SEPARATOR);
-        add(L"移至回收站", kMenuRecycle);
-        if (noteItem) main[n - 1].label = L"销毁";
+        /* 便签记录归轻雪：没有「销毁」这一项，取下卡片记录仍在剪切板历史里。 */
+        if (!noteItem) add(L"移至回收站", kMenuRecycle);
 
         menuIndex_ = index;
         plugin_->host()->show_menu(plugin_->host()->user, main, n, screen.x, screen.y,
@@ -1608,7 +1559,7 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
     action(L"取下内容", kMenuRemove);
     action(L"批量取下  ›", kMenuBatch);
     separator();
-    if (noteItem) action(L"销毁", kMenuRecycle); else action(L"移至回收站", kMenuRecycle);
+    if (!noteItem) action(L"移至回收站", kMenuRecycle);
 
     const bool menuDark = plugin_->host() && plugin_->host()->is_dark
                               ? plugin_->host()->is_dark(plugin_->host()->user) != 0
@@ -1737,14 +1688,9 @@ void RackWindow::HandleMenuCommand(int index, int command)
     } else if (command == kMenuRemove) {
         RemoveItem(index);
     } else if (command == kMenuRecycle) {
-        if (noteItem) {
-            /* 便签的正文就是轻雪里那条记录：销毁 = 删记录 + 摘牌 */
-            plugin_->DestroyNote(index);
-            RemoveItem(index, false);
-        } else if (RecyclePath(menuItem.path)) {
+        if (!noteItem && RecyclePath(menuItem.path)) {
             RemoveItem(index, false);
         }
-    
     } else if (command == kMenuBatchLeft || command == kMenuBatchRight ||
                command == kMenuBatchKeep || command == kMenuBatchAll) {
         const int count = static_cast<int>(plugin_->items().size());
@@ -1818,7 +1764,7 @@ void RackWindow::Paint(ID2D1RenderTarget* target)
         if (plugin_->host()->is_dark) {
             darkUi = plugin_->host()->is_dark(plugin_->host()->user) != 0;
         }
-        // 宿主给的 dark 标记在启动或切换主题的瞬间可能是旧的，
+        // 宿主提供的 dark 标记在启动或切换主题时可能尚未更新，
         // 这时「背景色角色」才是最可靠的判断依据。
         if (plugin_->host()->theme_color) {
             const uint32_t bg = plugin_->host()->theme_color(
@@ -1832,10 +1778,11 @@ void RackWindow::Paint(ID2D1RenderTarget* target)
     view_.SetUiDark(darkUi);
     const float swaySeconds =
         revealStart_ ? static_cast<float>(rack::NowMs() - revealStart_) / 1000.0f : 10.0f;
+    const int historyCount = historyDisabled_ ? 0 : plugin_->HistoryCount();
     view_.Draw(target, plugin_->items(), plugin_->theme(), expand_, swaySeconds, basketHover_,
                paperPos_, cardHover_, cardHoverIndex_,
                hovered_, mouseDown_ && !dragStarted_ ? pressed_ : -1,
-               plugin_->HistoryCount(), plugin_->ClipboardCount());
+               historyCount, plugin_->ClipboardCount());
 }
 
 LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
@@ -1865,6 +1812,9 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             KillTimer(hwnd(), kTimerCopyToast);
             view_.ClearCopyToast();
             Render();
+            return 0;
+        case kTimerFakeCursor:
+            dragdrop::SetDragCursor();
             return 0;
         case kTimerLongPress: {
             KillTimer(hwnd(), kTimerLongPress);
@@ -2010,8 +1960,8 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
 
         const Item* heldItem = plugin_->ItemById(pressItemId_);
         const bool locked = heldItem && heldItem->locked;
-        /* 方向判定：横向为主才算「沿绳子挪」，纵向为主才算「拖出去」。
-           斜着拖动时先等方向明确，避免想拖出去却变成挪位置。 */
+        /* 方向判定：横向为主才算「沿绳子移动」，纵向为主才算「拖出去」。
+           斜着拖动时先等方向明确，避免想拖出去却变成移动卡片。 */
         const float horizontalRun = static_cast<float>(dx);
         const float verticalRun = static_cast<float>(dy);
         const bool horizontalDominant =
@@ -2058,7 +2008,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         mouseDown_ = false;
         dragStarted_ = true;
         SetDragTransparent(true);
-        /* 反悔区域：屏幕顶部一直到卡片底部（整宽），比窗口矩形宽松，
+        /* 取消区域：屏幕顶部一直到卡片底部（整宽），比窗口矩形宽松，
            只要松手时还在这一条里就算「拖回来了」。 */
         RECT returnBand{};
         if (const RECT work = MonitorWorkArea(monitor_); work.right > work.left) {
@@ -2088,28 +2038,60 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                                                          dragBox->card.top)
                                       : static_cast<int>(119.0f * scale_);
             const Item& dragItem = plugin_->items()[index];
-            /* 图片/文件拖出去是文件本身；便签没有文件，拖出去的是正文文字，
-               跟手的图直接复用卡片自己的画法，看起来和绳子上那张一模一样。 */
+            /* 文字类卡片（便签 / SVG 代码）统一按文本拖拽；图片/文件仍拖文件。
+               SVG 的 ghost 仍是图片卡片，便签是便签卡片。 */
+            const std::wstring svgText =
+                !dragItem.svgId.empty() ? plugin_->SvgText(index) : std::wstring();
+            const std::wstring dragText = svgText.empty() ? dragItem.note : svgText;
             DWORD effect = DROPEFFECT_NONE;
-            if (dragItem.path.empty()) {
+            if (!dragText.empty()) {
                 SIZE ghostSize{};
+                /* 先让 view 画和绳子上完全一致的卡片 ghost；失败再用 PNG 预览兜底。 */
                 HBITMAP ghost = view_.MakeDragGhost(dragItem, dragW, dragH, &ghostSize);
-                effect = dragdrop::BeginTextDrag(dragItem.note, hwnd(), returnBand, ghost, ghostSize, dragW,
-                                                 dragH, 4.0f * scale_, &dropped, &outcome);
+                const std::wstring previewPath = dragItem.svgId.empty() ? std::wstring() : dragItem.path;
+                /* OLE 空数据拖拽时目标会画禁止光标；用 10ms 定时器把箭头压住。 */
+                SetTimer(hwnd(), kTimerFakeCursor, 10, nullptr);
+                effect = dragdrop::BeginTextDrag(dragText, hwnd(), returnBand, ghost, ghostSize, dragW,
+                                                 dragH, 4.0f * scale_, &dropped, &outcome, previewPath,
+                                                 true);
+                KillTimer(hwnd(), kTimerFakeCursor);
             } else {
                 effect = dragdrop::BeginDrag(dragItem.path, hwnd(), returnBand, dragW, dragH, 4.0f * scale_,
                                             &dropped, &outcome);
             }
             view_.SetDragging(-1);
+            /* 文字类拖拽：松手后静默复制同一段文本，再替用户按 Ctrl+V。
+               不依赖目标软件接不接拖放，也不区分 Figma/Pixso/MasterGo 等。 */
+            if (!dragText.empty() && !outcome.cancelled && !outcome.returnedToRack &&
+                plugin_->CopyCardText(index)) {
+                POINT dropPoint{};
+                GetCursorPos(&dropPoint);
+                /* 所有窗口统一用 UIA/MSAA 查元素：确认下面是可输入元素才先点一下；
+                   没识别到就保持正常落点（直接粘贴），不再限定浏览器。 */
+                if (dragdrop::EditableAtPoint(dropPoint)) {
+                    ClickAt(dropPoint);
+                    Sleep(90);
+                }
+                SendPasteShortcut();
+                effect = DROPEFFECT_COPY;
+                dropped = true;
+            }
             /* 拖出去只是「把内容交给别的程序」，绝不从绳子上取下、也不动文件。
-               拖回绳子区域则视为「反悔」：这次拖拽被取消，卡片留在原地晃一下。 */
+               拖回绳子区域则视为「取消」：这次拖拽被取消，卡片留在原地轻微晃动，作为提示。 */
             (void)dropped;
             if (outcome.returnedToRack) {
                 ShakeCard(index);
             } else if (outcome.sameFolder) {
-                /* 落在源文件所在的同一个文件夹：不复制；桌面就顺手把图标挪到落点。 */
-                if (outcome.desktop) {
+                /* 落在源文件所在的同一个文件夹：不复制；桌面则同时将图标移动到落点。 */
+                if (outcome.desktop && !dragItem.path.empty()) {
                     dragdrop::RepositionDesktopIcon(dragItem.path, outcome.point);
+                }
+            } else if (outcome.duplicate) {
+                /* 桌面已有同名同内容的那份：把桌面图标移到落点，而不是复制一份。 */
+                if (outcome.desktop && !outcome.duplicatePath.empty()) {
+                    dragdrop::RepositionDesktopIcon(outcome.duplicatePath, outcome.point);
+                } else {
+                    ShakeCard(index);
                 }
             }
             if (effect == DROPEFFECT_NONE) {

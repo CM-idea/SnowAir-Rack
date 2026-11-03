@@ -4,12 +4,15 @@
 
 namespace dragdrop {
 
-/* 拖拽的额外结果：反悔 / 落进同一文件夹 / 桌面挪图标。 */
+/* 拖拽的额外结果：取消 / 落进同一文件夹 / 桌面图标移动。 */
 struct DragOutcome {
     bool returnedToRack = false;
     bool sameFolder = false;
     bool desktop = false;
+    bool cancelled = false;
+    bool duplicate = false;
     POINT point{};
+    std::wstring duplicatePath;
 };
 
 /*
@@ -28,9 +31,15 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
 DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMAP ghost,
                     SIZE ghostSize,
                     int cardWidth, int cardHeight, float frameWidth, bool* dropped,
-                    DragOutcome* outcome);
+                    DragOutcome* outcome, const std::wstring& previewPath = std::wstring(),
+                    bool pasteOnly = false);
 
-/* 把桌面上某个文件/快捷方式的图标挪到屏幕坐标处（自动排列开启时由系统忽略）。 */
+/* 拖拽期间统一设置「箭头 + 复制框」光标。 */
+void SetDragCursor();
+/* 鼠标下面是否是 UIA/MSAA 能识别的可输入元素。 */
+bool EditableAtPoint(POINT point);
+
+/* 把桌面上某个文件/快捷方式的图标移动到屏幕坐标处（自动排列开启时由系统忽略）。 */
 bool RepositionDesktopIcon(const std::wstring& path, POINT screenPoint);
 
 } /* namespace dragdrop */

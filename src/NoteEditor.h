@@ -13,7 +13,7 @@ class Graphics;
  *
  * 打开时，绳子上的那张便签原地「长」成编辑卡片：先是便签的纸色和正文，
  * 边放大边淡入成编辑界面。保存/取消时反向播放：卡片原地淡回便签的外观，
- * 再缩小飞回绳子上的夹子，落位后与晾衣架画的那张卡片交叉淡出完成交接。
+ * 再缩小返回绳子上的夹子，落位后与晾衣架画的那张卡片交叉淡出完成交接。
  * 编辑期间卡片可以拖动（光标保持箭头，输入区仍是工字光标）。
  *
  * 视觉跟「新建便签」弹窗一致（轻雪的弹窗配色：卡片/描边/主色按钮）。
@@ -24,7 +24,7 @@ class NoteEditor : public LayeredWindow {
 public:
     /*
      * 打开模态编辑器，返回 true 表示用户点了“完成”。
-     * `anchor` 是被编辑便签卡片的屏幕矩形：打开从这里开始，收回也飞回这里。
+     * `anchor` 是被编辑便签卡片的屏幕矩形：打开从这里开始，收回也返回这里。
      * `onShown` 在第一帧画出来之后调用，宿主可在这时把卡片藏掉，避免闪一下。
      */
     static bool Edit(HWND owner, HINSTANCE instance, Graphics* graphics, const Theme& theme,
@@ -102,7 +102,7 @@ private:
     uint64_t alphaStart_ = 0;
     POINT dragOrigin_{};
     RECT dragStart_{};
-    /* 拖动时把输入框先藏起来、正文由卡片自己画：跟着窗口一起动，不会闪。 */
+    /* 拖动时把输入框先藏起来、正文由由卡片自行绘制：跟着窗口一起动，不会闪。 */
     std::wstring dragText_;
     POINT dragTextOrigin_{};
     int lastEditW_ = 0;

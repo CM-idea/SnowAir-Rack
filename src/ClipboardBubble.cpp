@@ -363,7 +363,7 @@ void ClipboardBubble::LoadEntries()
         }
         /* 同一个内容只保留最新的一条（列表是新的在前，所以先遇到的留下）。
            图片按文件内容识别：同一张图即使存在电脑上不同位置，也只出现一次，
-           并且由新的那条占据靠前的位置；文本按正文、其它按路径/名称。 */
+           并且由新记录占据靠前的位置；文本按正文、其它按路径/名称。 */
         const std::wstring key = EntryContentKey(entry);
         if (!seen.insert(key).second) {
             continue;
@@ -402,14 +402,23 @@ void ClipboardBubble::RefreshVisibleCategories()
     LayoutChips();
 }
 
+bool ClipboardBubble::IsSvgEntry(const Entry& entry) const
+{
+    /* 轻雪把剪切板里的 SVG 代码渲染成 PNG，并通过 thumb 交给插件；
+       kind 仍然是 TEXT（复制/删除还是按轻雪的文本记录走），只是显示按图片。 */
+    return entry.kind == SNOWAIR_ENTRY_TEXT && !entry.thumb.empty();
+}
+
 bool ClipboardBubble::CategoryMatches(const Entry& entry, const Category& category) const
 {
     switch (category.builtin) {
     case 0: return true;
     case 1: return entry.source == SNOWAIR_SOURCE_CAPTURE;
-    case 2: return entry.kind == SNOWAIR_ENTRY_TEXT;
+    case 2: return entry.kind == SNOWAIR_ENTRY_TEXT && !IsSvgEntry(entry);
     case 3: return entry.source == SNOWAIR_SOURCE_RECORD;
-    case 4: return entry.kind == SNOWAIR_ENTRY_IMAGE && entry.source != SNOWAIR_SOURCE_CAPTURE;
+    case 4:
+        return (entry.kind == SNOWAIR_ENTRY_IMAGE || IsSvgEntry(entry)) &&
+               entry.source != SNOWAIR_SOURCE_CAPTURE;
     case 5: return entry.kind == SNOWAIR_ENTRY_FILES;
     default: break;
     }
@@ -575,7 +584,8 @@ void ClipboardBubble::RebuildShown()
         if (!match) continue;
         if (!needle.empty()) {
             bool hit = Lower(entry.label).find(needle) != std::wstring::npos;
-            if (!hit && !entry.text.empty()) {
+            /* SVG 记录只按类型标签 / 自定义标签命中，代码本体不参与搜索。 */
+            if (!hit && !entry.text.empty() && !IsSvgEntry(entry)) {
                 hit = Lower(entry.text).find(needle) != std::wstring::npos;
             }
             if (!hit) {
@@ -601,7 +611,10 @@ void ClipboardBubble::MeasureCards()
     const float textWidth = CardWidth() - 2.0f * kCardPadX * s;
     for (auto& entry : entries_) {
         float contentH = kThumbH * s;
-        if (entry.kind == SNOWAIR_ENTRY_TEXT) {
+        if (IsSvgEntry(entry)) {
+            /* SVG 代码：卡片按图片的缩略图高度排，不再按文字行数撑高。 */
+            contentH = kThumbH * s;
+        } else if (entry.kind == SNOWAIR_ENTRY_TEXT) {
             float lineH = 17.0f * s;
             int lines = 1;
             if (textFormat_ && graphics_ && graphics_->dwrite() && !entry.label.empty()) {
@@ -1578,6 +1591,8 @@ std::wstring ClipboardBubble::TypeTagFor(const Entry& entry) const
             return std::wstring();
         }
     }
+    /* 轻雪把 SVG 代码按图片显示，类型标签也跟着用 SVG。 */
+    if (IsSvgEntry(entry)) return L"SVG";
     switch (entry.kind) {
     case SNOWAIR_ENTRY_TEXT:
         return L"文字";
@@ -1967,7 +1982,7 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
         const float contentTop = headerTop + (kCardHeaderH + kCardHeaderGap) * s;
         const float contentLeft = card.left + kCardPadX * s;
         const float contentWidth = card.right - card.left - 2.0f * kCardPadX * s;
-        if (entry.kind == SNOWAIR_ENTRY_TEXT) {
+        if (entry.kind == SNOWAIR_ENTRY_TEXT && !IsSvgEntry(entry)) {
             const float contentH = height - (kCardHeaderTop + kCardHeaderH + kCardHeaderGap +
                                              kCardTagGap + kCardTagH + kCardPadY) * s;
             DrawTextLayoutBlock(
@@ -1976,10 +1991,14 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
                 D2D1::RectF(contentLeft, contentTop, contentLeft + contentWidth,
                             contentTop + std::max(contentH, 16.0f * s)),
                 b.fg.Get(), true);
-        } else if (entry.kind == SNOWAIR_ENTRY_IMAGE) {
+        } else if (entry.kind == SNOWAIR_ENTRY_IMAGE || IsSvgEntry(entry)) {
+            const bool svgPreview = IsSvgEntry(entry);
             const std::wstring thumbPath = entry.thumb.empty() ? entry.path : entry.thumb;
             const D2D1_RECT_F thumbRect = D2D1::RectF(
                 contentLeft, contentTop, contentLeft + kThumbW * s, contentTop + kThumbH * s);
+            /* SVG 预览已经裁到墨迹边缘，缩略图里再留一圈，别顶满 96×48。 */
+            const D2D1_RECT_F contentRect =
+                svgPreview ? rack::Inset(thumbRect, 8.0f * s, 8.0f * s) : thumbRect;
             target->FillRoundedRectangle(D2D1::RoundedRect(thumbRect, 6.0f * s, 6.0f * s),
                                          b.accent.Get());
             ImageBitmap* bitmap = nullptr;
@@ -2003,16 +2022,33 @@ void ClipboardBubble::PaintCards(ID2D1RenderTarget* target, const Brushes& b)
                 }
                 const UINT iw = bitmap->width;
                 const UINT ih = bitmap->height;
-                float cropW = std::min(static_cast<float>(iw), ih * 2.0f);
-                float cropH = cropW * 0.5f;
-                if (cropH > ih) {
-                    cropH = static_cast<float>(ih);
-                    cropW = cropH * 2.0f;
+                if (svgPreview) {
+                    /* 完整显示（不裁切），在 contentRect 里居中 */
+                    if (iw > 0 && ih > 0) {
+                        const float fit = std::min(
+                            (contentRect.right - contentRect.left) / static_cast<float>(iw),
+                            (contentRect.bottom - contentRect.top) / static_cast<float>(ih));
+                        const float w = static_cast<float>(iw) * fit;
+                        const float h = static_cast<float>(ih) * fit;
+                        const float cx = (contentRect.left + contentRect.right) * 0.5f;
+                        const float cy = (contentRect.top + contentRect.bottom) * 0.5f;
+                        const D2D1_RECT_F dest = D2D1::RectF(
+                            cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f, cy + h * 0.5f);
+                        target->DrawBitmap(bitmap->bitmap.Get(), dest, 1.0f,
+                                           D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    }
+                } else {
+                    float cropW = std::min(static_cast<float>(iw), ih * 2.0f);
+                    float cropH = cropW * 0.5f;
+                    if (cropH > ih) {
+                        cropH = static_cast<float>(ih);
+                        cropW = cropH * 2.0f;
+                    }
+                    const D2D1_RECT_F src{(iw - cropW) * 0.5f, (ih - cropH) * 0.5f,
+                                          (iw + cropW) * 0.5f, (ih + cropH) * 0.5f};
+                    target->DrawBitmap(bitmap->bitmap.Get(), thumbRect, 1.0f,
+                                       D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
                 }
-                const D2D1_RECT_F src{(iw - cropW) * 0.5f, (ih - cropH) * 0.5f,
-                                      (iw + cropW) * 0.5f, (ih + cropH) * 0.5f};
-                target->DrawBitmap(bitmap->bitmap.Get(), thumbRect, 1.0f,
-                                   D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, src);
                 if (clip) target->PopLayer();
             } else if (iconImage_) {
                 DrawGlyph(target, iconImage_.Get(),
@@ -2292,7 +2328,7 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
         target->DrawText(c.text.c_str(), static_cast<UINT32>(c.text.size()),
                          chipFormat_.Get(), c.rect, ink, D2D1_DRAW_TEXT_OPTIONS_CLIP);
     };
-    /* 分类：选中=实心主色，未选中=描边（SnowAir 选中胶囊的写法），一眼能区分。 */
+    /* 分类：选中=实心主色，未选中=描边（SnowAir 选中胶囊的写法），可明确区分。 */
     for (const auto& c : layout.catChips) {
         const bool selected =
             std::find(editCats_.begin(), editCats_.end(), c.index) != editCats_.end();

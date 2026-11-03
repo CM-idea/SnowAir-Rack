@@ -23,15 +23,17 @@ public:
     void OnCapture(const wchar_t* path);
     void OnQuickHang(const wchar_t* path);
     void OnHangText(const std::wstring& text);
-    void OnHangImage(const std::wstring& path);
+    void OnHangImage(const std::wstring& path, const std::wstring& svgId = std::wstring());
+    /* SVG 卡片：按轻雪记录 id 取回代码，复制/拖拽用；取不到返回空。 */
+    std::wstring SvgText(int index);
+    /* 文字类卡片：把内容放进剪贴板，但不让轻雪历史把它提到最前/新增一条。 */
+    bool CopyCardText(int index);
     /* 统一上绳：kind = SNOWAIR_ENTRY_*；entryId 只在文本条目上有值（轻雪的记录 id）。 */
     void OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
                      const std::wstring& thumb, const std::wstring& entryId);
     /* 点击图片卡片的夹子：把图片贴到桌面。 */
     void PinItemToDesktop(int index);
     void PinImageFile(const std::wstring& path);
-    /* 销毁便签：删掉轻雪里对应的文本记录（卡片由调用方移除）。 */
-    void DestroyNote(int index);
     void OnSettingChanged(const wchar_t* key);
     int SettingsCount() const;
     bool SettingsGet(int index, SnowAirSettingDesc* out) const;
@@ -55,6 +57,8 @@ public:
     void SaveNotes();
     void SaveItems();
     int HistoryCount();
+    /* 轻雪「停用历史记录」开关。宿主没有专门的查询接口，直接读它的配置键。 */
+    bool HistoryDisabled() const;
     int ClipboardCount();
     bool HoverPreviewEnabled();
     bool PreviewPinned();
@@ -77,18 +81,19 @@ private:
 
     /*
      * 便签数据在轻雪：这里只是读写它剪切板里的文本记录。
-     * 插件本地只保存 noteId，正文永远从轻雪取。
+     * 插件本地只保存 noteId，正文永远从轻雪取；从绳上取下卡片不删记录，
+     * 轻雪剪切板历史里仍是一条带「便签」标签的普通文本。
      */
     void SyncNotes();
     void AddNoteItem(const std::wstring& text, const std::wstring& noteId);
     bool CreateNoteRecord(const std::wstring& text, std::wstring& noteId);
     bool ReadNoteRecord(const std::wstring& noteId, std::wstring& text);
     bool UpdateNoteRecord(const std::wstring& noteId, const std::wstring& text);
-    void DeleteNoteRecord(const std::wstring& noteId);
+    int FindHostEntryById(const std::wstring& id) const;
     int FindNoteItem(const std::wstring& noteId) const;
     /* 同一套「重复上绳」判定：便签比正文，其它比路径，没有路径时比标题。 */
     int FindDuplicateItem(const Item& item) const;
-    /* 重复时的反馈：展开绳子 + 让那张卡片晃一下。 */
+    /* 重复时的反馈：展开绳子 + 使该卡片轻微晃动提示。 */
     void NudgeExistingItem(int index);
 
     std::unique_ptr<RackWindow> window_;

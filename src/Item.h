@@ -10,6 +10,9 @@ struct Item {
     std::wstring path;        /* file used for copy/open/drag */
     std::wstring sourcePath;  /* original SnowAir capture */
     std::wstring thumbPath;   /* 录屏封面（可为空） */
+    /* SVG 卡片：path 是轻雪渲染的 PNG 预览，svgId 是轻雪剪切板记录的 id；
+       复制/拖拽时按 id 读回 SVG 代码，不另存 .svg 文件。 */
+    std::wstring svgId;
     std::wstring label;       /* 录屏/文件卡片上显示的文字 */
     /*
      * 便签属于轻雪的剪切板历史，插件只记条目 id；note 只是本次运行用的缓存，

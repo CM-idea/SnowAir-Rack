@@ -24,7 +24,7 @@ public:
     void Expand(bool peek);
     void ToggleVisibility();
     void Collapse();
-    /* 让某张卡片晃一下：重复上绳时提示「已经挂在这儿了」。 */
+    /* 使某张卡片轻微晃动，用于提示「已经挂在这儿了」。 */
     void ShakeCard(int index);
     /* 从左往右检查最小间距，挨太近就用缓动推开。 */
     void NormalizeSpacing(float ms);
@@ -60,6 +60,7 @@ private:
         kTimerLongPress,
         kTimerEditWatch,
     kTimerCopyToast,
+    kTimerFakeCursor,
     };
 
     enum MenuId {
@@ -84,6 +85,8 @@ private:
     void Tick();
     void Animate();
     void EnsureVisible();
+    /* 读轻雪的「停用历史记录」，变了就重新布局并重绘。 */
+    void RefreshHistoryDisabled();
     void PositionForMonitor(HMONITOR monitor);
     void StartAnimation(float target);
     void UpdateHover();
@@ -210,4 +213,5 @@ private:
     bool hiddenForFullscreen_ = false;
     bool needsLayout_ = false;
     bool editingWatchActive_ = false;
+    bool historyDisabled_ = false;
 };

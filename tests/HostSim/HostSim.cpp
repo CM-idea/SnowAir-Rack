@@ -31,6 +31,7 @@ int g_hoverDelay = 200;
 int g_autoHide = 700;
 int g_maxItems = 8;
 int g_theme = 0;   /* rack.theme: 0 银灰, 1 奶白, 2 木棉, 3 深沉 */
+bool g_disableHistory = false;   /* 轻雪的「停用历史记录」 */
 
 std::vector<std::wstring> g_images;
 size_t g_nextImage = 0;
@@ -75,6 +76,10 @@ bool HostGetBool(void*, const wchar_t* key, bool fallback)
 {
     if (key && _wcsicmp(key, L"rack.enabled") == 0) {
         return g_enabled;
+    }
+    /* 和真宿主一样：这个键在 features 下，不带 rack. 前缀。 */
+    if (key && _wcsicmp(key, L"disableCaptureHistory") == 0) {
+        return g_disableHistory;
     }
     return fallback;
 }
@@ -430,7 +435,7 @@ int RunLoop()
 {
     SetTimer(nullptr, 1, 50, nullptr);
     MSG msg{};
-    bool f8 = false, f9 = false, f10 = false, esc = false;
+    bool f8 = false, f9 = false, f10 = false, f11 = false, esc = false;
 
     while (g_running && GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_TIMER && msg.hwnd == nullptr) {
@@ -450,6 +455,11 @@ int RunLoop()
                     g_plugin->on_setting_changed(L"rack.enabled");
                 }
                 wprintf(L"[HostSim] enabled -> %d\n", g_enabled ? 1 : 0);
+            }
+            if (KeyPressedOnce(VK_F11, &f11)) {
+                /* 和真宿主一样切换配置、不发通知，检验晾衣架自己的轮询。 */
+                g_disableHistory = !g_disableHistory;
+                wprintf(L"[HostSim] disable history -> %d\n", g_disableHistory ? 1 : 0);
             }
             if (KeyPressedOnce(VK_ESCAPE, &esc)) {
                 g_running = false;
@@ -499,9 +509,11 @@ int wmain(int argc, wchar_t** argv)
             g_maxItems = _wtoi(argv[++i]);
         } else if (arg == L"--theme" && i + 1 < argc) {
             g_theme = _wtoi(argv[++i]);
+        } else if (arg == L"--disable-history") {
+            g_disableHistory = true;
         } else if (arg == L"--help" || arg == L"-h") {
             wprintf(L"HostSim: --dll <rack.dll> --image <png> [--image ...] "
-                    L"[--seconds N] [--dark|--light] [--theme 0..3]\n");
+                    L"[--seconds N] [--dark|--light] [--theme 0..3] [--disable-history]\n");
             return 0;
         }
     }
@@ -582,7 +594,8 @@ int wmain(int argc, wchar_t** argv)
     }
 
     wprintf(L"[HostSim] loaded %ls %ls\n", g_plugin->name, g_plugin->version);
-    wprintf(L"[HostSim] F8=add capture  F9=theme  F10=enabled  Esc=quit  rack.theme=%d\n", g_theme);
+    wprintf(L"[HostSim] F8=add capture  F9=theme  F10=enabled  F11=history  Esc=quit  rack.theme=%d\n",
+            g_theme);
     if (g_durationMs > 0) {
         wprintf(L"[HostSim] auto-quit in %llu ms\n",
                 static_cast<unsigned long long>(g_durationMs));

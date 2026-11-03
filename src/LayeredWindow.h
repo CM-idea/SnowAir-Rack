@@ -29,7 +29,7 @@ public:
     float dpiScale() const { return dpiScale_; }
 
     void MoveTo(int x, int y, int w, int h);
-    /* 只挪位置：用现有画面做一次 UpdateLayeredWindow，拖动时不会闪。 */
+    /* 仅移动位置：用现有画面做一次 UpdateLayeredWindow，拖动时不会闪。 */
     void MovePresent(int x, int y);
     /* 改位置/大小并换画面：一次 UpdateLayeredWindow 完成，动画不闪。 */
     void RenderAt(int x, int y, int w, int h);
@@ -37,7 +37,7 @@ public:
     void ShowNoActivate();
     void Hide();
     void SetSupersample(bool enabled) { supersample_ = enabled; }
-    /* 整窗透明度（1 = 不透明），用于和下面的卡片做交叉淡入淡出。 */
+    /* 窗口整体透明度（1 = 不透明），用于和下面的卡片做交叉淡入淡出。 */
     void SetOpacity(float alpha);
     void Render();
 

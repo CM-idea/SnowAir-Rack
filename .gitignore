@@ -33,3 +33,7 @@ desktop.ini
 THIRD_PARTY_NOTICES.md
 referto/
 images/
+
+# Local docs (not published)
+README.md
+DESIGN.md

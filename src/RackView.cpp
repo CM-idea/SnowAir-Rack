@@ -22,13 +22,24 @@ constexpr float kNoteHeight = 24.0f;
 constexpr float kFrame = 4.0f;
 constexpr float kOuterPad = 24.0f;
 constexpr float kAccessoryWidth = 260.0f;
-/* 截图/便签飞上绳子的时长，Layout、Draw 和 HasArrival 共用，
+
+/* 轻雪渲染的 SVG 预览缓存是 <id>.svg3.png；这张图已经裁到墨迹边缘，
+   卡片里再铺满就会贴边，所以按它识别、单独留一圈白。 */
+bool IsSvgPreviewPath(const std::wstring& path)
+{
+    constexpr size_t kSuffixLen = 9;   // ".svg3.png"
+    if (path.size() < kSuffixLen) return false;
+    std::wstring tail = path.substr(path.size() - kSuffixLen);
+    for (auto& c : tail) c = static_cast<wchar_t>(towlower(c));
+    return tail == L".svg3.png";
+}
+/* 截图/便签入场动画的时长，Layout、Draw 和 HasArrival 共用，
    保证交接只发生在同一帧。 */
 constexpr float kArrivalSeconds = 0.65f;
 /* 卡片位置的目标变了之后，先停这么久再开始靠拢。 */
 constexpr uint64_t kCloseHoldMs = 140;
 
-/* 弹簧积分器：位置和目标之间的阻尼弹簧，卡片靠拢/让位用它。
+/* 弹簧积分器：位置和目标之间的阻尼弹簧，卡片靠拢/让位动画使用它。
    参数和参考实现一致（response 大一点更慢，damping 越小越弹）。 */
 void SlideSpring(float& position, float& velocity, float target, float dt, float response,
                  float damping)
@@ -559,8 +570,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     float x = kOuterPad * s + (photoWidth - total) * 0.5f;
     const float y = cardTop + slide;
 
-    /* 显示位置用弹簧追目标：目标由布局按索引算出，叉掉/插入一张后，
-       其它卡片的目标整体平移，弹簧把它们平滑带过去。 */
+    /* 显示位置用弹簧跟随目标：目标由布局按索引算出，移除/插入卡片后，
+       其它卡片的目标位置整体平移，由弹簧平滑过渡到新位置。 */
     const uint64_t nowMs = rack::NowMs();
     float dt = 0.0f;
     if (lastLayoutMs_ != 0 && nowMs > lastLayoutMs_) {
@@ -581,6 +592,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     };
 
     cards_.reserve(items.size());
+    float previousRight = -1.0e9f;
+    bool firstCard = true;
     for (size_t i = 0; i < items.size(); ++i) {
         CardBox box;
         const float w = widths[i];
@@ -592,8 +605,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
             slot.velocity = 0.0f;
             slot.primed = true;
         } else {
-            /* 目标位置变了（有卡片被叉掉/新挂上来）先原地停一下，
-               再交给弹簧慢慢追过去：先愣一下、再靠拢。 */
+            /* 目标位置变了（有卡片被移除/新增）先原地停顿，
+               再交给弹簧平滑过渡：短暂停顿后靠拢。 */
             if (std::abs(slot.target - x) > 0.5f) {
                 slot.target = x;
                 slot.holdUntil = nowMs + kCloseHoldMs;
@@ -605,7 +618,18 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
                 sliding_ = true;
             }
         }
-        box.card = D2D1::RectF(slot.pos + offset, y, slot.pos + w + offset, y + heights[i]);
+        /* 弹簧跟随目标的过程中也强制保持最小间距：两张卡不能在任何一帧叠在一起。 */
+        float left = slot.pos + offset;
+        float right = left + w;
+        const bool manualDrag = std::abs(offset) > 0.5f;
+        if (!manualDrag && !firstCard && left < previousRight + gap) {
+            const float shift = previousRight + gap - left;
+            left += shift;
+            right += shift;
+            slot.pos += shift;
+            slot.velocity = 0.0f;
+        }
+        box.card = D2D1::RectF(left, y, right, y + heights[i]);
         box.image = rack::Inset(box.card, kFrame * cs, kFrame * cs);
         const bool hasNote = !items[i].note.empty() && !items[i].path.empty();
         box.hasNote = hasNote;
@@ -622,6 +646,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
         const int variant = (items[i].id * 37) % 8;
         box.angle = static_cast<float>(variant - 4) * 0.6f;
         cards_.push_back(box);
+        previousRight = right;
+        firstCard = false;
         x += w + gap;
     }
 
@@ -658,8 +684,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     (void)left;
     (void)right;
     bottom = std::max(bottom, lineY + sag + 136.0f * s);
-    // 收起状态只保留顶部那条热区。留一整块看不见的高窗口在那儿，
-    // 会把桌面上的点击吃掉。
+    // 收起状态只保留顶部的热区。保留一个不可见的高窗口，
+    // 会把桌面上的点击拦截。
     result.height = expandAmount < 0.3f
                         ? 60.0f * s
                         : std::max(240.0f * s, bottom + 28.0f * s);
@@ -668,15 +694,32 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
 
     const float accessoriesRight = result.width - kOuterPad * s;
     const float basketCenter = accessoriesRight - 78.0f * s;
-    const float envelopeCenter = accessoriesRight - 196.0f * s;
+    /* 篮子隐藏时信封右移到篮子的槽位；换槽位和卡片一样交给弹簧追，
+       不是瞬间跳变。 */
+    const float envelopeTarget =
+        accessoriesRight - (historyDisabled_ ? 78.0f : 196.0f) * s;
+    if (!envelopeXPrimed_) {
+        envelopeX_ = envelopeTarget;
+        envelopeXVelocity_ = 0.0f;
+        envelopeXPrimed_ = true;
+    } else if (dt > 0.0f) {
+        SlideSpring(envelopeX_, envelopeXVelocity_, envelopeTarget, dt, 0.55f, 0.78f);
+    }
+    envelopeSliding_ =
+        std::abs(envelopeX_ - envelopeTarget) > 0.15f || std::abs(envelopeXVelocity_) > 0.8f;
+    const float envelopeCenter = envelopeX_;
     const float accessoryLineSpan = std::max(1.0f, result.lineEnd - result.lineStart);
     auto ropeYAt = [&](float x) {
         const float t = rack::Clamp((x - result.lineStart) / accessoryLineSpan, 0.0f, 1.0f);
         return lineY + 4.0f * sag * t * (1.0f - t);
     };
-    const float basketTop = ropeYAt(basketCenter) - 14.0f * s;
-    basketRect_ = D2D1::RectF(basketCenter - 54.0f * s, basketTop + 24.0f * s,
-                              basketCenter + 54.0f * s, basketTop + 112.0f * s);
+    if (historyDisabled_) {
+        basketRect_ = {};
+    } else {
+        const float basketTop = ropeYAt(basketCenter) - 14.0f * s;
+        basketRect_ = D2D1::RectF(basketCenter - 54.0f * s, basketTop + 24.0f * s,
+                                  basketCenter + 54.0f * s, basketTop + 112.0f * s);
+    }
     const float envelopeTop = ropeYAt(envelopeCenter) + 8.0f * s;
     const float envelopeWidth = 70.0f * s;
     const float envelopeHeight = envelopeWidth * 376.0f / 340.0f;
@@ -732,8 +775,8 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     const bool expanded = expandAmount > 0.01f;
     lastHovered_ = hovered;
 
-    /* 卡片开始绘制之前，先退休掉已经飞完的飞行。原来在 DrawArrival 里清索引，
-       会让新卡片整整一帧不画：drawGroup 因为「还在飞」跳过它，DrawArrival
+    /* 卡片开始绘制之前，先移除已完成出场动画的索引。原来在 DrawArrival 里清索引，
+       会让新卡片整整一帧不画：drawGroup 因为「仍在入场动画」跳过它，DrawArrival
        又因为「已经落位」跳过它，结果图片/便签刚落到绳上时闪一帧。 */
     if (arrivalIndex_ >= 0 && (arrivalIndex_ >= static_cast<int>(cards_.size()) ||
                                !HasArrival())) {
@@ -868,20 +911,32 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     DrawCopyToast(target, s);
 }
 
+/* 信封当前画在哪儿：弹簧已开始运动则使用弹簧位置，否则按开关算目标。 */
+float RackView::EnvelopeCenterX() const
+{
+    if (envelopeXPrimed_) {
+        return envelopeX_;
+    }
+    return layout_.width - kOuterPad * scale_ - (historyDisabled_ ? 78.0f : 196.0f) * scale_;
+}
+
 D2D1_POINT_2F RackView::EnvelopeBadgeCenter() const
 {
     const float s = scale_;
     const float span = std::max(1.0f, layout_.lineEnd - layout_.lineStart);
-    const float center = layout_.width - kOuterPad * s - 196.0f * s;
-    const float t = rack::Clamp((center - layout_.lineStart) / span, 0.0f, 1.0f);
+    const float envelopeCenter = EnvelopeCenterX();
+    const float t = rack::Clamp((envelopeCenter - layout_.lineStart) / span, 0.0f, 1.0f);
     const float ropeY = layout_.lineY + 4.0f * layout_.sag * t * (1.0f - t);
     const float envelopeBottom = ropeY + 8.0f * s + 70.0f * s * 376.0f / 340.0f;
-    const float basketCenter = layout_.width - kOuterPad * s - 78.0f * s;
-    const float bt = rack::Clamp((basketCenter - layout_.lineStart) / span, 0.0f, 1.0f);
-    const float basketBottom =
-        layout_.lineY + 4.0f * layout_.sag * bt * (1.0f - bt) - 14.0f * s + 112.0f * s;
-    const float badgeTop = std::max(envelopeBottom, basketBottom) + 2.0f * s;
-    return D2D1::Point2F(center, badgeTop + 18.0f * s);
+    float badgeTop = envelopeBottom + 2.0f * s;
+    if (!historyDisabled_) {
+        const float basketCenter = layout_.width - kOuterPad * s - 78.0f * s;
+        const float bt = rack::Clamp((basketCenter - layout_.lineStart) / span, 0.0f, 1.0f);
+        const float basketBottom =
+            layout_.lineY + 4.0f * layout_.sag * bt * (1.0f - bt) - 14.0f * s + 112.0f * s;
+        badgeTop = std::max(envelopeBottom, basketBottom) + 2.0f * s;
+    }
+    return D2D1::Point2F(envelopeCenter, badgeTop + 18.0f * s);
 }
 
 void RackView::BeginArrival(int index)
@@ -959,6 +1014,17 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
     DrawCard(target, item, box, s, spin, 0.0f, false, false);
 }
 
+void RackView::SetHistoryDisabled(bool disabled)
+{
+    if (historyDisabled_ == disabled) {
+        return;
+    }
+    historyDisabled_ = disabled;
+    if (disabled) {
+        basketRect_ = {};
+    }
+}
+
 void RackView::BeginRemove(int index, const Item& item, bool toBasket)
 {
     if (index < 0 || index >= static_cast<int>(cards_.size())) {
@@ -968,7 +1034,8 @@ void RackView::BeginRemove(int index, const Item& item, bool toBasket)
     removed.item = item;
     removed.box = cards_[static_cast<size_t>(index)];
     removed.removedMs = rack::NowMs();
-    removed.toBasket = toBasket;
+    /* 篮子藏起来后没有可落的地方，退回成从绳上掉落。 */
+    removed.toBasket = toBasket && !historyDisabled_;
     removed_.push_back(std::move(removed));
 }
 
@@ -1317,14 +1384,41 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
 
     const float accessoriesRight = layout.width - kOuterPad * s;
     const float basketCenter = accessoriesRight - 78.0f * s;
-    const float envelopeCenter = accessoriesRight - 196.0f * s;
+    const float envelopeCenter = EnvelopeCenterX();
     /* 两个数量角标共用同一条基线，即使信封和篮子的高度不同。 */
     const float envelopeBottom =
         ropeYAt(envelopeCenter) + 8.0f * s + 70.0f * s * 376.0f / 340.0f;
-    const float basketBottom = ropeYAt(basketCenter) - 14.0f * s + 112.0f * s;
-    const float badgeTop = std::max(envelopeBottom, basketBottom) + 2.0f * s;
+    float badgeTop = envelopeBottom + 2.0f * s;
+    if (!historyDisabled_) {
+        const float basketBottom = ropeYAt(basketCenter) - 14.0f * s + 112.0f * s;
+        badgeTop = std::max(envelopeBottom, basketBottom) + 2.0f * s;
+    }
 
     const int themeIndex = rack::ClampInt(theme.index, 0, 3);
+
+    /* 篮子先画：从「停用历史」恢复时它就在信封现在的位置，让信封从它上面
+       滑开、把篮子露出来，而不是两个配件硬叠在一起。平时两者不重叠。 */
+    const ImageBitmap* basket = basketTheme_[themeIndex].valid()
+                                   ? &basketTheme_[themeIndex]
+                                   : &basket_;
+    if (!historyDisabled_ && basket && basket->valid()) {
+        /* 弹簧值要保留符号：离开时它会越过 0 后回摆，
+           篮子才像自然停住。 */
+        const float basketHoverAmount = basketHover;
+        const float basketSize = 112.0f * s;
+        const float themeDrop = themeIndex == 1 ? 2.0f * s : 0.0f;
+        const float top = ropeYAt(basketCenter) - 14.0f * s + themeDrop;
+        D2D1_RECT_F dest = D2D1::RectF(basketCenter - basketSize * 0.5f, top,
+                                       basketCenter + basketSize * 0.5f, top + basketSize);
+        const D2D1_POINT_2F hook = D2D1::Point2F(basketCenter, ropeYAt(basketCenter));
+        target->SetTransform(
+            D2D1::Matrix3x2F::Rotation(-2.0f * basketHoverAmount, hook));
+        target->DrawBitmap(basket->bitmap.Get(), dest, 1.0f,
+                           D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        target->SetTransform(D2D1::Matrix3x2F::Identity());
+        DrawCountBadge(target, basketCenter, badgeTop, historyCount, s);
+    }
+
     const ImageBitmap* envelopeBack = envelopeThemeBack_[themeIndex].valid()
                                           ? &envelopeThemeBack_[themeIndex]
                                           : &envelope_;
@@ -1366,27 +1460,6 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         }
         DrawCountBadge(target, envelopeCenter, badgeTop, clipboardCount, s);
-    }
-
-    const ImageBitmap* basket = basketTheme_[themeIndex].valid()
-                                   ? &basketTheme_[themeIndex]
-                                   : &basket_;
-    if (basket && basket->valid()) {
-        /* 弹簧值要保留符号：离开时它会冲过 0 再荡回来，
-           篮子才像自然停住。 */
-        const float basketHoverAmount = basketHover;
-        const float basketSize = 112.0f * s;
-        const float themeDrop = themeIndex == 1 ? 2.0f * s : 0.0f;
-        const float top = ropeYAt(basketCenter) - 14.0f * s + themeDrop;
-        D2D1_RECT_F dest = D2D1::RectF(basketCenter - basketSize * 0.5f, top,
-                                       basketCenter + basketSize * 0.5f, top + basketSize);
-        const D2D1_POINT_2F hook = D2D1::Point2F(basketCenter, ropeYAt(basketCenter));
-        target->SetTransform(
-            D2D1::Matrix3x2F::Rotation(-2.0f * basketHoverAmount, hook));
-        target->DrawBitmap(basket->bitmap.Get(), dest, 1.0f,
-                           D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        target->SetTransform(D2D1::Matrix3x2F::Identity());
-        DrawCountBadge(target, basketCenter, badgeTop, historyCount, s);
     }
 }
 
@@ -1668,6 +1741,10 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         }
 
         D2D1_RECT_F imageRect = rack::Inset(rect, kFrame * s, kFrame * s);
+        /* SVG 预览图本身没有留白：再往里收一圈，别让它顶到相框。 */
+        const bool svgPreview = IsSvgPreviewPath(item.path);
+        D2D1_RECT_F contentRect =
+            svgPreview ? rack::Inset(imageRect, 12.0f * s, 12.0f * s) : imageRect;
     const bool textCard = item.path.empty() && !item.note.empty();
     if (textCard) {
         const float sw = (rect.right - rect.left) / 496.0f;
@@ -1719,12 +1796,12 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
     if (item.thumb.valid()) {
         const D2D1_SIZE_F size = item.thumb.bitmap->GetSize();
         if (size.width > 0.0f && size.height > 0.0f) {
-            const float fit = std::min((imageRect.right - imageRect.left) / size.width,
-                                       (imageRect.bottom - imageRect.top) / size.height);
+            const float fit = std::min((contentRect.right - contentRect.left) / size.width,
+                                       (contentRect.bottom - contentRect.top) / size.height);
             const float w = size.width * fit;
             const float h = size.height * fit;
-            const float cx = (imageRect.left + imageRect.right) * 0.5f;
-            const float cy = (imageRect.top + imageRect.bottom) * 0.5f;
+            const float cx = (contentRect.left + contentRect.right) * 0.5f;
+            const float cy = (contentRect.top + contentRect.bottom) * 0.5f;
             D2D1_RECT_F dest = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f,
                                            cy + h * 0.5f);
 
@@ -2009,7 +2086,7 @@ RackHit RackView::HitTest(float x, float y, float scale) const
         }
         {
             /* 夹子：卡片顶部中间、绳子附近的一小块。图片/录屏点它把内容贴到桌面；
-               便签没有可贴的东西——命中照样吃掉（不然会漏到下面那个窗口），
+               便签没有可贴的东西——命中照样拦截（不然会传递到下层窗口），
                但光标和点击反馈在 RackWindow 里按卡片类型过滤。 */
             const float cx = (box.card.left + box.card.right) * 0.5f;
             const D2D1_RECT_F clipRect =
@@ -2028,12 +2105,14 @@ RackHit RackView::HitTest(float x, float y, float scale) const
         }
     }
 
-    if (rack::PointIn(basketRect_, x, y)) {
-        hit.part = RackPart::Basket;
-        return hit;
-    }
+    /* 信封画在篮子上面：两者在换槽位的动画里会重叠，命中也要按画面上
+       谁在上面来判，否则垫在下面的篮子会抢走信封的点击。 */
     if (rack::PointIn(envelopeRect_, x, y)) {
         hit.part = RackPart::Envelope;
+        return hit;
+    }
+    if (!historyDisabled_ && rack::PointIn(basketRect_, x, y)) {
+        hit.part = RackPart::Basket;
         return hit;
     }
     if (lineArea) {

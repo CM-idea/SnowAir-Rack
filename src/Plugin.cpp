@@ -1,5 +1,6 @@
 #include "Plugin.h"
 
+#include "Clipboard.h"
 #include "NoteStore.h"
 #include "PinWindow.h"
 #include "RackWindow.h"
@@ -101,7 +102,7 @@ bool Plugin::Init(const SnowAirHost* host)
     config_.Load(host_, host_->user);
     theme_.Load(host_, host_->user);
     itemStore_.Load(items_);
-    /* 便签正文在轻雪：读完卡片引用后同步正文、迁移旧数据、丢掉已被删除的记录。 */
+    /* 便签正文在轻雪：读完卡片引用后同步正文、迁移旧数据、移除已删除的记录。 */
     SyncNotes();
     nextId_ = 1;
     for (const auto& item : items_) {
@@ -167,7 +168,7 @@ bool Plugin::Init(const SnowAirHost* host)
 
     initialized_ = true;
     window_->OnConfigChanged();
-    /* 正常启动不打扰用户：只有宿主刚放好插件时才会请求那一次「看一眼」。 */
+    /* 正常启动不打扰用户：只有宿主刚放好插件时才会请求一次预览。 */
     RackLog(L"晾衣架 %s 已就绪（API %d）", SA_RACK_VERSION, SNOWAIR_PLUGIN_API);
     return true;
 }
@@ -238,7 +239,7 @@ void Plugin::OnCapture(const wchar_t* path)
     item.path = full;
     item.sourcePath = full;
     item.aspect = static_cast<float>(width) / static_cast<float>(height);
-    // 截图飞上绳子现在由 arrival 动画负责，不要再叠一层旧的落位弹簧。
+    // 截图入场动画现在由 arrival 动画负责，不要再叠一层旧的落位弹簧。
     item.addedMs = 0;
     if (host_->capture_rect && !manualHang_) {
         int cx = 0, cy = 0, cw = 0, ch = 0;
@@ -259,7 +260,7 @@ void Plugin::OnCapture(const wchar_t* path)
     if (window_) {
         window_->DismissPreview();
     }
-    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
     if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
         NudgeExistingItem(duplicate);
         return;
@@ -276,12 +277,16 @@ void Plugin::OnCapture(const wchar_t* path)
     RackLog(L"Capture added: %s (items=%zu)", full.c_str(), items_.size());
 }
 
-void Plugin::OnHangImage(const std::wstring& path)
+void Plugin::OnHangImage(const std::wstring& path, const std::wstring& svgId)
 {
     if (!initialized_ || path.empty()) return;
     const std::wstring full = util::FullPath(path);
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
         if (util::SamePath(items_[static_cast<size_t>(i)].path, full)) {
+            if (!svgId.empty() && items_[static_cast<size_t>(i)].svgId.empty()) {
+                items_[static_cast<size_t>(i)].svgId = svgId;
+                SaveItems();
+            }
             NudgeExistingItem(i);
             return;
         }
@@ -296,12 +301,17 @@ void Plugin::OnHangImage(const std::wstring& path)
     item.id = nextId_++;
     item.path = full;
     item.sourcePath = full;
+    item.svgId = svgId;
     item.aspect = aspect;
     item.addedMs = 0;
     item.mtime = util::FileWriteTime(full);
     item.contentHash = util::FileContentHash(full);
-    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
     if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+        if (!svgId.empty() && items_[static_cast<size_t>(duplicate)].svgId.empty()) {
+            items_[static_cast<size_t>(duplicate)].svgId = svgId;
+            SaveItems();
+        }
         NudgeExistingItem(duplicate);
         return;
     }
@@ -311,7 +321,7 @@ void Plugin::OnHangImage(const std::wstring& path)
         RemoveItemData(0);
     }
     if (window_) {
-        /* OnItemsChanged 会启动飞行并顺带展开绳子。之前先展开的话，新卡片会
+        /* OnItemsChanged 会启动出场动画并顺带展开绳子。之前先展开的话，新卡片会
            有一帧出现在终点、再被拽回光标位置，看起来像闪了一下。 */
         window_->OnItemsChanged(true);
     }
@@ -322,6 +332,13 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
                          const std::wstring& thumb, const std::wstring& entryId)
 {
     if (!initialized_) return;
+    /* 轻雪把剪切板里的 SVG 代码渲染成了 PNG（thumb）；上绳按图片处理，
+       和轻雪历史卡片看到的是同一张图。普通文字没有 thumb，仍走便签。 */
+    if (kind == SNOWAIR_ENTRY_TEXT && !thumb.empty() && util::FileExists(thumb)) {
+        /* 轻雪已经渲染好 PNG 预览；卡片只记记录 id，复制/拖拽时按 id 读回 SVG 代码。 */
+        OnHangImage(thumb, entryId);
+        return;
+    }
     if (kind == SNOWAIR_ENTRY_TEXT) {
         /* 文本条目本身就是轻雪的记录：卡片只记 id，正文从轻雪读，不另存一份。 */
         if (entryId.empty()) {
@@ -394,7 +411,7 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         if (item.label.empty()) return;
     }
 
-    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
     if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
         NudgeExistingItem(duplicate);
         return;
@@ -476,7 +493,7 @@ void Plugin::OnHangText(const std::wstring& text)
     if (!initialized_) return;
     const std::wstring body = TrimNoteText(text);
     if (body.empty()) return;
-    /* 同样内容的便签已经在绳子上：晃一下，不再挂第二张。 */
+    /* 同样内容的便签已在绳子上：轻微晃动提示，不再挂第二张。 */
     {
         Item probe;
         probe.kind = 1;
@@ -504,7 +521,7 @@ void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId)
     item.noteColor = 2; /* yellow sticky note */
     item.aspect = 1.1f;
     item.addedMs = 0;   /* no drop-in spring: avoids a flicker on landing */
-    /* 同一个内容已经在绳子上：不再挂第二张，只让原来那张晃一下。 */
+    /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
     if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
         NudgeExistingItem(duplicate);
         return;
@@ -562,11 +579,45 @@ bool Plugin::UpdateNoteRecord(const std::wstring& noteId, const std::wstring& te
     return host_->entry_update_text(host_->user, noteId.c_str(), text.c_str(), nullptr) != 0;
 }
 
-void Plugin::DeleteNoteRecord(const std::wstring& noteId)
+std::wstring Plugin::SvgText(int index)
 {
-    if (!host_ || !host_->entry_delete_id || noteId.empty()) return;
-    host_->entry_delete_id(host_->user, noteId.c_str());
-    if (host_->entry_refresh) host_->entry_refresh(host_->user);
+    if (index < 0 || index >= static_cast<int>(items_.size())) return {};
+    const Item& item = items_[static_cast<size_t>(index)];
+    if (item.svgId.empty()) return {};
+    std::wstring text;
+    if (!ReadNoteRecord(item.svgId, text)) return {};
+    return text;
+}
+
+int Plugin::FindHostEntryById(const std::wstring& id) const
+{
+    if (!host_ || id.empty() || !host_->entry_count || !host_->entry_id) return -1;
+    const int count = host_->entry_count(host_->user);
+    for (int i = 0; i < count; ++i) {
+        wchar_t buffer[128]{};
+        if (host_->entry_id(host_->user, i, buffer, static_cast<int>(std::size(buffer))) &&
+            id == buffer) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+bool Plugin::CopyCardText(int index)
+{
+    if (index < 0 || index >= static_cast<int>(items_.size()) || !host_) return false;
+    const Item& item = items_[static_cast<size_t>(index)];
+    const std::wstring id = !item.svgId.empty() ? item.svgId : item.noteId;
+    /* 优先走宿主的 entry_copy：它会 markOwnClipboardWrite，历史不会新增/置顶。 */
+    const int hostIndex = FindHostEntryById(id);
+    if (hostIndex >= 0 && host_->entry_copy) {
+        host_->entry_copy(host_->user, hostIndex);
+        return true;
+    }
+    /* 旧宿主 / 记录已删除：只能直接写剪贴板。 */
+    const std::wstring text = !item.svgId.empty() ? SvgText(index) : item.note;
+    if (text.empty()) return false;
+    return clipboard::CopyText(text);
 }
 
 int Plugin::FindDuplicateItem(const Item& item) const
@@ -660,14 +711,6 @@ void Plugin::SyncNotes()
     if (changed) {
         SaveItems();
     }
-}
-
-void Plugin::DestroyNote(int index)
-{
-    if (index < 0 || index >= static_cast<int>(items_.size())) return;
-    const Item& item = items_[static_cast<size_t>(index)];
-    if (item.kind != 1) return;
-    DeleteNoteRecord(item.noteId);
 }
 
 void Plugin::OnQuickHang(const wchar_t* path)
@@ -820,7 +863,7 @@ void Plugin::SetItemNote(int index, const std::wstring& text, int color)
     }
     Item& item = items_[static_cast<size_t>(index)];
     if (item.kind == 1) {
-        /* 便签：正文写回轻雪的那条记录，插件只留缓存。 */
+        /* 便签：正文写回轻雪的对应记录，插件只留缓存。 */
         const std::wstring body = TrimNoteText(text);
         if (!UpdateNoteRecord(item.noteId, body)) {
             /* 记录被删掉了就补一条，卡片保持可用 */
@@ -896,10 +939,19 @@ Item* Plugin::ItemById(int id)
     return index >= 0 ? &items_[static_cast<size_t>(index)] : nullptr;
 }
 
-/* 记录由轻雪统一负责（它默认就在记，没有开关），这里只负责读数量。 */
+/* 记录由轻雪统一负责，这里只负责读数量。 */
 int Plugin::HistoryCount()
 {
     return host_ && host_->history_count ? host_->history_count(host_->user) : 0;
+}
+
+/* 轻雪把「停用历史记录」存在 features.disableCaptureHistory 下。宿主没有
+   专门的查询字段，但 config_get_bool 读的就是 features 里的键，所以能读到；
+   这不是 rack.* 命名空间，属于对宿主配置的依赖，键名变了要跟着改。 */
+bool Plugin::HistoryDisabled() const
+{
+    return host_ && host_->config_get_bool &&
+           host_->config_get_bool(host_->user, L"disableCaptureHistory", false);
 }
 
 int Plugin::ClipboardCount()
@@ -940,6 +992,10 @@ void Plugin::CloseMenu()
 
 void Plugin::OpenHistory()
 {
+    /* 历史入口已经被用户停用：即使命中测试晚了半拍，也不要再打开。 */
+    if (HistoryDisabled()) {
+        return;
+    }
     if (host_ && host_->open_history) {
         host_->open_history(host_->user);
     }

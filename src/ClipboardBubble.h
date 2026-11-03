@@ -129,6 +129,7 @@ private:
     /* 1 = 取消, 2 = 确定, 3 = 删除, 4 = 添加标签; 0 = 未命中任何弹窗按钮. */
     int HitModalButton(float x, float y) const;
     std::wstring TypeTagFor(const Entry& entry) const;
+    bool IsSvgEntry(const Entry& entry) const;
 
     /* ---- 绘制 ---- */
     void PaintHeader(ID2D1RenderTarget* target, const Brushes& b);

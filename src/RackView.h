@@ -44,13 +44,15 @@ public:
     void ShowCopyToast(int index, uint64_t untilMs);
     void ClearCopyToast();
     void SetUiDark(bool dark) { uiDark_ = dark; }
+    /* 轻雪「停用历史记录」：篮子连同角标一起隐藏，信封右移占住原来的位置。 */
+    void SetHistoryDisabled(bool disabled);
 
     void Draw(ID2D1RenderTarget* target, const std::vector<Item>& items, const Theme& theme,
               float expandAmount, float swaySeconds, float basketHover, float paper0,
               float cardHover, int cardHoverIndex, int hovered, int pressed,
               int historyCount, int clipboardCount);
 
-    /* 拖拽时跟手的卡片图：用和绳子上完全相同的画法渲染到一张 DIB，
+    /* 拖拽时跟随指针的卡片图：用和绳子上完全相同的画法渲染到一张 DIB，
        调用方负责 DeleteObject。 */
     HBITMAP MakeDragGhost(const Item& item, int width, int height, SIZE* sizeOut);
 
@@ -63,11 +65,11 @@ public:
     void BeginArrival(int index);
     void SetArrivalStart(float x, float y, float w = 0.0f, float h = 0.0f);
     bool HasArrival() const;
-    /* 掉落/飞行动画实际需要的高度（相对窗口顶部）；用它决定窗口多高，
+    /* 掉落/出场动画实际需要的高度（相对窗口顶部）；用它决定窗口多高，
        不要为了动画把整个工作区都做成窗口，那会让每帧上传的位图非常大。 */
     float AnimationHeight() const;
     /* 卡片位置是否还在弹簧里往目标位置收（用于决定要不要继续跑动画）。 */
-    bool HasSliding() const { return sliding_; }
+    bool HasSliding() const { return sliding_ || envelopeSliding_; }
 
     bool HasFalling() const {
         for (const auto& item : removed_) {
@@ -112,6 +114,7 @@ private:
     void DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, float scale,
                          float expandAmount, float basketHover, float paper0, int historyCount,
                          int clipboardCount);
+    float EnvelopeCenterX() const;
     void DrawCountBadge(ID2D1RenderTarget* target, float centerX, float top, int count,
                         float scale);
     void DrawCopyToast(ID2D1RenderTarget* target, float scale);
@@ -155,8 +158,14 @@ private:
     RackLayout layout_;
     D2D1_RECT_F basketRect_{};
     D2D1_RECT_F envelopeRect_{};
-    /* 每张卡片的「显示位置」：目标位置由布局按索引算出，实际位置用弹簧追过去。
-       叉掉一张后，后面卡片的目标位置整体左移，弹簧把它平滑带过去。 */
+    bool historyDisabled_ = false;
+    /* 信封换槽位时和卡片共用同一套弹簧：位置逐帧跟随目标。 */
+    float envelopeX_ = 0.0f;
+    float envelopeXVelocity_ = 0.0f;
+    bool envelopeXPrimed_ = false;
+    bool envelopeSliding_ = false;
+    /* 每张卡片的「显示位置」：目标位置由布局按索引算出，实际位置用弹簧平滑过渡。
+       移除一张卡片后，后面卡片的目标位置整体左移，弹簧使其平滑过渡到新位置。 */
     struct SlotSpring {
         int id = 0;
         float pos = 0.0f;

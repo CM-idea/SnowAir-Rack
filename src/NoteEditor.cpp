@@ -23,7 +23,7 @@ constexpr float kNoteRadius = 4.0f;
 constexpr UINT_PTR kTimerMorph = 11;
 constexpr int kMorphOpenMs = 240;
 constexpr int kMorphCloseMs = 180;
-constexpr int kFlyMs = 380;     /* 便签从编辑位置飞回夹子 */
+constexpr int kFlyMs = 380;     /* 便签从编辑位置返回夹子 */
 constexpr int kAlphaMs = 130;   /* 落位后和卡片交叉淡出 */
 
 D2D1_COLOR_F Opaque(D2D1_COLOR_F color)
@@ -266,11 +266,11 @@ void NoteEditor::TickMorph()
     contentScale_ = static_cast<float>(w) / ((kCardW + kShadow * 2.0f) * scale_);
     contentScale_ = rack::Clamp(contentScale_, 0.15f, 1.0f);
     /* 打开：前段把便签纸色淡成编辑卡片；缩回：反过来，从编辑卡片淡回便签。
-       （之前缩回也用同一个方向，动画第一帧就整块跳成黄色，看着一直在闪。） */
+       （之前缩回也用同一个方向，动画第一帧就整块跳成黄色，造成持续闪烁。） */
     const float rise = rack::Clamp((eased - 0.35f) / 0.45f, 0.0f, 1.0f);
     morphT_ = closing_ ? 1.0f - rise : rise;
     if (noteOnly_) {
-        morphT_ = 0.0f; /* 已经变回便签，飞回去这一段保持便签的样子 */
+        morphT_ = 0.0f; /* 已经变回便签，返回段保持便签样式 */
     }
     EnsureFormats();
     ApplyEditFont();
@@ -284,7 +284,7 @@ void NoteEditor::TickMorph()
         if (closing_) {
             if (!flying_ && cardAnchor_.right > cardAnchor_.left &&
                 cardAnchor_.bottom > cardAnchor_.top) {
-                /* 第二段：变成便签之后，再飞回绳子的夹子。 */
+                /* 第二段：变成便签之后，再返回绳子的夹子。 */
                 flying_ = true;
                 noteOnly_ = true;
                 RECT current{};
@@ -578,7 +578,7 @@ void NoteEditor::Finish(bool accepted)
         ShowWindow(edit_, SW_HIDE);
     }
     /* 收回分三段：先原地把编辑卡片淡回便签的外观（位置不动），
-       再缩小飞回夹子（见 TickMorph 的飞行段），最后与卡片交叉淡出。 */
+       再缩小返回夹子（见 TickMorph 的动画段），最后与卡片交叉淡出。 */
     RECT current{};
     GetWindowRect(hwnd(), &current);
     StartMorph(current, current, true, kMorphCloseMs);
@@ -724,7 +724,7 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
        终点用和 RackView::DrawNote 完全一样的内边距（16/18）和字号（10 * scale）。 */
     const std::wstring& morphText = closing_ ? result_ : initial_;
     if (!morphText.empty() && (closing_ || t < 0.999f)) {
-        /* 正文在动画后半程才开始挪位置：前半程编辑界面还在淡出，
+        /* 正文在动画后半程才开始移动位置：前半程编辑界面还在淡出，
            文字先待在输入区里，不会横穿过正在消失的标题。 */
         const float textT = rack::Clamp(t / 0.55f, 0.0f, 1.0f);
         const float pad = 8.0f * s;

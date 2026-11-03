@@ -2,6 +2,12 @@
 #include "Clipboard.h"
 #include "Util.h"
 
+#include <oleacc.h>
+#include <uiautomationclient.h>
+#pragma comment(lib, "uiautomationcore.lib")
+
+#include <cmath>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <shlobj.h>
@@ -11,6 +17,71 @@
 namespace dragdrop {
 namespace {
 
+
+void UpdateFakeDragCursor()
+{
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+}
+
+bool UiaEditableAtPoint(POINT point)
+{
+    using Microsoft::WRL::ComPtr;
+    static ComPtr<IUIAutomation> uia = [] {
+        ComPtr<IUIAutomation> result;
+        CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                         IID_PPV_ARGS(result.GetAddressOf()));
+        return result;
+    }();
+    if (!uia) return false;
+    ComPtr<IUIAutomationElement> element;
+    if (FAILED(uia->ElementFromPoint(point, element.GetAddressOf())) || !element) {
+        return false;
+    }
+    CONTROLTYPEID type = 0;
+    element->get_CurrentControlType(&type);
+    if (type == UIA_EditControlTypeId) {
+        return true;
+    }
+    ComPtr<IUnknown> pattern;
+    if (SUCCEEDED(element->GetCurrentPattern(UIA_ValuePatternId, pattern.GetAddressOf())) &&
+        pattern) {
+        ComPtr<IValueProvider> value;
+        pattern.As(&value);
+        BOOL readOnly = TRUE;
+        if (value && SUCCEEDED(value->get_IsReadOnly(&readOnly)) && !readOnly) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MsaaTextAtPoint(POINT point)
+{
+    static HMODULE oleacc = LoadLibraryW(L"oleacc.dll");
+    if (!oleacc) return false;
+    using AccessibleObjectFromPointFn = HRESULT(WINAPI*)(POINT, IAccessible**, VARIANT*);
+    static auto fn = reinterpret_cast<AccessibleObjectFromPointFn>(
+        GetProcAddress(oleacc, "AccessibleObjectFromPoint"));
+    if (!fn) return false;
+    IAccessible* object = nullptr;
+    VARIANT child{};
+    VariantInit(&child);
+    if (FAILED(fn(point, &object, &child)) || !object) {
+        VariantClear(&child);
+        return false;
+    }
+    bool text = false;
+    VARIANT role{};
+    VariantInit(&role);
+    if (SUCCEEDED(object->get_accRole(child, &role)) && role.vt == VT_I4 &&
+        role.lVal == ROLE_SYSTEM_TEXT) {
+        text = true;
+    }
+    VariantClear(&role);
+    VariantClear(&child);
+    object->Release();
+    return text;
+}
 
 HGLOBAL MakeBytesHandle(const std::vector<BYTE>& bytes)
 {
@@ -38,6 +109,13 @@ HBITMAP MakeDragBitmap(const std::wstring& path, int cardWidth, int cardHeight,
     if (cardWidth < 24 || cardHeight < 24) {
         return nullptr;
     }
+    /* 轻雪渲染的 SVG 预览：卡片里要留白，ghost 也照卡片的样子留一圈。 */
+    bool svgPreview = false;
+    if (path.size() >= 9) {
+        std::wstring tail = path.substr(path.size() - 9);
+        for (auto& c : tail) c = static_cast<wchar_t>(towlower(c));
+        svgPreview = tail == L".svg3.png";
+    }
     ComPtr<IWICImagingFactory> factory;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(factory.GetAddressOf())))) {
@@ -57,9 +135,26 @@ HBITMAP MakeDragBitmap(const std::wstring& path, int cardWidth, int cardHeight,
     const int frame = std::max(2, static_cast<int>(frameWidth));
     const int photoW = std::max(1, cardWidth - frame * 2);
     const int photoH = std::max(1, cardHeight - frame * 2);
+    UINT srcW = 0, srcH = 0;
+    frameDecode->GetSize(&srcW, &srcH);
+    int drawW = photoW;
+    int drawH = photoH;
+    int drawX = 0;
+    int drawY = 0;
+    if (svgPreview && srcW > 0 && srcH > 0) {
+        const int pad = std::max(4, frame * 3);
+        const int boxW = std::max(1, photoW - pad * 2);
+        const int boxH = std::max(1, photoH - pad * 2);
+        const double scale = std::min(static_cast<double>(boxW) / srcW,
+                                      static_cast<double>(boxH) / srcH);
+        drawW = std::max(1, static_cast<int>(std::lround(srcW * scale)));
+        drawH = std::max(1, static_cast<int>(std::lround(srcH * scale)));
+        drawX = (photoW - drawW) / 2;
+        drawY = (photoH - drawH) / 2;
+    }
     ComPtr<IWICBitmapScaler> scaler;
     if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())) ||
-        FAILED(scaler->Initialize(frameDecode.Get(), photoW, photoH,
+        FAILED(scaler->Initialize(frameDecode.Get(), drawW, drawH,
                                   WICBitmapInterpolationModeFant))) {
         return nullptr;
     }
@@ -71,9 +166,21 @@ HBITMAP MakeDragBitmap(const std::wstring& path, int cardWidth, int cardHeight,
         return nullptr;
     }
     const UINT photoStride = static_cast<UINT>(photoW) * 4;
-    std::vector<BYTE> photo(photoStride * static_cast<UINT>(photoH));
-    if (FAILED(converter->CopyPixels(nullptr, photoStride,
-                                     static_cast<UINT>(photo.size()), photo.data()))) {
+    std::vector<BYTE> photo(static_cast<size_t>(photoStride) * photoH, 0);
+    if (svgPreview) {
+        const UINT drawStride = static_cast<UINT>(drawW) * 4;
+        std::vector<BYTE> scaled(static_cast<size_t>(drawStride) * drawH);
+        if (FAILED(converter->CopyPixels(nullptr, drawStride,
+                                         static_cast<UINT>(scaled.size()), scaled.data()))) {
+            return nullptr;
+        }
+        for (int y = 0; y < drawH; ++y) {
+            std::memcpy(photo.data() + (static_cast<size_t>(drawY + y) * photoW + drawX) * 4,
+                        scaled.data() + static_cast<size_t>(y) * drawStride,
+                        static_cast<size_t>(drawW) * 4);
+        }
+    } else if (FAILED(converter->CopyPixels(nullptr, photoStride,
+                                            static_cast<UINT>(photo.size()), photo.data()))) {
         return nullptr;
     }
 
@@ -538,7 +645,8 @@ private:
 /* 便签正文的拖拽数据对象：只提供文本，设计软件收到的是文字本身。 */
 class RackTextDataObject final : public IDataObject {
 public:
-    explicit RackTextDataObject(std::wstring text) : text_(std::move(text)) {}
+    RackTextDataObject(std::wstring text, bool exposeFormats)
+        : text_(std::move(text)), expose_(exposeFormats) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
     {
@@ -572,6 +680,9 @@ public:
     {
         if (!format || !medium) {
             return E_INVALIDARG;
+        }
+        if (!expose_) {
+            return DV_E_FORMATETC;
         }
         if (format->lindex != -1 && format->lindex != 0) {
             return DV_E_FORMATETC;
@@ -628,6 +739,9 @@ public:
         if (!format) {
             return E_INVALIDARG;
         }
+        if (!expose_) {
+            return DV_E_FORMATETC;
+        }
         const bool known = format->cfFormat == CF_UNICODETEXT ||
                            format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT;
         if (!known || !(format->tymed & TYMED_HGLOBAL) ||
@@ -662,6 +776,9 @@ public:
         if (direction != DATADIR_GET) {
             return E_NOTIMPL;
         }
+        if (!expose_) {
+            return E_NOTIMPL;
+        }
         FORMATETC formats[2]{};
         formats[0].cfFormat = CF_UNICODETEXT;
         formats[1].cfFormat = CF_TEXT;
@@ -694,6 +811,7 @@ private:
 
     LONG ref_ = 1;
     std::wstring text_;
+    bool expose_ = true;
 };
 
 
@@ -756,6 +874,29 @@ std::wstring FolderFromShellDispatch(IDispatch* dispatch)
     return result;
 }
 
+bool FilesEqual(const std::wstring& a, const std::wstring& b)
+{
+    std::ifstream left(a, std::ios::binary | std::ios::ate);
+    std::ifstream right(b, std::ios::binary | std::ios::ate);
+    if (!left || !right) return false;
+    const std::streamoff size = left.tellg();
+    if (size < 0 || size != right.tellg()) return false;
+    left.seekg(0);
+    right.seekg(0);
+    std::vector<char> bufA(64 * 1024), bufB(64 * 1024);
+    std::streamoff remaining = size;
+    while (remaining > 0) {
+        const std::streamsize chunk = static_cast<std::streamsize>(
+            std::min<std::streamoff>(remaining, static_cast<std::streamoff>(bufA.size())));
+        left.read(bufA.data(), chunk);
+        right.read(bufB.data(), chunk);
+        if (left.gcount() != chunk || right.gcount() != chunk) return false;
+        if (std::memcmp(bufA.data(), bufB.data(), static_cast<size_t>(chunk)) != 0) return false;
+        remaining -= chunk;
+    }
+    return true;
+}
+
 /* 光标落点对应的文件夹：桌面，或某个资源管理器窗口当前打开的目录。 */
 std::wstring FolderUnderCursor(POINT cursor)
 {
@@ -796,10 +937,12 @@ std::wstring FolderUnderCursor(POINT cursor)
 class RackDropSource final : public IDropSource {
 public:
     /* rack 用来判断「有没有拖回绳子区域」：出去了再拖回来就取消这次拖拽，
-       原卡片留在绳子上并晃一下，而不是把内容丢给桌面复制一份。 */
-    RackDropSource(HWND preview, RECT returnBand, DragOutcome* scene, std::wstring sourceFolder)
+       原卡片留在绳子上并轻微晃动提示，而不是把内容交给桌面复制一份。 */
+    RackDropSource(HWND preview, RECT returnBand, DragOutcome* scene, std::wstring sourceFolder,
+                   std::wstring sourcePath, bool fakeCursor = false)
         : preview_(preview), returnBand_(returnBand), scene_(scene),
-          sourceFolder_(std::move(sourceFolder)) {}
+          sourceFolder_(std::move(sourceFolder)), sourcePath_(std::move(sourcePath)),
+          fakeCursor_(fakeCursor) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
     {
@@ -832,18 +975,16 @@ public:
     HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override
     {
         if (escapePressed) {
+            if (scene_) scene_->cancelled = true;
             return DRAGDROP_S_CANCEL;
         }
         POINT cursor{};
         GetCursorPos(&cursor);
         const bool insideRack = PtInRect(&returnBand_, cursor) != FALSE;
-        if (!insideRack) {
-            leftRack_ = true;
-        }
         if (!(keyState & MK_LBUTTON)) {
-            /* 松手时落在绳子区域：按「反悔」处理，取消这次拖拽。
-               注意只在松手这一刻判断——拖动过程中经过绳子不会打断用户。 */
-            if (insideRack && leftRack_) {
+            /* 松手时还在绳子区域：按取消处理，终止本次拖拽。
+               不再要求之前离开过绳子——拖出去一点又拖回来也算取消。 */
+            if (insideRack) {
                 if (scene_) {
                     scene_->returnedToRack = true;
                 }
@@ -852,8 +993,26 @@ public:
             /* 落在「源文件所在的同一个文件夹」里（包括桌面）：不是复制，取消这次拖拽。
                否则资源管理器会复制到同目录，弹出「源文件名和目标文件名相同」。 */
             const std::wstring targetFolder = FolderUnderCursor(cursor);
-            if (!targetFolder.empty() && !sourceFolder_.empty() &&
-                util::SamePath(targetFolder, sourceFolder_)) {
+            const bool sameFolder = !targetFolder.empty() && !sourceFolder_.empty() &&
+                                    util::SamePath(targetFolder, sourceFolder_);
+            /* 同名同内容：桌面上的那份当作“同一个文件”，把它的图标移到落点；
+               同名不同内容交给资源管理器替换；不同名同内容仍然正常复制。 */
+            if (!targetFolder.empty() && !sourcePath_.empty()) {
+                const std::wstring name =
+                    std::filesystem::path(sourcePath_).filename().wstring();
+                const std::wstring target = util::JoinPath(targetFolder, name);
+                if (!name.empty() && util::FileExists(target) &&
+                    !util::SamePath(target, sourcePath_) && FilesEqual(sourcePath_, target)) {
+                    if (scene_) {
+                        scene_->duplicate = true;
+                        scene_->duplicatePath = target;
+                        scene_->desktop = util::SamePath(targetFolder, DesktopFolderPath());
+                        scene_->point = cursor;
+                    }
+                    return DRAGDROP_S_CANCEL;
+                }
+            }
+            if (sameFolder) {
                 if (scene_) {
                     scene_->sameFolder = true;
                     scene_->desktop = util::SamePath(targetFolder, DesktopFolderPath());
@@ -868,6 +1027,14 @@ public:
 
     HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override
     {
+        auto applyCursor = [this]() -> HRESULT {
+            if (fakeCursor_) {
+                UpdateFakeDragCursor();
+                return S_OK;
+            }
+            /* 文件拖拽交给 OLE 自己画 copy / no-drop，保留系统自带的复制角标。 */
+            return DRAGDROP_S_USEDEFAULTCURSORS;
+        };
         if (preview_ && IsWindow(preview_)) {
             POINT cursor{};
             GetCursorPos(&cursor);
@@ -878,12 +1045,12 @@ public:
             /* 预览窗口创建时已经置顶：这里只平移，不再每次 SetWindowPos(HWND_TOPMOST)。
                反复请求置顶会触发窗口管理器重排，拖拽就会发涩。 */
             if (x == rect.left && y == rect.top) {
-                return DRAGDROP_S_USEDEFAULTCURSORS;
+                return applyCursor();
             }
             SetWindowPos(preview_, nullptr, x, y, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
-        return DRAGDROP_S_USEDEFAULTCURSORS;
+        return applyCursor();
     }
 
 private:
@@ -892,11 +1059,22 @@ private:
     RECT returnBand_{};
     DragOutcome* scene_ = nullptr;
     std::wstring sourceFolder_;
-    bool leftRack_ = false;
+    std::wstring sourcePath_;
+    bool fakeCursor_ = false;
     LONG ref_ = 1;
 };
 
 } /* namespace */
+
+void SetDragCursor()
+{
+    UpdateFakeDragCursor();
+}
+
+bool EditableAtPoint(POINT point)
+{
+    return UiaEditableAtPoint(point) || MsaaTextAtPoint(point);
+}
 
 bool RepositionDesktopIcon(const std::wstring& path, POINT screenPoint)
 {
@@ -963,6 +1141,7 @@ bool RepositionDesktopIcon(const std::wstring& path, POINT screenPoint)
 DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWidth, int cardHeight,
                 float frameWidth, bool* dropped, DragOutcome* outcome)
 {
+    (void)rack;
     if (dropped) *dropped = false;
     if (outcome) *outcome = DragOutcome{};
     if (!util::FileExists(path)) {
@@ -979,7 +1158,7 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
     auto* data = new (std::nothrow) RackDataObject(path);
     auto* source = new (std::nothrow) RackDropSource(
         dragPreview, returnBand, outcome,
-        std::filesystem::path(path).parent_path().wstring());
+        std::filesystem::path(path).parent_path().wstring(), path);
     if (!data || !source) {
         if (data) {
             data->Release();
@@ -1057,8 +1236,10 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
 
 DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMAP ghost,
                     SIZE ghostSize,
-                    int cardWidth, int cardHeight, float frameWidth, bool* dropped, DragOutcome* outcome)
+                    int cardWidth, int cardHeight, float frameWidth, bool* dropped,
+                    DragOutcome* outcome, const std::wstring& previewPath, bool pasteOnly)
 {
+    (void)rack;
     if (dropped) *dropped = false;
     if (outcome) *outcome = DragOutcome{};
     if (text.empty()) {
@@ -1070,14 +1251,18 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
 
     SIZE dragSize = ghostSize;
     HBITMAP dragBitmap = ghost;
+    if (!dragBitmap && !previewPath.empty()) {
+        dragBitmap = MakeDragBitmap(previewPath, cardWidth, cardHeight, frameWidth, &dragSize);
+    }
     if (!dragBitmap) {
         dragBitmap = MakeTextDragBitmap(text, cardWidth, cardHeight, frameWidth, &dragSize);
     }
     HWND dragPreview = dragBitmap ? CreateDragPreview(dragBitmap, dragSize.cx, dragSize.cy)
                                   : nullptr;
 
-    auto* data = new (std::nothrow) RackTextDataObject(text);
-    auto* source = new (std::nothrow) RackDropSource(dragPreview, returnBand, outcome, std::wstring());
+    auto* data = new (std::nothrow) RackTextDataObject(text, !pasteOnly);
+    auto* source = new (std::nothrow) RackDropSource(dragPreview, returnBand, outcome, std::wstring(),
+                                                      std::wstring(), pasteOnly);
     if (!data || !source) {
         if (data) {
             data->Release();
