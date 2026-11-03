@@ -28,12 +28,10 @@ shot*.png
 Thumbs.db
 desktop.ini
 /rack.json
-²Î¿¼/
 *.bat
 THIRD_PARTY_NOTICES.md
 referto/
 images/
 
 # Local docs (not published)
-README.md
 DESIGN.md
