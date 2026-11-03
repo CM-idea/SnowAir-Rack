@@ -164,7 +164,7 @@ if ($Package) {
     $rackDir = Join-Path $stage 'rack'
     New-Item -ItemType Directory -Path $rackDir -Force | Out-Null
     Copy-Item $dll $rackDir
-    foreach ($extra in @('README.md', 'LICENSE', 'DESIGN.md', 'THIRD_PARTY_NOTICES.md')) {
+    foreach ($extra in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
         $path = Join-Path $root $extra
         if (Test-Path $path) { Copy-Item $path $rackDir }
     }
