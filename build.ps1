@@ -157,8 +157,6 @@ if ($BuildHostSim) {
 }
 
 if ($Package) {
-    $versionLine = Select-String -Path (Join-Path $src 'Version.h') -Pattern 'SA_RACK_VERSION\s+L"([^"]+)"'
-    $version = $versionLine.Matches[0].Groups[1].Value
     $stage = Join-Path $build 'package'
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
     $rackDir = Join-Path $stage 'rack'
@@ -171,15 +169,11 @@ if ($Package) {
     $docs = Join-Path $root 'docs'
     if (Test-Path $docs) { Copy-Item $docs $rackDir -Recurse }
     if (Test-Path $assetsSrc) { Copy-Item $assetsSrc $rackDir -Recurse }
-    $zip = Join-Path $dist "SnowAir-Rack-v$version.zip"
+
+    # 固定资源名：宿主用 /releases/latest/download/SnowAir-Rack.zip 永远拿最新版。
+    # 每次发 Release 只上传这一个 zip，不再生成带版本号的包。
+    $zip = Join-Path $dist "SnowAir-Rack.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
     Compress-Archive -Path $rackDir -DestinationPath $zip
-
-    # 固定资源名：宿主用 /releases/latest/download/SnowAir-Rack.zip 永远拿最新版，
-    # 不再依赖版本号/Atom 检查。每次发 Release 必须把这个文件一起传上去。
-    $latestZip = Join-Path $dist "SnowAir-Rack.zip"
-    if (Test-Path $latestZip) { Remove-Item $latestZip -Force }
-    Copy-Item $zip $latestZip -Force
-    Write-Host "==> $zip" -ForegroundColor Green
-    Write-Host "==> $latestZip (latest/download 固定名)" -ForegroundColor Green
+    Write-Host "==> $zip (latest/download 固定名)" -ForegroundColor Green
 }

@@ -7,7 +7,7 @@
 先安装 [SnowAir 轻雪](https://github.com/CM-idea/SnowAir)，然后两种方式任选其一：
 
 1. **从轻雪插件库安装**：打开轻雪 → 设置 → 插件集成，找到「晾衣架」卡片点下载，装好后重启轻雪。
-2. **手动安装**：下载 `SnowAir-Rack.zip`（固定名，始终指向最新版；历史版本仍保留 `SnowAir-Rack-v*.zip`），解压后把其中的 `rack` 文件夹放到 `%AppData%\SnowAir\plugin\`，重启轻雪即可。便携模式则放到 `SnowAir.exe` 同目录的 `plugin\` 下。
+2. **手动安装**：下载 `SnowAir-Rack.zip`（固定名，始终指向最新版），解压后把其中的 `rack` 文件夹放到 `%AppData%\SnowAir\plugin\`，重启轻雪即可。便携模式则放到 `SnowAir.exe` 同目录的 `plugin\` 下。
 
 ## 功能
 
@@ -27,7 +27,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 
 产物 `dist\rack.dll` 复制到 `%AppData%\SnowAir\plugin\rack\` 后重启轻雪。
 
-发版用 `build.ps1 -Package`，会同时生成 `dist\SnowAir-Rack-v<版本>.zip` 和固定名的 `dist\SnowAir-Rack.zip`；两个都要上传到 Release，插件库下载只认固定名。
+发版用 `build.ps1 -Package`，生成固定名的 `dist\SnowAir-Rack.zip`，上传到 Release 即可；插件库和手动安装都只认这个固定名。
 
 ## 依赖
 
