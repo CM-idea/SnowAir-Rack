@@ -174,5 +174,12 @@ if ($Package) {
     $zip = Join-Path $dist "SnowAir-Rack-v$version.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
     Compress-Archive -Path $rackDir -DestinationPath $zip
+
+    # 固定资源名：宿主用 /releases/latest/download/SnowAir-Rack.zip 永远拿最新版，
+    # 不再依赖版本号/Atom 检查。每次发 Release 必须把这个文件一起传上去。
+    $latestZip = Join-Path $dist "SnowAir-Rack.zip"
+    if (Test-Path $latestZip) { Remove-Item $latestZip -Force }
+    Copy-Item $zip $latestZip -Force
     Write-Host "==> $zip" -ForegroundColor Green
+    Write-Host "==> $latestZip (latest/download 固定名)" -ForegroundColor Green
 }

@@ -3390,6 +3390,9 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                         LoadEntries();
                         RefreshCategories();
                         Reload(true);
+                        /* 删除后轻雪的剪切板计数已经变了，但晾衣架是另一个窗口，
+                           不会自己重绘；不通知的话信封角标会一直显示旧数字。 */
+                        if (onEntriesChanged_) onEntriesChanged_();
                         break;
                     }
                 }

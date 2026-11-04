@@ -27,6 +27,10 @@ public:
     /* 屏幕点是否落在面板窗口上：晾衣架只在这块区域里把鼠标让给面板。 */
     bool ContainsPoint(POINT screen) const;
     void SetOnClosed(std::function<void()> callback) { onClosed_ = std::move(callback); }
+    /* 条目被删掉后通知晾衣架：信封/篮子的数字角标要马上跟着变。 */
+    void SetOnEntriesChanged(std::function<void()> callback) {
+        onEntriesChanged_ = std::move(callback);
+    }
     void SetOnHangText(std::function<void(const std::wstring&)> callback) { onHangText_ = std::move(callback); }
     void SetOnHangImage(std::function<void(const std::wstring&)> callback) { onHangImage_ = std::move(callback); }
     void SetOnHangEntry(std::function<void(int, const std::wstring&, const std::wstring&,
@@ -215,6 +219,7 @@ private:
 
     /* ---- 状态 ---- */
     std::function<void()> onClosed_;
+    std::function<void()> onEntriesChanged_;
     std::function<void(const std::wstring&)> onHangText_;
     std::function<void(const std::wstring&)> onHangImage_;
     std::function<void(int, const std::wstring&, const std::wstring&, const std::wstring&,

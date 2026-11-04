@@ -156,7 +156,15 @@ bool Plugin::Init(const SnowAirHost* host)
     if (!clipboard_->Init(graphics_.get(), host_)) {
         clipboard_.reset();
     } else {
-        clipboard_->SetOnClosed([this]() { clipboardClosedTick_ = rack::NowMs(); });
+        clipboard_->SetOnClosed([this]() {
+            clipboardClosedTick_ = rack::NowMs();
+            /* 面板开着时宿主也可能改过计数：收起时补一次重绘，角标不会停在旧数字。 */
+            if (window_) window_->RenderNow();
+        });
+        clipboard_->SetOnEntriesChanged([this]() {
+            /* 面板里删了剪切板记录：立刻重画晾衣架，让信封角标上的数字同步减一。 */
+            if (window_) window_->RenderNow();
+        });
         clipboard_->SetOnHangText([this](const std::wstring& text) { OnHangText(text); });
         clipboard_->SetOnHangImage([this](const std::wstring& path) { OnHangImage(path); });
         clipboard_->SetOnHangEntry(
@@ -1024,6 +1032,8 @@ void Plugin::OpenClipboard(int screenX, int screenY)
     const bool dark = HostThemeIsDark();
     clipboard_->Open(screenX, screenY, scale,
                      host_ ? Theme::HostUi(host_, host_->user) : Theme::MenuStyle(dark));
+    /* 面板可能盖住信封角标的一部分：打开时按最新计数重画一次，避免先看到旧数字。 */
+    if (window_) window_->RenderNow();
 }
 
 bool Plugin::HostThemeIsDark() const

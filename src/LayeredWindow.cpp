@@ -185,8 +185,11 @@ void LayeredWindow::Render()
     }
 
     if (!target_) {
+        /* 软件 DC 渲染目标：默认（硬件）会为进程拉起一套 D3D11 设备，实测常驻私有内存
+           多 ~22MB；晾衣架只是 2560×60 的 2D 条，软件光栅足够，先按软件建。
+           如果以后某个大图/动效窗口确实需要硬件，再给 LayeredWindow 加 per-window 开关。 */
         D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
-            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         HRESULT hr = graphics_->d2d()->CreateDCRenderTarget(&props, target_.GetAddressOf());
         if (FAILED(hr)) {
