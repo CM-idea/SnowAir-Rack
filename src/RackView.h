@@ -6,17 +6,47 @@
 
 class Graphics;
 
-enum class RackPart { None, Line, Background, Card, Note, Close, Lock, Basket, Envelope, Clip };
+enum class RackPart {
+    None,
+    Line,
+    Background,
+    Card,
+    Note,
+    Close,
+    Lock,
+    Basket,
+    Envelope,
+    Clip,
+    CardLink,  /* 链接卡的正文 URL */
+    CardColor  /* 颜色卡的色块 / hex / rgb 文本 */
+};
 
 struct RackHit {
     RackPart part = RackPart::None;
     int index = -1;
+    int colorIndex = -1; /* CardColor：第几个颜色 */
+    int colorPart = 0;   /* CardColor：0=色块，1=hex，2=rgb */
+};
+
+struct ColorRowBox {
+    int index = 0;
+    D2D1_RECT_F row{};
+    D2D1_RECT_F swatch{};
+    D2D1_RECT_F hex{};
+    D2D1_RECT_F rgb{};
 };
 
 struct CardBox {
+    int id = 0;
     D2D1_RECT_F card{};
     D2D1_RECT_F image{};
     D2D1_RECT_F note{};
+    D2D1_RECT_F header{};
+    D2D1_RECT_F body{};
+    D2D1_RECT_F linkText{};
+    std::vector<ColorRowBox> colorRows;
+    card::Type cardType = card::Type::Image;
+    bool flat = false;
     bool hasNote = false;
     float pinTop = 0.0f;
     float angle = 0.0f;
@@ -41,8 +71,15 @@ public:
 
     RackLayout Layout(const std::vector<Item>& items, float maxWidth, float scale,
                       float expandAmount, float cardScale);
+    /* 与 Layout 完全一致的最终槽位：重排时先把槽位钉到目标，
+       再用 rackOffsetX 从当前视觉位置缓动回 0，避免槽位弹簧和偏移叠加。 */
+    std::vector<float> TargetLefts(const std::vector<Item>& items) const;
+    void SnapSlotsTo(const std::vector<Item>& items, const std::vector<float>& lefts);
     void ShowCopyToast(int index, uint64_t untilMs);
     void ClearCopyToast();
+    /* 单击某个 hex/rgb 后让那一行短暂变绿，作为“已复制”的微提示。 */
+    void ShowColorFlash(int itemId, int colorIndex, int part, uint64_t untilMs);
+    void ClearColorFlash();
     void SetUiDark(bool dark) { uiDark_ = dark; }
     /* 轻雪「停用历史记录」：篮子连同角标一起隐藏，信封右移占住原来的位置。 */
     void SetHistoryDisabled(bool disabled);
@@ -55,6 +92,8 @@ public:
     /* 拖拽时跟随指针的卡片图：用和绳子上完全相同的画法渲染到一张 DIB，
        调用方负责 DeleteObject。 */
     HBITMAP MakeDragGhost(const Item& item, int width, int height, SIZE* sizeOut);
+    /* 颜色卡拖单个颜色：一张纯色块卡片的 ghost。 */
+    HBITMAP MakeColorGhost(const card::Rgba& color, int width, int height, SIZE* sizeOut);
 
     RackHit HitTest(float x, float y, float scale) const;
     const CardBox* Card(int index) const;
@@ -78,16 +117,30 @@ public:
         return false;
     }
     void SetDragging(int index) { dragging_ = index; }
+    /* 松手时把被拖卡的弹簧起点钉在当前位置：重排后从落点弹回新槽位，
+       不会先闪回旧槽位再跳过去。 */
+    void PrepareCardRelease(int index);
+    /* 颜色卡滚轮只在白卡内部生效，不包含 20% 外圈。 */
+    bool ColorContentContains(int index, float x, float y) const;
     /* 光标压在卡片哪个控件上（锁定/关闭），用来做悬停反馈。 */
     void SetHoverPart(int part, int index) {
         hoverPart_ = part;
         hoverPartIndex_ = index;
+    }
+    /* 颜色卡悬停到第几个颜色的哪一段（0 色块 / 1 hex / 2 rgb）。 */
+    void SetHoverColor(int colorIndex, int colorPart) {
+        hoverColorIndex_ = colorIndex;
+        hoverColorPart_ = colorPart;
     }
     /* 正在编辑器里的便签：卡片先藏起来，只留绳子上的夹子。 */
     void SetEditingCard(int index) { editingCard_ = index; }
 
     const RackLayout& layout() const { return layout_; }
     bool hasLayout() const { return !cards_.empty(); }
+    const CardBox* CardAt(int index) const
+    {
+        return index >= 0 && index < static_cast<int>(cards_.size()) ? &cards_[index] : nullptr;
+    }
 
 private:
     void EnsureFormats(float scale);
@@ -97,9 +150,18 @@ private:
                         bool hovered);
     void DrawCard(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                   float scale, float swayAngle, float hoverAmount, bool hovered,
-                  bool pressed, bool hotLock = false, bool hotClose = false);
+                  bool pressed, bool hotLock = false, bool hotClose = false,
+                  bool hotLink = false, bool hotColor = false);
     void DrawNote(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                   const Theme& theme, float scale, float swayAngle);
+    /* 新式非图片卡：白底 + 顶部纯色头 + 20% 类型色外圈。 */
+    void DrawFlatCard(ID2D1RenderTarget* target, const Item& item, const D2D1_RECT_F& rect,
+                      float scale, bool hotLink = false, bool hotColor = false);
+    /* 便签纸卡：方角、右下折角、头部 #FFE087。 */
+    void DrawPaperCard(ID2D1RenderTarget* target, const Item& item, const D2D1_RECT_F& rect,
+                       float scale);
+    void DrawFlatIcon(ID2D1RenderTarget* target, card::Type type, D2D1_POINT_2F center,
+                      float size, ID2D1Brush* brush, float stroke);
     void DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Theme& theme,
                  float scale);
     /* 文件卡片左下角：文件夹图标 + 类型/数量文字。 */
@@ -133,11 +195,25 @@ private:
     ComPtr<IDWriteTextFormat> badgeFormat_;
     ComPtr<IDWriteTextFormat> fileTagFormat_;
     ComPtr<IDWriteTextFormat> toastFormat_;
+    ComPtr<IDWriteTextFormat> cardTitleFormat_;
+    ComPtr<IDWriteTextFormat> cardMetaFormat_;
+    ComPtr<IDWriteTextFormat> cardBodyFormat_;
+    ComPtr<IDWriteTextFormat> cardColorHexFormat_;
+    ComPtr<IDWriteTextFormat> cardColorRgbFormat_;
+    ComPtr<IDWriteTextFormat> cardColorHexBoldFormat_;
+    ComPtr<IDWriteTextFormat> cardColorRgbBoldFormat_;
+    ComPtr<IDWriteTextFormat> cardFileNameFormat_;
+    ComPtr<IDWriteTextFormat> cardFileNameWrapFormat_;
     ComPtr<IDWriteFontFace> iconFace_;
     ComPtr<ID2D1PathGeometry> iconLock_;
     ComPtr<ID2D1PathGeometry> iconUnlock_;
     ComPtr<ID2D1PathGeometry> iconClose_;
     ComPtr<ID2D1PathGeometry> iconFolder_;
+    ComPtr<ID2D1PathGeometry> iconLink_;
+    ComPtr<ID2D1PathGeometry> iconText_;
+    ComPtr<ID2D1PathGeometry> iconColor_;
+    ComPtr<ID2D1PathGeometry> iconVideo_;
+    ComPtr<ID2D1PathGeometry> iconMusic_;
     ImageBitmap basket_;
     ImageBitmap basketTheme_[4];
     ImageBitmap envelope_;
@@ -180,11 +256,15 @@ private:
 
     float scale_ = 1.0f;
     float formatScale_ = 0.0f;
+    float formatCardScale_ = 0.0f;
     float lineRetract_ = 0.0f;
     float cardScale_ = 1.0f;
     int lastHovered_ = -1;
     int hoverPart_ = 0;
     int hoverPartIndex_ = -1;
+    int hoverColorIndex_ = -1;
+    int hoverColorPart_ = -1;
+    bool skipHoldOnce_ = false;
     int editingCard_ = -1;
     int arrivalIndex_ = -1;
     uint64_t arrivalStartMs_ = 0;
@@ -195,4 +275,8 @@ private:
     bool uiDark_ = false;
     int copyToastIndex_ = -1;
     uint64_t copyToastUntil_ = 0;
+    int copyFlashItemId_ = -1;
+    int copyFlashColorIndex_ = -1;
+    int copyFlashPart_ = 0;
+    uint64_t copyFlashUntil_ = 0;
 };

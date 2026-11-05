@@ -183,6 +183,22 @@ bool CopyFilePath(const std::wstring& path)
     return ok;
 }
 
+bool CopyFilePaths(const std::vector<std::wstring>& paths)
+{
+    if (paths.empty()) {
+        return false;
+    }
+    if (!OpenClipboard(nullptr)) {
+        return false;
+    }
+    bool ok = false;
+    if (EmptyClipboard()) {
+        ok = SetClipboardData(CF_HDROP, util::MakeDropFilesHandle(paths)) != nullptr;
+    }
+    CloseClipboard();
+    return ok;
+}
+
 HGLOBAL MakeDibFromFile(const std::wstring& path)
 {
     DecodedImage image;

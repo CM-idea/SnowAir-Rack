@@ -34,7 +34,8 @@ public:
     void SetOnHangText(std::function<void(const std::wstring&)> callback) { onHangText_ = std::move(callback); }
     void SetOnHangImage(std::function<void(const std::wstring&)> callback) { onHangImage_ = std::move(callback); }
     void SetOnHangEntry(std::function<void(int, const std::wstring&, const std::wstring&,
-                                           const std::wstring&, const std::wstring&)> callback) {
+                                           const std::wstring&, const std::wstring&, long long,
+                                           const std::vector<std::wstring>&, bool)> callback) {
         onHangEntry_ = std::move(callback);
     }
 
@@ -49,6 +50,7 @@ private:
         std::wstring id;
         std::wstring text;
         std::wstring path;
+        std::vector<std::wstring> paths; /* 多文件条目的全部路径 */
         std::wstring thumb;
         std::wstring time;
         std::vector<std::wstring> tags;
@@ -223,7 +225,8 @@ private:
     std::function<void(const std::wstring&)> onHangText_;
     std::function<void(const std::wstring&)> onHangImage_;
     std::function<void(int, const std::wstring&, const std::wstring&, const std::wstring&,
-                       const std::wstring&)> onHangEntry_;
+                       const std::wstring&, long long, const std::vector<std::wstring>&, bool)>
+        onHangEntry_;
     const SnowAirHost* host_ = nullptr;
     Theme theme_;
     float scale_ = 1.0f;

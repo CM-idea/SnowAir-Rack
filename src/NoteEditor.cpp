@@ -4,6 +4,10 @@
 
 #include "Graphics.h"
 
+#include <commdlg.h>
+
+#include <cmath>
+
 namespace {
 
 /* 卡片尺寸全部按 96 DPI 的 DIP 设计，运行时再乘屏幕缩放。 */
@@ -19,6 +23,11 @@ constexpr float kRadius = 16.0f;
 constexpr float kFieldRadius = 6.0f;
 constexpr float kButtonRadius = 6.0f;
 constexpr float kNoteRadius = 4.0f;
+
+/* 强调色色板：卡片类型默认色 + 七彩色块（打开系统颜色面板）。 */
+constexpr uint32_t kAccentPresets[8] = {
+    0x1677FF, 0x34C759, 0xFF8D28, 0xFF383C, 0xCB30E0, 0xF3CD5F, 0xAC7F5E, 0x515151,
+};
 
 constexpr UINT_PTR kTimerMorph = 11;
 constexpr int kMorphOpenMs = 240;
@@ -41,6 +50,35 @@ D2D1_COLOR_F Mix(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t)
 D2D1_COLOR_F White()
 {
     return D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+D2D1_COLOR_F HsvColor(float hue, float saturation, float value)
+{
+    float h = std::fmod(hue, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    const float c = value * saturation;
+    const float x = c * (1.0f - std::fabs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+    const float m = value - c;
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (h < 60.0f) { r = c; g = x; }
+    else if (h < 120.0f) { r = x; g = c; }
+    else if (h < 180.0f) { g = c; b = x; }
+    else if (h < 240.0f) { g = x; b = c; }
+    else if (h < 300.0f) { r = x; b = c; }
+    else { r = c; b = x; }
+    return D2D1::ColorF(r + m, g + m, b + m, 1.0f);
+}
+
+D2D1_COLOR_F RgbColor(uint32_t rgb)
+{
+    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
+                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
+                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
+}
+
+bool UsesDarkInk(const D2D1_COLOR_F& accent)
+{
+    return 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b > 0.72f;
 }
 
 D2D1_COLOR_F Black()
@@ -72,7 +110,8 @@ bool NoteEditor::Edit(HWND owner, HINSTANCE instance, Graphics* graphics, const 
                       const std::wstring& title, const RECT& anchor,
                       const std::wstring& initial, std::wstring& text,
                       std::function<void()> onShown, std::function<void(const RECT&)> onClosed,
-                      std::function<void()> onLanded)
+                      std::function<void()> onLanded, const CardLook& look,
+                      std::function<void(uint32_t)> onAccent)
 {
     if (!instance || !graphics) {
         return false;
@@ -91,9 +130,11 @@ bool NoteEditor::Edit(HWND owner, HINSTANCE instance, Graphics* graphics, const 
 
     NoteEditor editor;
     editor.theme_ = theme;
+    editor.look_ = look;
     editor.title_ = title.empty() ? L"便签" : title;
     editor.onClosed_ = std::move(onClosed);
     editor.onLanded_ = std::move(onLanded);
+    editor.onAccent_ = std::move(onAccent);
     if (!editor.Create(graphics, instance, L"SnowAirRackNoteEditor", L"便签")) {
         RackLog(L"NoteEditor: Create failed");
         return false;
@@ -160,7 +201,8 @@ bool NoteEditor::Open(HWND owner, const RECT& anchor, const std::wstring& initia
     if (anchor.right > anchor.left && anchor.bottom > anchor.top) {
         const int centerX = (anchor.left + anchor.right) / 2;
         target.left = centerX - windowW / 2;
-        target.top = anchor.bottom + Px(10.0f * scale_) - Px(kShadow * scale_);
+        /* 整体往上一点，离被编辑的卡片更近。 */
+        target.top = anchor.bottom - Px(2.0f * scale_) - Px(kShadow * scale_);
     } else {
         target.left = workArea_.left + (workArea_.right - workArea_.left - windowW) / 2;
         target.top = workArea_.top + (workArea_.bottom - workArea_.top - windowH) / 2;
@@ -310,7 +352,7 @@ void NoteEditor::TickMorph()
         LayoutEdit();
         if (edit_) {
             ShowWindow(edit_, SW_SHOWNOACTIVATE);
-            SetFocus(edit_);
+            if (!look_.readOnly) SetFocus(edit_);
         }
     }
 }
@@ -354,6 +396,11 @@ void NoteEditor::CreateEdit()
     const int margin = Px(8.0f * scale_);
     SendMessageW(edit_, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
                  MAKELPARAM(margin, margin));
+    if (look_.readOnly) {
+        SendMessageW(edit_, EM_SETREADONLY, TRUE, 0);
+        /* 只读时禁用它：文字变灰，也不会再出现闪烁光标。 */
+        EnableWindow(edit_, FALSE);
+    }
 
     /* 光标落到末尾：编辑已有便签时不该一上来就全选覆盖。 */
     const int length = GetWindowTextLengthW(edit_);
@@ -405,10 +452,10 @@ void NoteEditor::LayoutEdit()
     const Layout layout = Measure();
     const float s = scale_ * contentScale_;
     const float inset = 1.0f * s;
-    const int x = Px(layout.field.left + inset);
-    const int y = Px(layout.field.top + inset);
-    const int w = std::max(24, Px((layout.field.right - layout.field.left) - inset * 2.0f));
-    const int h = std::max(24, Px((layout.field.bottom - layout.field.top) - inset * 2.0f));
+    const int x = Px(layout.editArea.left + inset);
+    const int y = Px(layout.editArea.top + inset);
+    const int w = std::max(24, Px((layout.editArea.right - layout.editArea.left) - inset * 2.0f));
+    const int h = std::max(24, Px((layout.editArea.bottom - layout.editArea.top) - inset * 2.0f));
 
     POINT origin{x, y};
     ClientToScreen(hwnd(), &origin);
@@ -464,8 +511,8 @@ void NoteEditor::EnsureFormats()
         return;
     }
     const float s = scale_ * contentScale_;
-    if (titleFormat_ && hintFormat_ && buttonFormat_ &&
-        std::abs(formatScale_ - s) < 0.001f) {
+    if (titleFormat_ && hintFormat_ && buttonFormat_ && cardTitleFormat_ &&
+        cardMetaFormat_ && std::abs(formatScale_ - s) < 0.001f) {
         return;
     }
     formatScale_ = s;
@@ -495,7 +542,20 @@ void NoteEditor::EnsureFormats()
                              DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_TEXT_ALIGNMENT_LEADING);
     buttonFormat_ = makeFormat(12.5f * s, DWRITE_FONT_WEIGHT_NORMAL,
                                DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_TEXT_ALIGNMENT_CENTER);
-
+    const float cardScale = std::max(0.5f, look_.cardScale);
+    float titleSize = 12.0f;
+    float metaSize = 10.0f;
+    if (cardScale <= 0.9f) {
+        titleSize = 10.0f;
+        metaSize = 8.0f;
+    } else if (cardScale >= 1.2f) {
+        titleSize = 14.0f;
+        metaSize = 12.0f;
+    }
+    cardTitleFormat_ = makeFormat(titleSize * s, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                  DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_TEXT_ALIGNMENT_LEADING);
+    cardMetaFormat_ = makeFormat(metaSize * s, DWRITE_FONT_WEIGHT_NORMAL,
+                                 DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 NoteEditor::Layout NoteEditor::Measure() const
@@ -517,6 +577,19 @@ NoteEditor::Layout NoteEditor::Measure() const
     layout.field = D2D1::RectF(layout.card.left + pad,
                                layout.card.top + pad + kHeaderH * s + 8.0f * s,
                                layout.card.right - pad, footerTop - 16.0f * s);
+    layout.editArea = layout.field;
+    if (look_.colorMode) {
+        const float rowH = 28.0f * s;
+        layout.editArea.bottom = layout.field.bottom - rowH - 2.0f * s;
+        const float size = 17.0f * s;
+        const float gap = 7.0f * s;
+        float sx = layout.field.left + 11.0f * s;
+        const float sy = layout.field.bottom - 9.0f * s - size;
+        for (int i = 0; i < 9; ++i) {
+            layout.swatches[i] = D2D1::RectF(sx, sy, sx + size, sy + size);
+            sx += size + gap;
+        }
+    }
     layout.save = D2D1::RectF(layout.card.right - pad - kButtonW * s, footerTop,
                               layout.card.right - pad, footerTop + kButtonH * s);
     layout.cancel = D2D1::RectF(layout.save.left - 8.0f * s - kButtonW * s, footerTop,
@@ -528,8 +601,10 @@ NoteEditor::Layout NoteEditor::Measure() const
 
 D2D1_COLOR_F NoteEditor::FieldColor() const
 {
-    /* 跟「新建便签」弹窗一致：弹窗卡片色 / 深色下 #262626、浅色下 #FFFFFF。 */
-    return theme_.dark ? D2D1::ColorF(0.149f, 0.149f, 0.149f, 1.0f) : White();
+    /* 输入框和信封弹窗卡片同色：深色 #1A1A1A，浅色 #F5F4F4。 */
+    return theme_.dark
+               ? D2D1::ColorF(26.0f / 255.0f, 26.0f / 255.0f, 26.0f / 255.0f, 1.0f)
+               : D2D1::ColorF(245.0f / 255.0f, 244.0f / 255.0f, 244.0f / 255.0f, 1.0f);
 }
 
 NoteEditor::Hot NoteEditor::HitTest(float x, float y) const
@@ -545,6 +620,47 @@ NoteEditor::Hot NoteEditor::HitTest(float x, float y) const
         return Hot::Cancel;
     }
     return Hot::None;
+}
+
+int NoteEditor::SwatchAt(float x, float y) const
+{
+    if (!look_.colorMode || morphT_ < 0.45f) {
+        return -1;
+    }
+    const Layout layout = Measure();
+    for (int i = 0; i < 9; ++i) {
+        D2D1_RECT_F r = layout.swatches[i];
+        const float grow = 3.0f * scale_;
+        r = D2D1::RectF(r.left - grow, r.top - grow, r.right + grow, r.bottom + grow);
+        if (rack::PointIn(r, x, y)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+uint32_t NoteEditor::EditColorValue() const
+{
+    const std::wstring text = EditText();
+    std::vector<card::Rgba> colors;
+    if (card::ParseColors(text, colors) && !colors.empty()) {
+        const card::Rgba& c = colors.front();
+        return (static_cast<uint32_t>(c.r) << 16) | (static_cast<uint32_t>(c.g) << 8) |
+               static_cast<uint32_t>(c.b);
+    }
+    return look_.accent & 0xFFFFFFu;
+}
+
+void NoteEditor::SetEditColor(uint32_t rgb)
+{
+    if (!edit_) return;
+    const std::wstring text = card::HexText(card::Rgba{
+        static_cast<uint8_t>((rgb >> 16) & 0xFF),
+        static_cast<uint8_t>((rgb >> 8) & 0xFF),
+        static_cast<uint8_t>(rgb & 0xFF), 255});
+    SetWindowTextW(edit_, text.c_str());
+    SendMessageW(edit_, EM_SETSEL, 0, -1);
+    Render();
 }
 
 std::wstring NoteEditor::EditText() const
@@ -621,8 +737,8 @@ void NoteEditor::AfterDraw(HDC dc, void* bits, int width, int height)
     RECT rect{};
     rect.left = dragTextOrigin_.x;
     rect.top = dragTextOrigin_.y;
-    rect.right = static_cast<LONG>(layout.field.right - 8.0f * s);
-    rect.bottom = static_cast<LONG>(layout.field.bottom - 6.0f * s);
+    rect.right = static_cast<LONG>(layout.editArea.right - 8.0f * s);
+    rect.bottom = static_cast<LONG>(layout.editArea.bottom - 6.0f * s);
     if (rect.right > rect.left && rect.bottom > rect.top) {
         DrawTextW(dc, dragText_.c_str(), static_cast<int>(dragText_.size()), &rect,
                   DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK);
@@ -652,10 +768,13 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
         return;
     }
     const float s = scale_ * contentScale_;
+    const float cardS = scale_ * std::max(0.5f, look_.cardScale);
     const Layout layout = Measure();
     const float radius = kRadius * s;
     const float t = morphT_;
 
+    /* 弹窗背景用信封面板色（深色 #262626 / 浅色 #FFFFFF）；
+       输入框单独用更深的卡片色（#1A1A1A / #F5F4F4）。 */
     const D2D1_COLOR_F cardFill =
         theme_.dark ? D2D1::ColorF(0.149f, 0.149f, 0.149f, 1.0f) : White();
     const D2D1_COLOR_F border = Opaque(theme_.dark ? D2D1::ColorF(0.290f, 0.290f, 0.290f, 1.0f)
@@ -685,24 +804,50 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
         }
     }
 
-    /* 1) 卡片底：便签纸色 → 编辑卡片色，同时从「铺满窗口」收进卡片矩形。
+    /* 1) 卡片底：绳子上那张卡的外观 → 编辑卡片，同时从「铺满窗口」收进卡片矩形。
        全程不透明，避免动画中透出桌面。 */
-    /* 与晾衣架上的便签卡片同色：黄色纸张 + 深棕字。 */
-    const NotePalette note{NotePaperTop(), NotePaperInk(), NotePaperEdge(), NotePaperBottom()};
+    const bool imageNote = look_.type == card::Type::Image;
+    const bool noteLook = look_.type == card::Type::Note;
+    const bool flatLook = !imageNote && !noteLook;
+    D2D1_COLOR_F paperTop = NotePaperTop();
+    D2D1_COLOR_F paperBottom = NotePaperBottom();
+    D2D1_COLOR_F headerColor = NotePaperHeader();
+    D2D1_COLOR_F cardTitleColor = NotePaperTitle();
+    D2D1_COLOR_F cardBodyColor = NotePaperInk();
+    D2D1_COLOR_F cardAccent = D2D1::ColorF(0.1f, 0.1f, 0.1f);
+    if (flatLook) {
+        cardAccent = RgbColor(look_.accentSet ? look_.accent : card::DefaultAccent(look_.type));
+        headerColor = cardAccent;
+        cardTitleColor = UsesDarkInk(cardAccent) ? D2D1::ColorF(0.12f, 0.12f, 0.12f) : White();
+        cardBodyColor = D2D1::ColorF(0.318f, 0.318f, 0.318f);
+        paperTop = White();
+        paperBottom = White();
+    } else if (noteLook && look_.accentSet) {
+        cardAccent = RgbColor(look_.accent);
+        headerColor = cardAccent;
+        paperTop = Mix(cardAccent, White(), 0.70f);
+        paperBottom = paperTop;
+        cardTitleColor = White();
+        cardBodyColor = NotePaperInk();
+    }
+    const NotePalette note{paperTop, cardBodyColor,
+                           flatLook ? util::WithAlpha(headerColor, 0.20f) : NotePaperEdge(),
+                           paperBottom};
     RECT client{};
     GetClientRect(hwnd(), &client);
     D2D1_RECT_F base = D2D1::RectF(
         rack::Lerp(0.0f, layout.card.left, t), rack::Lerp(0.0f, layout.card.top, t),
         rack::Lerp(static_cast<float>(client.right), layout.card.right, t),
         rack::Lerp(static_cast<float>(client.bottom), layout.card.bottom, t));
-    const float baseRadius = rack::Lerp(kNoteRadius * s, radius, t);
-    /* 便签纸和绳子上那张卡片一样是斜向渐变（F4D476 → F7E3A7），
-       落位交接时才不会突然从纯色变成渐变。 */
+    const float cardRadius = flatLook ? 15.0f * cardS
+                                      : (noteLook ? 0.0f : kNoteRadius * s);
+    const float baseRadius = rack::Lerp(cardRadius, radius, t);
     {
-        const D2D1_GRADIENT_STOP stops[2] = {
-            {0.0f, Opaque(Mix(D2D1::ColorF(0xF4D476), cardFill, t))},
-            {1.0f, Opaque(Mix(D2D1::ColorF(0xF7E3A7), cardFill, t))},
-        };
+        const D2D1_COLOR_F top =
+            flatLook ? Mix(White(), cardFill, t) : Mix(paperTop, cardFill, t);
+        const D2D1_COLOR_F bottom =
+            flatLook ? Mix(White(), cardFill, t) : Mix(paperBottom, cardFill, t);
+        const D2D1_GRADIENT_STOP stops[2] = {{0.0f, Opaque(top)}, {1.0f, Opaque(bottom)}};
         ComPtr<ID2D1GradientStopCollection> collection;
         ComPtr<ID2D1LinearGradientBrush> paper;
         if (SUCCEEDED(target->CreateGradientStopCollection(stops, 2, collection.GetAddressOf())) &&
@@ -719,27 +864,82 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
         }
     }
 
-    /* 正文：全程只有一份，从「输入区里的 13px」连续变形成「便签上的 10px」——
-       位置、字号、颜色一起插值，文字一直在，不会先消失再在别处长出来。
-       终点用和 RackView::DrawNote 完全一样的内边距（16/18）和字号（10 * scale）。 */
+    /* 文字卡的 20% 外圈；便签没有。头部会把顶部那段盖掉。 */
+    if (flatLook && t < 0.999f) {
+        const float ring = 4.5f * cardS;
+        fill->SetColor(util::WithAlpha(Opaque(cardAccent), 0.20f * (1.0f - t)));
+        const D2D1_RECT_F ringRect = rack::Inset(base, ring * 0.5f, ring * 0.5f);
+        target->DrawRoundedRectangle(
+            D2D1::RoundedRect(ringRect, std::max(1.0f, baseRadius - ring * 0.5f),
+                              std::max(1.0f, baseRadius - ring * 0.5f)),
+            fill.Get(), ring);
+    }
+
+    /* 卡片头：标题/时间。t=0 时和绳子上的卡片一致，随后淡成编辑卡片。 */
+    if (!imageNote) {
+        const float headerHeight = 33.0f * cardS;
+        const D2D1_RECT_F headerRect =
+            D2D1::RectF(base.left, base.top, base.right, base.top + headerHeight);
+        fill->SetColor(Opaque(Mix(headerColor, cardFill, t)));
+        if (baseRadius > 0.5f) {
+            target->FillRoundedRectangle(
+                D2D1::RoundedRect(headerRect, baseRadius, baseRadius), fill.Get());
+            target->FillRectangle(D2D1::RectF(headerRect.left, headerRect.top + baseRadius,
+                                              headerRect.right, headerRect.bottom),
+                                  fill.Get());
+        } else {
+            target->FillRectangle(headerRect, fill.Get());
+        }
+        if (t < 0.999f) {
+            const std::wstring label = noteLook ? L"便签" : card::TypeLabel(look_.type);
+            const std::wstring time = card::FormatCardTime(look_.createdAt);
+            if (cardTitleFormat_) {
+                ink->SetColor(util::WithAlpha(Opaque(Mix(cardTitleColor, fg, t)), 1.0f - t));
+                target->DrawText(
+                    label.c_str(), static_cast<UINT32>(label.size()), cardTitleFormat_.Get(),
+                    D2D1::RectF(base.left + 11.0f * cardS, base.top + 4.0f * cardS,
+                                base.right - 11.0f * cardS, base.top + 19.0f * cardS),
+                    ink.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            if (!time.empty() && cardMetaFormat_) {
+                ink->SetColor(
+                    util::WithAlpha(Opaque(Mix(cardTitleColor, muted, t)), (1.0f - t) * 0.50f));
+                target->DrawText(
+                    time.c_str(), static_cast<UINT32>(time.size()), cardMetaFormat_.Get(),
+                    D2D1::RectF(base.left + 11.0f * cardS, base.top + 19.0f * cardS,
+                                base.right - 11.0f * cardS, base.top + 31.0f * cardS),
+                    ink.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        }
+    }
+
+    /* 正文：从「输入区里的 13px」连续变形成卡片正文。 */
     const std::wstring& morphText = closing_ ? result_ : initial_;
     if (!morphText.empty() && (closing_ || t < 0.999f)) {
-        /* 正文在动画后半程才开始移动位置：前半程编辑界面还在淡出，
-           文字先待在输入区里，不会横穿过正在消失的标题。 */
         const float textT = rack::Clamp(t / 0.55f, 0.0f, 1.0f);
         const float pad = 8.0f * s;
         const D2D1_RECT_F editorRect =
             D2D1::RectF(layout.field.left + pad, layout.field.top + pad,
                         layout.field.right - pad, layout.field.bottom - pad);
+        const float cardTextTop = imageNote ? 18.0f * scale_ : 41.0f * cardS;
+        const float cardTextLeft = imageNote ? 16.0f * scale_ : 11.0f * cardS;
         const D2D1_RECT_F noteRect =
-            D2D1::RectF(base.left + 16.0f * scale_, base.top + 18.0f * scale_,
-                        base.right - 12.0f * scale_, base.bottom - 10.0f * scale_);
+            D2D1::RectF(base.left + cardTextLeft, base.top + cardTextTop,
+                        base.right - (imageNote ? 12.0f * scale_ : 11.0f * cardS),
+                        base.bottom - 10.0f * (imageNote ? scale_ : cardS));
         const D2D1_RECT_F textRect = D2D1::RectF(
             rack::Lerp(noteRect.left, editorRect.left, textT),
             rack::Lerp(noteRect.top, editorRect.top, textT),
             rack::Lerp(noteRect.right, editorRect.right, textT),
             rack::Lerp(noteRect.bottom, editorRect.bottom, textT));
-        const float textSize = rack::Lerp(10.0f * scale_, 13.0f * s, textT);
+        float cardBodySize = 11.5f;
+        if (look_.cardScale <= 0.9f) {
+            cardBodySize = 9.5f;
+        } else if (look_.cardScale >= 1.2f) {
+            cardBodySize = 13.5f;
+        }
+        const float cardTextSize = imageNote ? 10.0f * scale_ : cardBodySize * s;
+        const float textSize = rack::Lerp(cardTextSize, 13.0f * s, textT);
         if (IDWriteTextFormat* format = MorphFormat(textSize)) {
             /* 收回时正文始终不透明（它就是同一段文字在变形）；
                打开时淡出，把位置让给随后的输入框。 */
@@ -755,10 +955,6 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
         return;
     }
     auto fade = [t](D2D1_COLOR_F color) { return util::WithAlpha(color, color.a * t); };
-
-    ink->SetColor(fade(Mix(note.edge, border, t)));
-    target->DrawRoundedRectangle(D2D1::RoundedRect(base, baseRadius, baseRadius), ink.Get(),
-                                 1.0f * s);
 
     if (titleFormat_) {
         ink->SetColor(fade(fg));
@@ -784,13 +980,73 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
                          ink.Get(), 1.3f * s);
     }
 
-    /* 输入区：与弹窗一致——同卡片底色 + 描边 */
-    fill->SetColor(fade(cardFill));
+    /* 输入区：比弹窗背景更深一档的卡片色，不再描边。 */
+    fill->SetColor(fade(FieldColor()));
     target->FillRoundedRectangle(
         D2D1::RoundedRect(layout.field, kFieldRadius * s, kFieldRadius * s), fill.Get());
-    ink->SetColor(fade(border));
-    target->DrawRoundedRectangle(
-        D2D1::RoundedRect(layout.field, kFieldRadius * s, kFieldRadius * s), ink.Get(), 1.0f * s);
+
+    if (look_.colorMode && t > 0.15f) {
+        const uint32_t current = look_.accent & 0xFFFFFFu;
+        bool presetSelected = false;
+        for (uint32_t preset : kAccentPresets) {
+            if ((preset & 0xFFFFFFu) == (current & 0xFFFFFFu)) presetSelected = true;
+        }
+        /* 选中绿圈不跟着色块一起缩小：色块 17，圈仍按原来的 22 左右。 */
+        const float ringRadius = 11.0f * s;
+        for (int i = 0; i < 9; ++i) {
+            const D2D1_RECT_F r = layout.swatches[i];
+            const float cx = (r.left + r.right) * 0.5f;
+            const float cy = (r.top + r.bottom) * 0.5f;
+            const float radius = (r.right - r.left) * 0.5f;
+            if (i == 8) {
+                /* 纯圆彩虹渐变：用足够细的扇形近似锥形渐变，最上面是蓝，
+                   顺时针经过紫/红/黄/绿/青回到蓝。 */
+                constexpr int kSegments = 180;
+                const float step = 6.2831853f / static_cast<float>(kSegments);
+                for (int k = 0; k < kSegments; ++k) {
+                    const float a0 = -1.5707964f + static_cast<float>(k) * step;
+                    const float a1 = a0 + step * 1.15f;
+                    ComPtr<ID2D1PathGeometry> wedge;
+                    if (graphics_ && graphics_->d2d() &&
+                        SUCCEEDED(graphics_->d2d()->CreatePathGeometry(
+                            wedge.GetAddressOf())) && wedge) {
+                        ComPtr<ID2D1GeometrySink> sink;
+                        if (SUCCEEDED(wedge->Open(sink.GetAddressOf())) && sink) {
+                            sink->BeginFigure(D2D1::Point2F(cx, cy),
+                                              D2D1_FIGURE_BEGIN_FILLED);
+                            sink->AddLine(D2D1::Point2F(cx + std::cos(a0) * radius,
+                                                        cy + std::sin(a0) * radius));
+                            sink->AddLine(D2D1::Point2F(cx + std::cos(a1) * radius,
+                                                        cy + std::sin(a1) * radius));
+                            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                            sink->Close();
+                            const float hue =
+                                240.0f + (static_cast<float>(k) + 0.5f) /
+                                             static_cast<float>(kSegments) * 360.0f;
+                            fill->SetColor(fade(HsvColor(hue, 1.0f, 1.0f)));
+                            target->FillGeometry(wedge.Get(), fill.Get());
+                        }
+                    }
+                }
+                if (!presetSelected) {
+                    ink->SetColor(fade(D2D1::ColorF(0.2f, 0.78f, 0.35f, 1.0f)));
+                    target->DrawEllipse(
+                        D2D1::Ellipse(D2D1::Point2F(cx, cy), ringRadius, ringRadius),
+                        ink.Get(), 2.0f * s);
+                }
+            } else {
+                fill->SetColor(fade(RgbColor(kAccentPresets[i])));
+                target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), radius, radius),
+                                    fill.Get());
+                if ((kAccentPresets[i] & 0xFFFFFFu) == current) {
+                    ink->SetColor(fade(D2D1::ColorF(0.2f, 0.78f, 0.35f, 1.0f)));
+                    target->DrawEllipse(
+                        D2D1::Ellipse(D2D1::Point2F(cx, cy), ringRadius, ringRadius),
+                        ink.Get(), 2.0f * s);
+                }
+            }
+        }
+    }
 
     /* 拖动中：正文由卡片用 GDI 补画（见 AfterDraw），和 EDIT 里的一模一样。 */
 
@@ -803,13 +1059,9 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
 
     {
         const bool hovered = hot_ == Hot::Cancel;
-        fill->SetColor(fade(hovered ? Mix(Opaque(theme_.card), fg, 0.06f) : Opaque(theme_.card)));
+        fill->SetColor(fade(theme_.PopupCancelBg(hovered)));
         target->FillRoundedRectangle(
             D2D1::RoundedRect(layout.cancel, kButtonRadius * s, kButtonRadius * s), fill.Get());
-        ink->SetColor(fade(border));
-        target->DrawRoundedRectangle(
-            D2D1::RoundedRect(layout.cancel, kButtonRadius * s, kButtonRadius * s), ink.Get(),
-            1.0f * s);
         if (buttonFormat_) {
             static const wchar_t kLabel[] = L"取消";
             ink->SetColor(fade(fg));
@@ -871,13 +1123,15 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         break;
+    case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
         if (!edit_ || reinterpret_cast<HWND>(lParam) != edit_) {
             break;
         }
         HDC dc = reinterpret_cast<HDC>(wParam);
         const COLORREF bg = ToColorRef(FieldColor());
-        SetTextColor(dc, ToColorRef(Opaque(theme_.fg)));
+        SetTextColor(dc, ToColorRef(Opaque(look_.readOnly ? theme_.fgTertiary
+                                                          : theme_.fg)));
         SetBkColor(dc, bg);
         if (!editBrush_ || editBrushColor_ != bg) {
             if (editBrush_) {
@@ -893,7 +1147,8 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         GetCursorPos(&point);
         ScreenToClient(hwnd(), &point);
         const Hot hot = HitTest(static_cast<float>(point.x), static_cast<float>(point.y));
-        if (hot == Hot::Close || hot == Hot::Cancel || hot == Hot::Save) {
+        if (SwatchAt(static_cast<float>(point.x), static_cast<float>(point.y)) >= 0 ||
+            hot == Hot::Close || hot == Hot::Cancel || hot == Hot::Save) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
         } else {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
@@ -921,6 +1176,10 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         if (morphing_) {
             return 0;
         }
+        if (look_.colorMode && SwatchAt(x, y) >= 0) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return 0;
+        }
         const Hot hot = HitTest(x, y);
         if (hot != hot_) {
             hot_ = hot;
@@ -937,13 +1196,20 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         }
         const float x = static_cast<float>(GET_X_LPARAM(lParam));
         const float y = static_cast<float>(GET_Y_LPARAM(lParam));
+        if (look_.colorMode) {
+            const int swatch = SwatchAt(x, y);
+            if (swatch >= 0) {
+                pressedSwatch_ = swatch;
+                return 0;
+            }
+        }
         const Hot hot = HitTest(x, y);
         if (hot == Hot::Close || hot == Hot::Cancel || hot == Hot::Save) {
             pressed_ = hot;
             Render();
             return 0;
         }
-        if (edit_) {
+        if (edit_ && !look_.readOnly) {
             SetFocus(edit_);
         }
         /* 卡片空白处（标题/边距）按住就能拖，光标不变；输入区由 EDIT 接管。
@@ -985,12 +1251,47 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             LayoutEdit();
             if (edit_) {
                 ShowWindow(edit_, SW_SHOWNOACTIVATE);
-                SetFocus(edit_);
+                if (!look_.readOnly) SetFocus(edit_);
             }
             Render();
             return 0;
         }
         if (morphing_) {
+            return 0;
+        }
+        if (pressedSwatch_ >= 0) {
+            const int swatch = SwatchAt(static_cast<float>(GET_X_LPARAM(lParam)),
+                                        static_cast<float>(GET_Y_LPARAM(lParam)));
+            const int pressed = pressedSwatch_;
+            pressedSwatch_ = -1;
+            if (swatch == pressed) {
+                auto applyAccent = [this](uint32_t rgb) {
+                    look_.accent = rgb & 0xFFFFFFu;
+                    look_.accentSet = true;
+                    if (onAccent_) onAccent_(look_.accent);
+                    Render();
+                };
+                if (pressed < 8) {
+                    applyAccent(kAccentPresets[pressed]);
+                } else {
+                    COLORREF custom[16]{};
+                    const uint32_t current = look_.accent & 0xFFFFFFu;
+                    CHOOSECOLORW choose{};
+                    choose.lStructSize = sizeof(choose);
+                    choose.hwndOwner = hwnd();
+                    choose.rgbResult = RGB((current >> 16) & 0xFF, (current >> 8) & 0xFF,
+                                           current & 0xFF);
+                    choose.lpCustColors = custom;
+                    choose.Flags = CC_FULLOPEN | CC_RGBINIT;
+                    if (ChooseColorW(&choose)) {
+                        applyAccent((static_cast<uint32_t>(GetRValue(choose.rgbResult)) << 16) |
+                                    (static_cast<uint32_t>(GetGValue(choose.rgbResult)) << 8) |
+                                    static_cast<uint32_t>(GetBValue(choose.rgbResult)));
+                    }
+                }
+                if (edit_ && !look_.readOnly) SetFocus(edit_);
+            }
+            Render();
             return 0;
         }
         const Hot hot = HitTest(static_cast<float>(GET_X_LPARAM(lParam)),
@@ -1017,7 +1318,7 @@ LRESULT NoteEditor::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             LayoutEdit();
             if (edit_) {
                 ShowWindow(edit_, SW_SHOWNOACTIVATE);
-                SetFocus(edit_);
+                if (!look_.readOnly) SetFocus(edit_);
             }
             Render();
         }

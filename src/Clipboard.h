@@ -12,5 +12,7 @@ HGLOBAL MakeDibFromFile(const std::wstring& path);
 
 /* 只把文件放进剪贴板（CF_HDROP），不读取文件内容，适合视频/大文件。 */
 bool CopyFilePath(const std::wstring& path);
+/* 多文件 CF_HDROP。 */
+bool CopyFilePaths(const std::vector<std::wstring>& paths);
 
 } /* namespace clipboard */

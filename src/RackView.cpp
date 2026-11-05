@@ -14,6 +14,12 @@ constexpr float kCardTop = 42.0f;
 constexpr float kPhotoMaxWidth = 136.0f;
 constexpr float kNoteCardWidth = 150.0f;
 constexpr float kNoteCardHeight = 136.0f;
+/* 新式非图片卡：150 方卡，头部 33，圆角 15，20% 外圈 4.5。 */
+constexpr float kFlatCardSize = 150.0f;
+constexpr float kFlatHeader = 33.0f;
+constexpr float kFlatRadius = 15.0f;
+constexpr float kFlatRing = 4.5f;
+constexpr float kColorRowHeight = 36.0f;
 constexpr float kPhotoMaxHeight = 104.0f;
 constexpr float kClipSlotRatio = 0.32f;
 constexpr float kGap = 24.0f;
@@ -263,12 +269,145 @@ float CardEntryOffset(const Item& item)
            (std::cos(damped * age) + (decay / damped) * std::sin(damped * age));
 }
 
+bool IsNewCard(const Item& item)
+{
+    switch (item.cardType) {
+    case card::Type::Note:
+    case card::Type::Text:
+    case card::Type::Link:
+    case card::Type::Color:
+    case card::Type::File:
+    case card::Type::Video:
+    case card::Type::Music: return true;
+    default: return false;
+    }
+}
+
+D2D1_COLOR_F AccentFor(const Item& item)
+{
+    const uint32_t rgb = item.accentSet ? item.accent : card::DefaultAccent(item.cardType);
+    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
+                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
+                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
+}
+
+D2D1_COLOR_F RgbColor(uint32_t rgb)
+{
+    return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
+                        static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
+                        static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
+}
+
+D2D1_COLOR_F MixColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t)
+{
+    return D2D1::ColorF(rack::Lerp(a.r, b.r, t), rack::Lerp(a.g, b.g, t),
+                        rack::Lerp(a.b, b.b, t), 1.0f);
+}
+
+bool AccentUsesDarkInk(const D2D1_COLOR_F& accent)
+{
+    const float luminance = 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b;
+    return luminance > 0.72f;
+}
+
+int ColorCountFor(const Item& item)
+{
+    std::vector<card::Rgba> colors;
+    if (!item.note.empty() && card::ParseColors(item.note, colors)) {
+        return static_cast<int>(colors.size());
+    }
+    return 1;
+}
+
+int CardCountFor(const Item& item)
+{
+    if (item.cardType == card::Type::Color) {
+        return std::max(1, ColorCountFor(item));
+    }
+    if (item.cardType == card::Type::File || item.cardType == card::Type::Music ||
+        item.cardType == card::Type::Video) {
+        const int parsed = FileCountFromLabel(item.label);
+        if (parsed > 1) return parsed;
+        if (!item.paths.empty()) return static_cast<int>(item.paths.size());
+        return 1;
+    }
+    return 1;
+}
+
+/* 便签比普通方卡略大一点，避免一排卡片过于规整。 */
+float FlatCardSide(const Item& item, float cs)
+{
+    const float factor = item.cardType == card::Type::Note ? 1.08f : 1.0f;
+    return kFlatCardSize * cs * factor;
+}
+
+/*
+ * 新式卡的内部几何：头部 / 正文 / 链接命中区 / 颜色行。
+ * rect 用实际绘制矩形（含按下位移），色卡滚动量按 150 基准缩放。
+ */
+void BuildCardMetrics(const Item& item, const D2D1_RECT_F& rect, CardBox& out)
+{
+    out.card = rect;
+    out.flat = true;
+    const float u = (rect.right - rect.left) / kFlatCardSize;
+    out.header = D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
+    out.body = D2D1::RectF(rect.left, out.header.bottom, rect.right, rect.bottom);
+    out.linkText = rack::Inset(out.body, 11.0f * u, 8.0f * u);
+    out.colorRows.clear();
+    if (item.cardType != card::Type::Color) return;
+
+    std::vector<card::Rgba> colors;
+    if (!card::ParseColors(item.note, colors)) return;
+    const float pad = 11.0f * u;
+    const float swatch = 30.0f * u;
+    const float left = rect.left + pad;
+    const float top = out.body.top + 4.0f * u - item.colorScroll * u;
+    out.colorRows.reserve(colors.size());
+    for (size_t i = 0; i < colors.size(); ++i) {
+        ColorRowBox row;
+        row.index = static_cast<int>(i);
+        row.row = D2D1::RectF(left, top + static_cast<float>(i) * kColorRowHeight * u,
+                              rect.right - pad,
+                              top + static_cast<float>(i + 1) * kColorRowHeight * u);
+        row.swatch = D2D1::RectF(row.row.left, row.row.top + 3.0f * u, row.row.left + swatch,
+                                 row.row.top + 3.0f * u + swatch);
+        const float textLeft = row.swatch.right + 8.0f * u;
+        D2D1_RECT_F hexRect = D2D1::RectF(textLeft, row.row.top + 3.0f * u,
+                                          rect.right - pad, row.row.top + 18.0f * u);
+        D2D1_RECT_F rgbRect = D2D1::RectF(textLeft, row.row.top + 18.0f * u,
+                                          rect.right - pad, row.row.top + 32.0f * u);
+        /* rgb() 来源的卡把 rgb 放上面，hex 放下面；两种来源的卡外观能区分。 */
+        if (card::ColorTextIsRgb(item.note)) {
+            std::swap(hexRect, rgbRect);
+        }
+        row.hex = hexRect;
+        row.rgb = rgbRect;
+        out.colorRows.push_back(row);
+    }
+}
+
 void ShiftCard(CardBox& box, float dy)
 {
     box.card.top += dy;
     box.card.bottom += dy;
     box.image.top += dy;
     box.image.bottom += dy;
+    box.header.top += dy;
+    box.header.bottom += dy;
+    box.body.top += dy;
+    box.body.bottom += dy;
+    box.linkText.top += dy;
+    box.linkText.bottom += dy;
+    for (auto& row : box.colorRows) {
+        row.row.top += dy;
+        row.row.bottom += dy;
+        row.swatch.top += dy;
+        row.swatch.bottom += dy;
+        row.hex.top += dy;
+        row.hex.bottom += dy;
+        row.rgb.top += dy;
+        row.rgb.bottom += dy;
+    }
     if (box.hasNote) {
         box.note.top += dy;
         box.note.bottom += dy;
@@ -285,7 +424,8 @@ bool RackView::Init(Graphics* graphics)
     }
     EnsureFormats(1.0f);
     return noteFormat_ != nullptr && placeholderFormat_ != nullptr &&
-           toastFormat_ != nullptr;
+           toastFormat_ != nullptr && cardTitleFormat_ != nullptr &&
+           cardBodyFormat_ != nullptr;
 }
 
 void RackView::LoadAssets(ID2D1RenderTarget* target)
@@ -346,6 +486,12 @@ void RackView::LoadIconFont()
     BuildIconGlyph(0xE643, iconUnlock_);
     BuildIconGlyph(0xE624, iconClose_);
     BuildIconGlyph(0xE61C, iconFolder_); /* 文件夹（和剪切板面板同一个字形） */
+    /* 卡片类型图标统一用 font_5228143 / SnowAirIcons.ttf 里的字形。 */
+    BuildIconGlyph(0xE67E, iconLink_);   /* lianjie */
+    BuildIconGlyph(0xE61D, iconText_);   /* a-shibiewenzi1：参考稿的扫描框 */
+    BuildIconGlyph(0xE673, iconColor_);  /* wuse */
+    BuildIconGlyph(0xE686, iconVideo_);  /* shipin */
+    BuildIconGlyph(0xE67F, iconMusic_);  /* yinle */
 }
 
 void RackView::BuildIconGlyph(uint32_t codepoint, ComPtr<ID2D1PathGeometry>& out)
@@ -407,18 +553,24 @@ void RackView::EnsureFormats(float scale)
         return;
     }
     if (noteFormat_ && placeholderFormat_ && badgeFormat_ && toastFormat_ &&
-        std::abs(formatScale_ - scale) < 0.001f) {
+        cardTitleFormat_ && cardMetaFormat_ && cardBodyFormat_ && cardColorHexFormat_ &&
+        cardColorRgbFormat_ && cardColorHexBoldFormat_ && cardColorRgbBoldFormat_ &&
+        cardFileNameFormat_ && cardFileNameWrapFormat_ &&
+        std::abs(formatScale_ - scale) < 0.001f &&
+        std::abs(formatCardScale_ - cardScale_) < 0.001f) {
         return;
     }
 
-    auto makeFormat = [&](float size) -> ComPtr<IDWriteTextFormat> {
+    auto makeFormat = [&](float size, DWRITE_FONT_WEIGHT weight =
+                                           DWRITE_FONT_WEIGHT_NORMAL)
+        -> ComPtr<IDWriteTextFormat> {
         ComPtr<IDWriteTextFormat> format;
         HRESULT hr = graphics_->dwrite()->CreateTextFormat(
-            L"Microsoft YaHei UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            L"Microsoft YaHei UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, size, L"zh-CN", format.GetAddressOf());
         if (FAILED(hr)) {
             hr = graphics_->dwrite()->CreateTextFormat(
-                L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL, size, L"zh-CN", format.GetAddressOf());
         }
         if (SUCCEEDED(hr) && format) {
@@ -448,7 +600,62 @@ void RackView::EnsureFormats(float scale)
         toastFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         toastFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
+
+    /* 新式非图片卡：标题/元信息按卡片档位给固定字号，其余文字按同一档位
+       微调。这里 scale 是「Windows 缩放 × 卡片档位」，ui 只是 Windows 缩放。 */
+    const float ui = cardScale_ > 0.5f ? scale / cardScale_ : scale;
+    float titleSize = 12.0f;
+    float metaSize = 10.0f;
+    float bodySize = 11.5f;
+    float colorSize = 10.5f;
+    float fileSize = 11.0f;
+    if (cardScale_ <= 0.9f) {
+        titleSize = 10.0f;
+        metaSize = 8.0f;
+        bodySize = 9.5f;
+        colorSize = 9.0f;
+        fileSize = 9.0f;
+    } else if (cardScale_ >= 1.2f) {
+        titleSize = 14.0f;
+        metaSize = 12.0f;
+        bodySize = 13.5f;
+        colorSize = 12.5f;
+        fileSize = 12.8f;
+    }
+    cardTitleFormat_ = makeFormat(titleSize * ui);
+    if (cardTitleFormat_) {
+        cardTitleFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    cardMetaFormat_ = makeFormat(metaSize * ui);
+    if (cardMetaFormat_) cardMetaFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    cardBodyFormat_ = makeFormat(bodySize * ui);
+    /* Hex 和 rgb 用同一字号；10.5 能保证 rgb(22,119,255) 在 150 卡内不被裁掉。 */
+    cardColorHexFormat_ = makeFormat(colorSize * ui);
+    if (cardColorHexFormat_) {
+        cardColorHexFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    cardColorRgbFormat_ = makeFormat(colorSize * ui);
+    if (cardColorRgbFormat_) cardColorRgbFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    cardColorHexBoldFormat_ =
+        makeFormat(colorSize * ui, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    if (cardColorHexBoldFormat_) {
+        cardColorHexBoldFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    cardColorRgbBoldFormat_ =
+        makeFormat(colorSize * ui, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    if (cardColorRgbBoldFormat_) {
+        cardColorRgbBoldFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    cardFileNameFormat_ = makeFormat(fileSize * ui);
+    if (cardFileNameFormat_) {
+        cardFileNameFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    cardFileNameWrapFormat_ = makeFormat(fileSize * ui);
+    if (cardFileNameWrapFormat_) {
+        cardFileNameWrapFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    }
     formatScale_ = scale;
+    formatCardScale_ = cardScale_;
 }
 
 void RackView::Shutdown()
@@ -457,6 +664,15 @@ void RackView::Shutdown()
     placeholderFormat_.Reset();
     badgeFormat_.Reset();
     toastFormat_.Reset();
+    cardTitleFormat_.Reset();
+    cardMetaFormat_.Reset();
+    cardBodyFormat_.Reset();
+    cardColorHexFormat_.Reset();
+    cardColorRgbFormat_.Reset();
+    cardColorHexBoldFormat_.Reset();
+    cardColorRgbBoldFormat_.Reset();
+    cardFileNameFormat_.Reset();
+    cardFileNameWrapFormat_.Reset();
     iconFace_.Reset();
     iconLock_.Reset();
     iconUnlock_.Reset();
@@ -482,7 +698,8 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     scale_ = std::max(0.5f, scale);
     cardScale_ = rack::Clamp(cardScale, 0.8f, 1.35f);
     const float cs = scale_ * cardScale_;
-    EnsureFormats(scale_);
+    /* 字号跟着卡片大小走：小/中/大三档不是只缩卡片、字号不动。 */
+    EnsureFormats(cs);
     const float s = scale_;
     result.width = std::max(320.0f * s, maxWidth);
     result.height = kWindowHeight * s;
@@ -503,11 +720,9 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     auto measure = [&]() {
         float total = 0.0f;
         for (size_t i = 0; i < items.size(); ++i) {
-            const bool textCard = items[i].kind == 1 || items[i].kind == 3 ||
-                                  (items[i].kind == 2 && items[i].thumbPath.empty());
-            if (textCard) {
-                widths[i] = kNoteCardWidth * cs + 2.0f * kFrame * cs;
-                heights[i] = kNoteCardHeight * cs + 2.0f * kFrame * cs;
+            if (IsNewCard(items[i])) {
+                widths[i] = FlatCardSide(items[i], cs);
+                heights[i] = widths[i];
                 total += widths[i];
                 continue;
             }
@@ -559,7 +774,6 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     result.lineStart = kOuterPad * s;
     result.lineEnd = result.width - kOuterPad * s;
 
-    const float cardTop = kCardTop * s;
     float maxCardHeight = 0.0f;
     for (float height : heights) {
         maxCardHeight = std::max(maxCardHeight, height);
@@ -568,7 +782,6 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     const float slide =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) * -(maxCardHeight + 30.0f * s);
     float x = kOuterPad * s + (photoWidth - total) * 0.5f;
-    const float y = cardTop + slide;
 
     /* 显示位置用弹簧跟随目标：目标由布局按索引算出，移除/插入卡片后，
        其它卡片的目标位置整体平移，由弹簧平滑过渡到新位置。 */
@@ -592,8 +805,6 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     };
 
     cards_.reserve(items.size());
-    float previousRight = -1.0e9f;
-    bool firstCard = true;
     for (size_t i = 0; i < items.size(); ++i) {
         CardBox box;
         const float w = widths[i];
@@ -609,7 +820,7 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
                再交给弹簧平滑过渡：短暂停顿后靠拢。 */
             if (std::abs(slot.target - x) > 0.5f) {
                 slot.target = x;
-                slot.holdUntil = nowMs + kCloseHoldMs;
+                slot.holdUntil = skipHoldOnce_ ? 0 : nowMs + kCloseHoldMs;
             }
             if (nowMs >= slot.holdUntil && dt > 0.0f) {
                 SlideSpring(slot.pos, slot.velocity, x, dt, 0.55f, 0.78f);
@@ -618,19 +829,26 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
                 sliding_ = true;
             }
         }
-        /* 弹簧跟随目标的过程中也强制保持最小间距：两张卡不能在任何一帧叠在一起。 */
-        float left = slot.pos + offset;
-        float right = left + w;
-        const bool manualDrag = std::abs(offset) > 0.5f;
-        if (!manualDrag && !firstCard && left < previousRight + gap) {
-            const float shift = previousRight + gap - left;
-            left += shift;
-            right += shift;
-            slot.pos += shift;
-            slot.velocity = 0.0f;
-        }
-        box.card = D2D1::RectF(left, y, right, y + heights[i]);
+        const float left = slot.pos + offset;
+        box.id = items[i].id;
+        /* 绳子是下垂的弧线：卡片上沿跟着它所在位置的实际绳高走，
+           这样每个夹子压住卡片上沿的深度始终一样，不会中间夹得深、
+           两边悬空。 */
+        const float cx = left + w * 0.5f;
+        const float t = rack::Clamp((cx - result.lineStart) / std::max(1.0f, lineSpan), 0.0f,
+                                    1.0f);
+        const float pinTop = lineY + 4.0f * sag * t * (1.0f - t);
+        /* 夹身从 pinTop 向下压约 16*clipScale；卡片上沿放在
+           pinTop + 12*clipScale，夹子稳定咬住约 4*clipScale。
+           夹子和悬挂深度都跟卡片大中小一起缩放。 */
+        const float clipScale = s * cardScale_;
+        const float cardY = pinTop + 12.0f * clipScale - 3.0f * s + slide;
+        box.card = D2D1::RectF(left, cardY, left + w, cardY + heights[i]);
         box.image = rack::Inset(box.card, kFrame * cs, kFrame * cs);
+        box.cardType = items[i].cardType;
+        if (IsNewCard(items[i])) {
+            BuildCardMetrics(items[i], box.card, box);
+        }
         const bool hasNote = !items[i].note.empty() && !items[i].path.empty();
         box.hasNote = hasNote;
         if (hasNote) {
@@ -639,15 +857,11 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
                                    box.card.right - 4.0f * s,
                                    box.card.bottom + 4.0f * s + kNoteHeight * s);
         }
-        const float cx = (box.card.left + box.card.right) * 0.5f;
-        const float t = rack::Clamp((cx - result.lineStart) / std::max(1.0f, lineSpan), 0.0f,
-                                    1.0f);
-        box.pinTop = lineY + 4.0f * sag * t * (1.0f - t);
+        box.pinTop = pinTop;
         const int variant = (items[i].id * 37) % 8;
+        /* 和图片卡一致：每张卡按 id 得到一个固定的小角度，避免一排太规整。 */
         box.angle = static_cast<float>(variant - 4) * 0.6f;
         cards_.push_back(box);
-        previousRight = right;
-        firstCard = false;
         x += w + gap;
     }
 
@@ -728,6 +942,91 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
                                 envelopeTop + envelopeHeight + 26.0f * s);
     layout_ = result;
     return result;
+}
+
+std::vector<float> RackView::TargetLefts(const std::vector<Item>& items) const
+{
+    std::vector<float> lefts(items.size(), 0.0f);
+    if (items.empty()) {
+        return lefts;
+    }
+    const float s = scale_;
+    const float cs = scale_ * cardScale_;
+    const float width = std::max(320.0f * s, layout_.width);
+    const float photoWidth =
+        std::max(120.0f * s, width - (2.0f * kOuterPad + kAccessoryWidth) * s);
+    const float maxContent = photoWidth;
+    std::vector<float> widths(items.size(), 0.0f);
+    auto measure = [&]() {
+        float total = 0.0f;
+        for (size_t i = 0; i < items.size(); ++i) {
+            if (IsNewCard(items[i])) {
+                widths[i] = FlatCardSide(items[i], cs);
+                total += widths[i];
+                continue;
+            }
+            const float aspect = (items[i].aspect > 0.01f) ? items[i].aspect : 1.4f;
+            float photoW = kPhotoMaxWidth * cs;
+            float photoH = photoW / aspect;
+            if (photoH > kPhotoMaxHeight * cs) {
+                photoH = kPhotoMaxHeight * cs;
+                photoW = photoH * aspect;
+            }
+            widths[i] = photoW + 2.0f * kFrame * cs;
+            total += widths[i];
+        }
+        total += kGap * cs * static_cast<float>(items.size() - 1);
+        return total;
+    };
+    float total = measure();
+    if (total > maxContent) {
+        const float factor = rack::Clamp(maxContent / total, 0.45f, 1.0f);
+        for (float& w : widths) {
+            w *= factor;
+        }
+        total = 0.0f;
+        for (float w : widths) total += w;
+        total += kGap * cs * static_cast<float>(items.size() - 1);
+    }
+    float gap = kGap * cs;
+    if (total > maxContent && items.size() > 1) {
+        gap = std::max(10.0f * s,
+                       (maxContent - total) / static_cast<float>(items.size() - 1) + gap);
+    }
+    float x = kOuterPad * s + (photoWidth - total) * 0.5f;
+    for (size_t i = 0; i < items.size(); ++i) {
+        lefts[i] = x;
+        x += widths[i] + gap;
+    }
+    return lefts;
+}
+
+void RackView::SnapSlotsTo(const std::vector<Item>& items,
+                           const std::vector<float>& lefts)
+{
+    if (lefts.size() != items.size()) {
+        return;
+    }
+    for (size_t i = 0; i < items.size(); ++i) {
+        SlotSpring* found = nullptr;
+        for (auto& slot : slots_) {
+            if (slot.id == items[i].id) {
+                found = &slot;
+                break;
+            }
+        }
+        if (!found) {
+            SlotSpring fresh;
+            fresh.id = items[i].id;
+            slots_.push_back(fresh);
+            found = &slots_.back();
+        }
+        found->pos = lefts[i];
+        found->target = lefts[i];
+        found->velocity = 0.0f;
+        found->holdUntil = 0;
+        found->primed = true;
+    }
 }
 
 void RackView::DrawShadow(ID2D1RenderTarget* target, const D2D1_RECT_F& rect, float radius,
@@ -846,6 +1145,9 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     for (size_t i = 0; i < cards_.size() && i < items.size(); ++i) {
         if (static_cast<int>(i) == arrivalIndex_) continue;
         if (static_cast<int>(i) == editingCard_) continue;
+        if (IsNewCard(items[i])) {
+            continue; /* 新式卡不画外发光/阴影，避免四周出现灰色毛边。 */
+        }
         CardBox box = cards_[i];
         ShiftCard(box, CardEntryOffset(items[i]));
         DrawCardShadow(target, box, s, static_cast<int>(i) == hovered);
@@ -879,8 +1181,12 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
                                  hoverPartIndex_ == static_cast<int>(i);
             const bool hotClose = hoverPart_ == static_cast<int>(RackPart::Close) &&
                                   hoverPartIndex_ == static_cast<int>(i);
+            const bool hotLink = hoverPart_ == static_cast<int>(RackPart::CardLink) &&
+                                 hoverPartIndex_ == static_cast<int>(i);
+            const bool hotColor = hoverPart_ == static_cast<int>(RackPart::CardColor) &&
+                                  hoverPartIndex_ == static_cast<int>(i);
             DrawCard(target, items[i], box, s, sway, hoverAmount, isHovered,
-                     static_cast<int>(i) == pressed, hotLock, hotClose);
+                     static_cast<int>(i) == pressed, hotLock, hotClose, hotLink, hotColor);
         }
         DrawPin(target, box, theme, s);
         if (box.hasNote && !editing) {
@@ -1012,6 +1318,39 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
     box.image = rack::Inset(box.card, inset, inset);
     const float spin = targetBox.angle * t;
     DrawCard(target, item, box, s, spin, 0.0f, false, false);
+}
+
+bool RackView::ColorContentContains(int index, float x, float y) const
+{
+    if (index < 0 || index >= static_cast<int>(cards_.size())) {
+        return false;
+    }
+    const CardBox& box = cards_[static_cast<size_t>(index)];
+    if (!box.flat || box.cardType != card::Type::Color) {
+        return false;
+    }
+    const float u = (box.card.right - box.card.left) / kFlatCardSize;
+    const float ring = kFlatRing * u;
+    const D2D1_RECT_F white = D2D1::RectF(box.card.left + ring, box.body.top,
+                                          box.card.right - ring, box.card.bottom - ring);
+    return rack::PointIn(white, x, y);
+}
+
+void RackView::PrepareCardRelease(int index)
+{
+    if (index < 0 || index >= static_cast<int>(cards_.size())) {
+        return;
+    }
+    const CardBox& box = cards_[static_cast<size_t>(index)];
+    for (auto& slot : slots_) {
+        if (slot.id == box.id) {
+            slot.pos = box.card.left;
+            slot.velocity = 0.0f;
+            break;
+        }
+    }
+    /* 重排松手后的第一帧不要 140ms 停顿，直接从落点弹到新槽位。 */
+    skipHoldOnce_ = true;
 }
 
 void RackView::SetHistoryDisabled(bool disabled)
@@ -1233,11 +1572,11 @@ void RackView::DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Them
                        float s)
 {
     const float cx = (box.card.left + box.card.right) * 0.5f;
-    const float clipHeight = 24.0f * s;
-    /* 夹子的槽正好落在绳子上，再让夹身向下压住足够多的白边，
-       才像真的夹住了照片。 */
+    /* 夹子跟卡片大中小一起缩放；槽仍在绳子上，夹身压住卡片上沿。 */
+    const float clipScale = s * cardScale_;
+    const float clipHeight = 24.0f * clipScale;
     DrawClipAt(target, cx, box.pinTop + lineRetract_ - clipHeight * kClipSlotRatio,
-               theme, s);
+               theme, clipScale);
 }
 
 void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const Theme& theme,
@@ -1439,8 +1778,11 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         target->DrawBitmap(envelopeBack->bitmap.Get(), dest, 1.0f,
                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 
+        const float envelopeClipScale = s * cardScale_;
         DrawClipAt(target, envelopeCenter,
-                   ropeYAt(envelopeCenter) - 24.0f * s * kClipSlotRatio, theme, s);
+                   ropeYAt(envelopeCenter) -
+                       24.0f * envelopeClipScale * kClipSlotRatio,
+                   theme, envelopeClipScale);
 
         // 所有主题共用同一张信纸，换的只是它下面的信封配色。
         if (letter_.valid()) {
@@ -1511,6 +1853,22 @@ void RackView::DrawCountBadge(ID2D1RenderTarget* target, float centerX, float to
 
     target->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), rect,
                      text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+void RackView::ShowColorFlash(int itemId, int colorIndex, int part, uint64_t untilMs)
+{
+    copyFlashItemId_ = itemId;
+    copyFlashColorIndex_ = colorIndex;
+    copyFlashPart_ = part;
+    copyFlashUntil_ = untilMs;
+}
+
+void RackView::ClearColorFlash()
+{
+    copyFlashItemId_ = -1;
+    copyFlashColorIndex_ = -1;
+    copyFlashPart_ = 0;
+    copyFlashUntil_ = 0;
 }
 
 void RackView::ShowCopyToast(int index, uint64_t untilMs)
@@ -1674,9 +2032,467 @@ void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, flo
     target->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
+void RackView::DrawFlatIcon(ID2D1RenderTarget* target, card::Type type,
+                            D2D1_POINT_2F center, float size, ID2D1Brush* brush, float stroke)
+{
+    if (!brush || size <= 0.0f) return;
+    /* 优先用 iconfont.ttf（font_5228143 / SnowAirIcons）里的字形。 */
+    ID2D1PathGeometry* glyph = nullptr;
+    switch (type) {
+    case card::Type::Text: glyph = iconText_.Get(); break;
+    case card::Type::Link: glyph = iconLink_.Get(); break;
+    case card::Type::File: glyph = iconFolder_.Get(); break;
+    case card::Type::Video: glyph = iconVideo_.Get(); break;
+    case card::Type::Music: glyph = iconMusic_.Get(); break;
+    /* 字体里的 wuse 是外观设置同款方块；颜色卡用参考稿的三圆，不走字体。 */
+    case card::Type::Color: glyph = nullptr; break;
+    default: break;
+    }
+    if (glyph) {
+        DrawIcon(target, glyph, center, size, brush);
+        return;
+    }
+    switch (type) {
+    case card::Type::Text: {
+        const D2D1_RECT_F frame = D2D1::RectF(center.x - size * 0.42f, center.y - size * 0.42f,
+                                              center.x + size * 0.42f, center.y + size * 0.42f);
+        target->DrawRoundedRectangle(D2D1::RoundedRect(frame, size * 0.12f, size * 0.12f),
+                                     brush, stroke);
+        for (int i = -1; i <= 1; ++i) {
+            const float y = center.y + static_cast<float>(i) * size * 0.17f;
+            target->DrawLine(D2D1::Point2F(center.x - size * 0.22f, y),
+                             D2D1::Point2F(center.x + size * 0.22f, y), brush, stroke);
+        }
+        break;
+    }
+    case card::Type::Link: {
+        D2D1_MATRIX_3X2_F saved{};
+        target->GetTransform(&saved);
+        for (int i = 0; i < 2; ++i) {
+            const float angle = i == 0 ? 45.0f : -45.0f;
+            const float shift = i == 0 ? -size * 0.10f : size * 0.10f;
+            target->SetTransform(D2D1::Matrix3x2F::Translation(shift, 0.0f) *
+                                 D2D1::Matrix3x2F::Rotation(angle, center) * saved);
+            const D2D1_RECT_F capsule = D2D1::RectF(
+                center.x - size * 0.30f, center.y - size * 0.12f,
+                center.x + size * 0.12f, center.y + size * 0.12f);
+            target->DrawRoundedRectangle(
+                D2D1::RoundedRect(capsule, size * 0.12f, size * 0.12f), brush, stroke);
+        }
+        target->SetTransform(saved);
+        break;
+    }
+    case card::Type::File: {
+        const float left = center.x - size * 0.40f;
+        const float top = center.y - size * 0.30f;
+        const D2D1_ROUNDED_RECT body = D2D1::RoundedRect(
+            D2D1::RectF(left, top + size * 0.14f, left + size * 0.80f, top + size * 0.62f),
+            size * 0.08f, size * 0.08f);
+        const D2D1_ROUNDED_RECT tab = D2D1::RoundedRect(
+            D2D1::RectF(left, top, left + size * 0.34f, top + size * 0.24f), size * 0.07f,
+            size * 0.07f);
+        target->DrawRoundedRectangle(body, brush, stroke);
+        target->DrawRoundedRectangle(tab, brush, stroke);
+        break;
+    }
+    case card::Type::Video: {
+        const D2D1_RECT_F screen = D2D1::RectF(
+            center.x - size * 0.42f, center.y - size * 0.32f,
+            center.x + size * 0.42f, center.y + size * 0.22f);
+        target->DrawRoundedRectangle(D2D1::RoundedRect(screen, size * 0.10f, size * 0.10f),
+                                     brush, stroke);
+        ComPtr<ID2D1PathGeometry> play;
+        if (SUCCEEDED(graphics_->d2d()->CreatePathGeometry(play.GetAddressOf())) && play) {
+            ComPtr<ID2D1GeometrySink> sink;
+            if (SUCCEEDED(play->Open(sink.GetAddressOf())) && sink) {
+                sink->BeginFigure(D2D1::Point2F(center.x - size * 0.07f, center.y - size * 0.14f),
+                                  D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(center.x + size * 0.12f, center.y - size * 0.05f));
+                sink->AddLine(D2D1::Point2F(center.x - size * 0.07f, center.y + size * 0.04f));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink->Close();
+                target->FillGeometry(play.Get(), brush);
+            }
+        }
+        target->DrawLine(D2D1::Point2F(center.x, center.y + size * 0.22f),
+                         D2D1::Point2F(center.x, center.y + size * 0.32f), brush, stroke);
+        target->DrawLine(D2D1::Point2F(center.x - size * 0.16f, center.y + size * 0.32f),
+                         D2D1::Point2F(center.x + size * 0.16f, center.y + size * 0.32f), brush,
+                         stroke);
+        break;
+    }
+    case card::Type::Music: {
+        const float headR = size * 0.15f;
+        const D2D1_POINT_2F leftHead =
+            D2D1::Point2F(center.x - size * 0.18f, center.y + size * 0.20f);
+        const D2D1_POINT_2F rightHead =
+            D2D1::Point2F(center.x + size * 0.22f, center.y + size * 0.08f);
+        target->FillEllipse(D2D1::Ellipse(leftHead, headR, headR * 0.80f), brush);
+        target->FillEllipse(D2D1::Ellipse(rightHead, headR, headR * 0.80f), brush);
+        target->DrawLine(D2D1::Point2F(leftHead.x + headR * 0.9f, leftHead.y),
+                         D2D1::Point2F(leftHead.x + headR * 0.9f, center.y - size * 0.30f),
+                         brush, stroke);
+        target->DrawLine(D2D1::Point2F(rightHead.x + headR * 0.9f, rightHead.y),
+                         D2D1::Point2F(rightHead.x + headR * 0.9f, center.y - size * 0.36f),
+                         brush, stroke);
+        target->DrawLine(D2D1::Point2F(leftHead.x + headR * 0.9f, center.y - size * 0.30f),
+                         D2D1::Point2F(rightHead.x + headR * 0.9f, center.y - size * 0.36f),
+                         brush, stroke);
+        target->DrawLine(D2D1::Point2F(leftHead.x + headR * 0.9f, center.y - size * 0.22f),
+                         D2D1::Point2F(rightHead.x + headR * 0.9f, center.y - size * 0.28f),
+                         brush, stroke);
+        break;
+    }
+    case card::Type::Color: {
+        const D2D1_POINT_2F top = D2D1::Point2F(center.x, center.y - size * 0.20f);
+        const D2D1_POINT_2F left =
+            D2D1::Point2F(center.x - size * 0.21f, center.y + size * 0.16f);
+        const D2D1_POINT_2F right =
+            D2D1::Point2F(center.x + size * 0.21f, center.y + size * 0.16f);
+        const float r = size * 0.20f;
+        target->DrawEllipse(D2D1::Ellipse(top, r, r), brush, stroke);
+        target->DrawEllipse(D2D1::Ellipse(left, r, r), brush, stroke);
+        target->DrawEllipse(D2D1::Ellipse(right, r, r), brush, stroke);
+        break;
+    }
+    default: break;
+    }
+}
+
+void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
+                            const D2D1_RECT_F& rect, float s, bool hotLink, bool hotColor)
+{
+    (void)s;
+    if (!cardTitleFormat_ || !cardBodyFormat_) return;
+    const float u = (rect.right - rect.left) / kFlatCardSize;
+    const float radius = kFlatRadius * u;
+    const float ring = kFlatRing * u;
+    const D2D1_COLOR_F accent = AccentFor(item);
+    const bool darkInk = AccentUsesDarkInk(accent);
+    const D2D1_COLOR_F headerInk =
+        darkInk ? D2D1::ColorF(0.12f, 0.12f, 0.12f) : D2D1::ColorF(1.0f, 1.0f, 1.0f);
+    const D2D1_RECT_F header =
+        D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
+    const D2D1_RECT_F body =
+        D2D1::RectF(rect.left, header.bottom, rect.right, rect.bottom);
+
+    ComPtr<ID2D1SolidColorBrush> white;
+    ComPtr<ID2D1SolidColorBrush> accentBrush;
+    ComPtr<ID2D1SolidColorBrush> ringBrush;
+    ComPtr<ID2D1SolidColorBrush> headerBrush;
+    ComPtr<ID2D1SolidColorBrush> metaBrush;
+    ComPtr<ID2D1SolidColorBrush> bodyBrush;
+    ComPtr<ID2D1SolidColorBrush> mutedBrush;
+    ComPtr<ID2D1SolidColorBrush> swatchBorder;
+    ComPtr<ID2D1SolidColorBrush> softEdge;
+    ComPtr<ID2D1SolidColorBrush> flashGreen;
+    const D2D1_COLOR_F ringColor =
+        MixColor(accent, D2D1::ColorF(1.0f, 1.0f, 1.0f), 0.80f);
+    if (FAILED(target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f),
+                                             white.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(accent, accentBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(ringColor, ringBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(
+            D2D1::ColorF(ringColor.r, ringColor.g, ringColor.b, 0.075f),
+            softEdge.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(headerInk, headerBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(
+            D2D1::ColorF(headerInk.r, headerInk.g, headerInk.b, 0.60f),
+            metaBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.318f, 0.318f, 0.318f),
+                                             bodyBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.45f, 0.45f, 0.45f),
+                                             mutedBrush.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.10f),
+                                             swatchBorder.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0x34C759),
+                                             flashGreen.GetAddressOf()))) {
+        return;
+    }
+
+    /* 外圈用不透明的「20% 类型色 + 80% 白」预合成色，白卡再内缩一圈。
+       这样最外沿的 AA 像素是类型色而不是白色，深色桌面上不会出现
+       「GIF 透明图」那种白色毛边。外沿再加 1u 很淡的同色柔光，
+       让圆角在深色背景上不至于像刀切一样锐。 */
+    for (int layer = 0; layer < 3; ++layer) {
+        const float grow = (3.0f - static_cast<float>(layer)) * 0.8f * u;
+        const D2D1_RECT_F softRect = rack::Inset(rect, -grow, -grow);
+        target->FillRoundedRectangle(
+            D2D1::RoundedRect(softRect, radius + grow, radius + grow), softEdge.Get());
+    }
+    target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), ringBrush.Get());
+    const D2D1_RECT_F whiteCard = rack::Inset(rect, ring, ring);
+    target->FillRoundedRectangle(
+        D2D1::RoundedRect(whiteCard, std::max(1.0f, radius - ring),
+                          std::max(1.0f, radius - ring)),
+        white.Get());
+    target->FillRoundedRectangle(D2D1::RoundedRect(header, radius, radius),
+                                 accentBrush.Get());
+    target->FillRectangle(
+        D2D1::RectF(header.left, header.top + radius, header.right, header.bottom),
+        accentBrush.Get());
+
+    const int count = CardCountFor(item);
+    std::wstring title = card::TypeLabel(item.cardType);
+    if (item.cardType == card::Type::File) {
+        std::vector<std::wstring> paths = item.paths;
+        if (paths.empty() && !item.path.empty()) {
+            paths.push_back(item.path);
+        }
+        title = card::FileLabel(paths);
+    }
+    if (count > 1) title += L"（" + std::to_wstring(count) + L"）";
+    target->DrawText(title.c_str(), static_cast<UINT32>(title.size()), cardTitleFormat_.Get(),
+                     D2D1::RectF(header.left + 11.0f * u, header.top + 4.0f * u,
+                                 header.right - 32.0f * u, header.top + 19.0f * u),
+                     headerBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+    std::wstring meta = card::FormatCardTime(item.createdAt);
+    if ((item.cardType == card::Type::File || item.cardType == card::Type::Music ||
+         item.cardType == card::Type::Video) &&
+        !item.path.empty()) {
+        const std::wstring app =
+            AppNameForExtension(std::filesystem::path(item.path).extension().wstring());
+        if (!app.empty()) {
+            if (!meta.empty()) meta += L" ";
+            meta += app;
+        }
+    }
+    if (!meta.empty()) {
+        target->DrawText(meta.c_str(), static_cast<UINT32>(meta.size()), cardMetaFormat_.Get(),
+                         D2D1::RectF(header.left + 11.0f * u, header.top + 19.0f * u,
+                                     header.right - 32.0f * u, header.top + 31.0f * u),
+                         metaBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+    DrawFlatIcon(target, item.cardType,
+                 D2D1::Point2F(header.right - 16.0f * u, header.top + 16.5f * u), 13.0f * u,
+                 headerBrush.Get(), 1.2f * u);
+
+    target->PushAxisAlignedClip(body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (item.cardType == card::Type::Color) {
+        std::vector<card::Rgba> colors;
+        if (card::ParseColors(item.note, colors) && !colors.empty()) {
+            ComPtr<ID2D1SolidColorBrush> swatch;
+            if (SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0),
+                                                        swatch.GetAddressOf()))) {
+                for (size_t i = 0; i < colors.size(); ++i) {
+                    const float rowTop = body.top + 4.0f * u -
+                                         item.colorScroll * u +
+                                         static_cast<float>(i) * kColorRowHeight * u;
+                    if (rowTop + kColorRowHeight * u < body.top) continue;
+                    if (rowTop > body.bottom) break;
+                    const int colorIndex = static_cast<int>(i);
+                    D2D1_RECT_F swatchRect =
+                        D2D1::RectF(rect.left + 11.0f * u, rowTop + 3.0f * u,
+                                    rect.left + 41.0f * u, rowTop + 33.0f * u);
+                    /* 悬停色块时略微放大，给一个不改变命中区的视觉反馈。 */
+                    if (hotColor && hoverColorIndex_ == colorIndex &&
+                        hoverColorPart_ == 0) {
+                        swatchRect = rack::Inset(swatchRect, -2.0f * u, -2.0f * u);
+                    }
+                    const D2D1_RECT_F topTextRect =
+                        D2D1::RectF(rect.left + 49.0f * u, rowTop + 3.0f * u,
+                                    rect.right - 11.0f * u, rowTop + 18.0f * u);
+                    const D2D1_RECT_F bottomTextRect =
+                        D2D1::RectF(rect.left + 49.0f * u, rowTop + 18.0f * u,
+                                    rect.right - 11.0f * u, rowTop + 32.0f * u);
+                    const bool rgbFirst = card::ColorTextIsRgb(item.note);
+                    const D2D1_RECT_F hexRect = rgbFirst ? bottomTextRect : topTextRect;
+                    const D2D1_RECT_F rgbRect = rgbFirst ? topTextRect : bottomTextRect;
+                    const card::Rgba& color = colors[i];
+                    swatch->SetColor(D2D1::ColorF(color.r / 255.0f, color.g / 255.0f,
+                                                  color.b / 255.0f, color.a / 255.0f));
+                    target->FillRoundedRectangle(
+                        D2D1::RoundedRect(swatchRect, 6.0f * u, 6.0f * u), white.Get());
+                    target->FillRoundedRectangle(
+                        D2D1::RoundedRect(swatchRect, 6.0f * u, 6.0f * u), swatch.Get());
+                    target->DrawRoundedRectangle(
+                        D2D1::RoundedRect(swatchRect, 6.0f * u, 6.0f * u),
+                        swatchBorder.Get(), 0.7f * u);
+                    const bool hotHex =
+                        hotColor && hoverColorIndex_ == colorIndex && hoverColorPart_ == 1;
+                    const bool hotRgb =
+                        hotColor && hoverColorIndex_ == colorIndex && hoverColorPart_ == 2;
+                    IDWriteTextFormat* hexFormat =
+                        (hotHex && cardColorHexBoldFormat_) ? cardColorHexBoldFormat_.Get()
+                                                            : cardColorHexFormat_.Get();
+                    IDWriteTextFormat* rgbFormat =
+                        (hotRgb && cardColorRgbBoldFormat_) ? cardColorRgbBoldFormat_.Get()
+                                                            : cardColorRgbFormat_.Get();
+                    const bool flashThis =
+                        copyFlashUntil_ > rack::NowMs() && copyFlashItemId_ == item.id &&
+                        copyFlashColorIndex_ == colorIndex;
+                    const bool flashHex = flashThis && copyFlashPart_ == 1;
+                    const bool flashRgb = flashThis && copyFlashPart_ == 2;
+                    /* 上面那行用实色，下面那行用浅色；RGB/Hex 谁在上谁实。 */
+                    ID2D1Brush* hexBrush = rgbFirst ? mutedBrush.Get() : bodyBrush.Get();
+                    ID2D1Brush* rgbBrush = rgbFirst ? bodyBrush.Get() : mutedBrush.Get();
+                    const std::wstring hex = card::HexText(color);
+                    const std::wstring rgb = card::RgbText(color);
+                    target->DrawText(hex.c_str(), static_cast<UINT32>(hex.size()), hexFormat,
+                                     hexRect,
+                                     flashHex ? flashGreen.Get() : hexBrush,
+                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                    target->DrawText(rgb.c_str(), static_cast<UINT32>(rgb.size()), rgbFormat,
+                                     rgbRect,
+                                     flashRgb ? flashGreen.Get() : rgbBrush,
+                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                }
+            }
+        }
+    } else if (item.cardType == card::Type::Text || item.cardType == card::Type::Link) {
+        const D2D1_RECT_F textRect = rack::Inset(body, 11.0f * u, 8.0f * u);
+        /* 链接正文悬停变蓝（默认 #1677FF，跟随这张卡的强调色）。 */
+        ID2D1Brush* textBrush =
+            (item.cardType == card::Type::Link && hotLink) ? accentBrush.Get()
+                                                           : bodyBrush.Get();
+        target->DrawText(item.note.c_str(), static_cast<UINT32>(item.note.size()),
+                         cardBodyFormat_.Get(), textRect, textBrush,
+                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    } else {
+        std::vector<std::wstring> names;
+        std::vector<std::wstring> paths = item.paths;
+        if (paths.empty() && !item.path.empty()) {
+            paths.push_back(item.path);
+        }
+        const bool foldersOnly =
+            item.cardType == card::Type::File && card::AllPathsAreFolders(paths);
+        if (!paths.empty()) {
+            for (const auto& path : paths) {
+                names.push_back(foldersOnly ? path : card::FileName(path));
+            }
+        } else if (!item.label.empty()) {
+            names.push_back(item.label);
+        }
+        const float lineHeight = 16.0f * u;
+        const float textLeft = rect.left + 11.0f * u;
+        const float textWidth = rect.right - 11.0f * u - textLeft;
+        float y = body.top + 7.0f * u;
+        for (const auto& name : names) {
+            if (y >= body.bottom - 2.0f * u || textWidth <= 0.0f) break;
+            if (cardFileNameWrapFormat_ && graphics_ && graphics_->dwrite()) {
+                ComPtr<IDWriteTextLayout> layout;
+                const HRESULT hr = graphics_->dwrite()->CreateTextLayout(
+                    name.c_str(), static_cast<UINT32>(name.size()),
+                    cardFileNameWrapFormat_.Get(), textWidth, body.bottom - y,
+                    layout.GetAddressOf());
+                if (SUCCEEDED(hr) && layout) {
+                    DWRITE_TEXT_METRICS metrics{};
+                    layout->GetMetrics(&metrics);
+                    const float height = std::max(lineHeight, metrics.height);
+                    target->DrawTextLayout(D2D1::Point2F(textLeft, y), layout.Get(),
+                                           bodyBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                    y += height + 2.0f * u;
+                    continue;
+                }
+            }
+            if (y + lineHeight > body.bottom) break;
+            target->DrawText(name.c_str(), static_cast<UINT32>(name.size()),
+                             cardFileNameFormat_.Get(),
+                             D2D1::RectF(textLeft, y, textLeft + textWidth, y + lineHeight),
+                             bodyBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            y += lineHeight;
+        }
+    }
+    target->PopAxisAlignedClip();
+}
+
+void RackView::DrawPaperCard(ID2D1RenderTarget* target, const Item& item,
+                             const D2D1_RECT_F& rect, float s)
+{
+    (void)s;
+    if (!cardTitleFormat_ || !cardBodyFormat_) return;
+    const float u = (rect.right - rect.left) / kFlatCardSize;
+    const float sw = (rect.right - rect.left) / 496.0f;
+    const float sh = (rect.bottom - rect.top) / 503.0f;
+    D2D1_COLOR_F headerColor = NotePaperHeader();
+    D2D1_COLOR_F titleColor = NotePaperTitle();
+    D2D1_COLOR_F paperTop = NotePaperTop();
+    D2D1_COLOR_F paperBottom = NotePaperBottom();
+    D2D1_COLOR_F bodyInk = NotePaperInk();
+    if (item.accentSet) {
+        const D2D1_COLOR_F accent = RgbColor(item.accent);
+        headerColor = accent;
+        /* 正文背景 = 选中颜色 30% 叠在白底上。 */
+        paperTop = MixColor(accent, D2D1::ColorF(1, 1, 1), 0.70f);
+        paperBottom = paperTop;
+        /* 便签标题统一白色，和其他卡片的头部文字一致。 */
+        titleColor = D2D1::ColorF(1.0f, 1.0f, 1.0f);
+        /* 便签正文始终跟普通卡片正文同色。 */
+        bodyInk = NotePaperInk();
+    }
+    auto pt = [&](float x, float y) {
+        return D2D1::Point2F(rect.left + x * sw, rect.top + y * sh);
+    };
+    ComPtr<ID2D1PathGeometry> notePath;
+    if (SUCCEEDED(graphics_->d2d()->CreatePathGeometry(notePath.GetAddressOf())) && notePath) {
+        ComPtr<ID2D1GeometrySink> sink;
+        if (SUCCEEDED(notePath->Open(sink.GetAddressOf())) && sink) {
+            sink->BeginFigure(pt(494.0f, 0.0f), D2D1_FIGURE_BEGIN_FILLED);
+            sink->AddLine(pt(0.0f, 0.0f));
+            sink->AddLine(pt(0.0f, 494.5f));
+            sink->AddBezier(D2D1::BezierSegment(pt(188.7f, 497.2f), pt(294.4f, 499.8f),
+                                                pt(486.0f, 478.5f)));
+            sink->AddBezier(D2D1::BezierSegment(pt(493.7f, 297.8f), pt(495.4f, 192.9f),
+                                                pt(494.0f, 0.0f)));
+            sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink->Close();
+            D2D1_GRADIENT_STOP stops[2] = {
+                {0.0f, paperTop},
+                {1.0f, paperBottom},
+            };
+            ComPtr<ID2D1GradientStopCollection> collection;
+            ComPtr<ID2D1LinearGradientBrush> noteFill;
+            if (SUCCEEDED(target->CreateGradientStopCollection(stops, 2,
+                                                               collection.GetAddressOf())) &&
+                SUCCEEDED(target->CreateLinearGradientBrush(
+                    D2D1::LinearGradientBrushProperties(pt(9.0f, 0.0f), pt(480.0f, 468.5f)),
+                    collection.Get(), noteFill.GetAddressOf()))) {
+                target->FillGeometry(notePath.Get(), noteFill.Get());
+            }
+        }
+    }
+
+    const D2D1_RECT_F header =
+        D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
+    ComPtr<ID2D1SolidColorBrush> headerFill;
+    ComPtr<ID2D1SolidColorBrush> titleInk;
+    ComPtr<ID2D1SolidColorBrush> metaInk;
+    ComPtr<ID2D1SolidColorBrush> bodyInkBrush;
+    if (FAILED(target->CreateSolidColorBrush(headerColor, headerFill.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(titleColor, titleInk.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(util::WithAlpha(titleColor, 0.50f),
+                                             metaInk.GetAddressOf())) ||
+        FAILED(target->CreateSolidColorBrush(bodyInk, bodyInkBrush.GetAddressOf()))) {
+        return;
+    }
+    target->FillRectangle(header, headerFill.Get());
+    target->DrawText(L"便签", 2, cardTitleFormat_.Get(),
+                     D2D1::RectF(header.left + 11.0f * u, header.top + 4.0f * u,
+                                 header.right - 11.0f * u, header.top + 19.0f * u),
+                     titleInk.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    const std::wstring time = card::FormatCardTime(item.createdAt);
+    if (!time.empty()) {
+        target->DrawText(time.c_str(), static_cast<UINT32>(time.size()), cardMetaFormat_.Get(),
+                         D2D1::RectF(header.left + 11.0f * u, header.top + 19.0f * u,
+                                     header.right - 11.0f * u, header.top + 31.0f * u),
+                         metaInk.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+    target->PushAxisAlignedClip(
+        D2D1::RectF(rect.left + 2.0f * u, header.bottom, rect.right - 2.0f * u, rect.bottom),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    target->DrawText(item.note.c_str(), static_cast<UINT32>(item.note.size()),
+                     cardBodyFormat_.Get(),
+                     D2D1::RectF(rect.left + 11.0f * u, header.bottom + 8.0f * u,
+                                 rect.right - 11.0f * u, rect.bottom - 10.0f * u),
+                     bodyInkBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    target->PopAxisAlignedClip();
+}
+
 void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                         float s, float swayAngle, float hoverAmount, bool hovered,
-                        bool pressed, bool hotLock, bool hotClose)
+                        bool pressed, bool hotLock, bool hotClose, bool hotLink,
+                        bool hotColor)
 {
     const float radius = 12.0f * s;
     const float cardScale =
@@ -1705,6 +2521,13 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         return;
     }
 
+    if (IsNewCard(item)) {
+        if (item.cardType == card::Type::Note) {
+            DrawPaperCard(target, item, rect, s);
+        } else {
+            DrawFlatCard(target, item, rect, s, hotLink, hotColor);
+        }
+    } else {
     /* 录屏无封面 / 文件：纯色卡片 + 文字 + 左下角类型图标。 */
     const bool isNoteCard = item.path.empty() && !item.note.empty();
     const bool plainCard = item.kind == 3 || (item.kind == 2 && !item.thumb.valid());
@@ -1741,7 +2564,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         }
 
         D2D1_RECT_F imageRect = rack::Inset(rect, kFrame * s, kFrame * s);
-        /* SVG 预览图本身没有留白：再往里收一圈，别让它顶到相框。 */
+        /* SVG 预览图本身没有留白：再向内收一圈，避免顶到相框。 */
         const bool svgPreview = IsSvgPreviewPath(item.path);
         D2D1_RECT_F contentRect =
             svgPreview ? rack::Inset(imageRect, 12.0f * s, 12.0f * s) : imageRect;
@@ -1840,6 +2663,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         target->DrawRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), border.Get(),
                                      1.0f * s);
     }
+    } /* !IsNewCard */
 
     if (hovered && hoverAmount > 0.15f) {
         const float size = 20.0f * s;
@@ -2038,6 +2862,70 @@ HBITMAP RackView::MakeDragGhost(const Item& item, int width, int height, SIZE* s
     return bitmap;
 }
 
+HBITMAP RackView::MakeColorGhost(const card::Rgba& color, int width, int height,
+                                 SIZE* sizeOut)
+{
+    if (!graphics_ || !graphics_->d2d() || width < 8 || height < 8) {
+        return nullptr;
+    }
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap) return nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+
+    ComPtr<ID2D1DCRenderTarget> target;
+    const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    RECT bounds{0, 0, width, height};
+    HRESULT hr = graphics_->d2d()->CreateDCRenderTarget(&properties, target.GetAddressOf());
+    if (SUCCEEDED(hr)) hr = target->BindDC(dc, &bounds);
+    if (SUCCEEDED(hr)) {
+        const float inset = 2.0f * scale_;
+        const D2D1_RECT_F card =
+            D2D1::RectF(inset, inset, width - inset, height - inset);
+        const float radius = std::max(3.0f, 12.0f * scale_);
+        ComPtr<ID2D1SolidColorBrush> fill;
+        ComPtr<ID2D1SolidColorBrush> border;
+        target->BeginDraw();
+        target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        if (SUCCEEDED(target->CreateSolidColorBrush(
+                D2D1::ColorF(color.r / 255.0f, color.g / 255.0f, color.b / 255.0f,
+                             color.a / 255.0f),
+                fill.GetAddressOf())) &&
+            SUCCEEDED(target->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.9f),
+                                                    border.GetAddressOf()))) {
+            target->FillRoundedRectangle(D2D1::RoundedRect(card, radius, radius), fill.Get());
+            target->DrawRoundedRectangle(D2D1::RoundedRect(card, radius, radius), border.Get(),
+                                         1.5f * scale_);
+        }
+        hr = target->EndDraw();
+    }
+    SelectObject(dc, oldBitmap);
+    DeleteDC(dc);
+    if (FAILED(hr)) {
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+    if (sizeOut) {
+        sizeOut->cx = width;
+        sizeOut->cy = height;
+    }
+    return bitmap;
+}
+
 RackHit RackView::HitTest(float x, float y, float scale) const
 {
     RackHit hit;
@@ -2096,6 +2984,40 @@ RackHit RackView::HitTest(float x, float y, float scale) const
                 hit.part = RackPart::Clip;
                 hit.index = i;
                 return hit;
+            }
+        }
+        if (box.flat && rack::PointIn(box.body, local.x, local.y)) {
+            if (box.cardType == card::Type::Link &&
+                rack::PointIn(box.linkText, local.x, local.y)) {
+                hit.part = RackPart::CardLink;
+                hit.index = i;
+                return hit;
+            }
+            if (box.cardType == card::Type::Color) {
+                for (const ColorRowBox& row : box.colorRows) {
+                    if (!rack::PointIn(box.body, local.x, local.y)) break;
+                    if (rack::PointIn(row.swatch, local.x, local.y)) {
+                        hit.part = RackPart::CardColor;
+                        hit.index = i;
+                        hit.colorIndex = row.index;
+                        hit.colorPart = 0;
+                        return hit;
+                    }
+                    if (rack::PointIn(row.hex, local.x, local.y)) {
+                        hit.part = RackPart::CardColor;
+                        hit.index = i;
+                        hit.colorIndex = row.index;
+                        hit.colorPart = 1;
+                        return hit;
+                    }
+                    if (rack::PointIn(row.rgb, local.x, local.y)) {
+                        hit.part = RackPart::CardColor;
+                        hit.index = i;
+                        hit.colorIndex = row.index;
+                        hit.colorPart = 2;
+                        return hit;
+                    }
+                }
             }
         }
         if (rack::PointIn(box.card, local.x, local.y)) {

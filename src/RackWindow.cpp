@@ -24,6 +24,27 @@ constexpr uint64_t kCloseDelayMs = 130;
 /* 屏幕最上面这一条：点一下就收回，和「停在这里拉下来」用的是同一块区域。 */
 constexpr float kTopBarBand = 24.0f;
 constexpr UINT kMsgTopBarClick = WM_APP + 2;
+constexpr UINT kMsgColorWheel = WM_APP + 3;
+constexpr UINT kMsgRackRightClick = WM_APP + 4;
+
+bool CanPinItem(const Item& item)
+{
+    if (item.kind == 0) return !item.path.empty();
+    if (!item.paths.empty() || !item.path.empty()) return true;
+    return !item.note.empty() || !item.label.empty();
+}
+
+bool PinAsFiles(const Item& item)
+{
+    return !item.paths.empty() || item.kind == 2 || item.kind == 3;
+}
+
+std::wstring PinTextForItem(const Item& item)
+{
+    if (!item.note.empty()) return item.note;
+    if (!item.label.empty()) return item.label;
+    return item.path;
+}
 
 void SendPasteShortcut()
 {
@@ -115,6 +136,10 @@ bool RackWindow::Init(Plugin* plugin, Graphics* graphics)
     }
     historyDisabled_ = plugin_->HistoryDisabled();
     view_.SetHistoryDisabled(historyDisabled_);
+    lastCardSize_ = plugin_->config().size;
+    cardScaleValue_ = plugin_->config().CardScale();
+    cardScaleFrom_ = cardScaleValue_;
+    cardScaleTarget_ = cardScaleValue_;
     if (!preview_.Init(graphics)) {
         RackLog(L"RackWindow: preview initialization failed");
         return false;
@@ -134,6 +159,8 @@ bool RackWindow::Init(Plugin* plugin, Graphics* graphics)
     workArea_ = MonitorWorkArea(monitor_);
     scale_ = util::ScaleForMonitor(monitor_);
     SetDpiScale(scale_);
+    /* 2x 超采样后线性缩回：卡片圆角/20% 外圈/文字更平滑。 */
+    SetSupersample(true);
     lastInside_ = rack::NowMs();
     normalizeSpacingPending_ = !plugin_->items().empty();
     SetTimer(hwnd(), kTimerPoll, kPollIntervalMs, nullptr);
@@ -148,6 +175,7 @@ void RackWindow::Shutdown()
         KillTimer(hwnd(), kTimerClick);
         KillTimer(hwnd(), kTimerLongPress);
         KillTimer(hwnd(), kTimerEditWatch);
+        KillTimer(hwnd(), kTimerEditStart);
         KillTimer(hwnd(), kTimerFakeCursor);
     }
     editingWatchActive_ = false;
@@ -256,10 +284,30 @@ void RackWindow::OnConfigChanged()
         return;
     }
     RefreshHistoryDisabled();
+    /* 尺寸档位变化：只记录目标档位，卡片宽度和槽位在 Animate 里逐帧缓动。
+       不在这里清偏移/槽位，否则会跳变。 */
+    const int newCardSize = plugin_->config().size;
+    const bool sizeChanged = lastCardSize_ >= 0 && newCardSize != lastCardSize_;
+    lastCardSize_ = newCardSize;
+    if (sizeChanged) {
+        /* 不在配置回调里直接跳到新尺寸：让卡片宽度和槽位一起缓动，
+           放大时把间距挤开，缩小时把间距收拢。 */
+        cardScaleFrom_ = cardScaleValue_;
+        cardScaleTarget_ = plugin_->config().CardScale();
+        cardScaleAnimStart_ = rack::NowMs();
+        cardScaleAnimating_ = true;
+        needsLayout_ = true;
+        if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
     if (!monitor_) {
         monitor_ = CursorMonitor();
     }
     PositionForMonitor(monitor_);
+    /* 尺寸档位从「小」变「大」时窗口和分层表面都要长大；强制丢掉旧的
+       DIB/D2D 表面再重排，避免只有缩小方向即时生效。 */
+    InvalidateSurface();
+    needsLayout_ = true;
+    Reposition();
     EnsureVisible();
     /* 关闭「自动收回」后衣架常驻：任何配置变化都把它重新展开。 */
     if (!plugin_->config().autoRetract && expand_ < 0.9f) {
@@ -320,6 +368,9 @@ void RackWindow::Expand(bool peek)
     expanding_ = true;
     if (!hiddenForFullscreen_) {
         EnsureVisible();
+        /* 窗口一出现就恢复可命中，不依赖下一次轮询；否则刚展开时右键
+           仍可能沿用旧的 WS_EX_TRANSPARENT 状态。 */
+        SetClickThrough(false);
     }
     StartAnimation(1.0f);
     if (hwnd()) {
@@ -346,6 +397,7 @@ void RackWindow::SetTopBarWatch(bool enabled)
             RackLog(L"RackWindow: 顶栏点击监测装不上（%lu）", GetLastError());
         }
     } else {
+        rightCardDown_ = false;
         if (topBarHook_) {
             UnhookWindowsHookEx(topBarHook_);
             topBarHook_ = nullptr;
@@ -372,8 +424,86 @@ bool RackWindow::IsTopBarPoint(POINT screen) const
            screen.x >= info.rcMonitor.left && screen.x < info.rcMonitor.right;
 }
 
+int RackWindow::CardIndexAtScreen(POINT screen) const
+{
+    if (!hwnd()) return -1;
+    /* 先精确命中；卡片旋转或动画中命中可能为空，再用轴对齐包围盒兜底。 */
+    POINT client = screen;
+    ScreenToClient(hwnd(), &client);
+    const float px = static_cast<float>(client.x);
+    const float py = static_cast<float>(client.y);
+    const RackHit hit = view_.HitTest(px, py, scale_);
+    if (hit.index >= 0 && hit.part != RackPart::None && hit.part != RackPart::Background &&
+        hit.part != RackPart::Line && hit.part != RackPart::Basket &&
+        hit.part != RackPart::Envelope) {
+        return hit.index;
+    }
+    const float pad = 10.0f * scale_;
+    for (int i = 0;; ++i) {
+        const CardBox* box = view_.CardAt(i);
+        if (!box) break;
+        if (px >= box->card.left - pad && px <= box->card.right + pad &&
+            py >= box->pinTop - pad && py <= box->card.bottom + pad) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
+    /* 右键在按下阶段就截住：分层窗口偶发命中失败时，这次右键不会先落到桌面。
+       其他 UI 持有指针（菜单/编辑器/拖拽/剪贴板面板）时放行。 */
+    if (code == HC_ACTION && (wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP) &&
+        topBarOwner_ && topBarOwner_->hwnd() && topBarOwner_->plugin_) {
+        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (!mouse) return CallNextHookEx(nullptr, code, wParam, lParam);
+        if (wParam == WM_RBUTTONUP) {
+            if (topBarOwner_->rightCardDown_) {
+                topBarOwner_->rightCardDown_ = false;
+                return 1;
+            }
+        } else if (!topBarOwner_->rightCardDown_ && !topBarOwner_->menuOpen_ &&
+                   !topBarOwner_->dragStarted_ && !topBarOwner_->editingNote_ &&
+                   !topBarOwner_->plugin_->MenuOpen()) {
+            if (topBarOwner_->plugin_->ClipboardOpen()) {
+                POINT cur{};
+                GetCursorPos(&cur);
+                if (topBarOwner_->plugin_->ClipboardContains(cur)) {
+                    return CallNextHookEx(nullptr, code, wParam, lParam);
+                }
+            }
+            const int index = topBarOwner_->CardIndexAtScreen(mouse->pt);
+            if (index >= 0) {
+                topBarOwner_->rightCardDown_ = true;
+                PostMessageW(topBarOwner_->hwnd(), kMsgRackRightClick,
+                             static_cast<WPARAM>(index),
+                             MAKELPARAM(mouse->pt.x, mouse->pt.y));
+                return 1;
+            }
+        }
+    }
+    if (code == HC_ACTION && wParam == WM_MOUSEWHEEL && topBarOwner_ &&
+        topBarOwner_->hwnd()) {
+        const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
+        if (mouse) {
+            POINT client = mouse->pt;
+            ScreenToClient(topBarOwner_->hwnd(), &client);
+            const RackHit hit = topBarOwner_->view_.HitTest(
+                static_cast<float>(client.x), static_cast<float>(client.y),
+                topBarOwner_->scale_);
+            if ((hit.part == RackPart::Card || hit.part == RackPart::CardColor) &&
+                hit.index >= 0 &&
+                hit.index < static_cast<int>(topBarOwner_->plugin_->items().size()) &&
+                topBarOwner_->plugin_->items()[static_cast<size_t>(hit.index)].cardType ==
+                    card::Type::Color) {
+                PostMessageW(topBarOwner_->hwnd(), kMsgColorWheel,
+                             static_cast<WPARAM>(GET_WHEEL_DELTA_WPARAM(mouse->mouseData)), 0);
+                /* 颜色卡吃掉的滚轮不要再传给下面窗口。 */
+                return 1;
+            }
+        }
+    }
     if (code == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN) &&
         topBarOwner_ && topBarOwner_->hwnd()) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
@@ -386,28 +516,11 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
 
 void RackWindow::NormalizeLoadedSpacing()
 {
-    if (!plugin_) return;
-    /* 启动时清掉旧的手动偏移：水平位置只由布局决定。 */
-    bool changed = false;
-    for (auto& item : plugin_->items()) {
-        if (std::abs(item.rackOffsetX) > 0.35f) {
-            item.rackOffsetX = 0.0f;
-            changed = true;
-        }
+    if (!plugin_) {
+        return;
     }
-    if (changed) {
-        plugin_->SaveItems();
-        needsLayout_ = true;
-    }
-}
-
-
-void RackWindow::FinishCardDrag(int id)
-{
-    (void)id;
-    if (!plugin_) return;
-    /* 水平拖动不再保留自由 offset，而是按松手时的左右顺序重新排卡片；
-       布局仍然是唯一间距来源，所以不会叠、不会被旧偏移推散。 */
+    /* 0.1.1 的做法：按画面上的左右顺序补最小间距，偏移保留下来，
+       视觉顺序才不会被启动时清零。 */
     struct Entry {
         float left = 0.0f;
         int index = -1;
@@ -418,28 +531,107 @@ void RackWindow::FinishCardDrag(int id)
             order.push_back({box->card.left, i});
         }
     }
-    if (order.empty()) return;
     std::sort(order.begin(), order.end(),
               [](const Entry& a, const Entry& b) { return a.left < b.left; });
+    const float gap = view_.DefaultGap();
+    float previousRight = 0.0f;
+    bool first = true;
+    bool changed = false;
+    for (const auto& entry : order) {
+        const CardBox* box = view_.Card(entry.index);
+        if (!box) continue;
+        const float width = box->card.right - box->card.left;
+        float left = box->card.left;
+        if (!first && left - previousRight < gap) {
+            const float shift = gap - (left - previousRight);
+            plugin_->items()[entry.index].rackOffsetX += shift;
+            left += shift;
+            changed = true;
+        }
+        previousRight = left + width;
+        first = false;
+    }
+    if (changed) {
+        plugin_->SaveItems();
+        needsLayout_ = true;
+    }
+}
+
+void RackWindow::FinishCardDrag(int id)
+{
+    (void)id;
+    if (!plugin_) {
+        return;
+    }
+    struct Entry {
+        float center = 0.0f;
+        int index = -1;
+    };
+    std::vector<Entry> order;
+    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
+        if (const CardBox* box = view_.Card(i)) {
+            order.push_back(
+                {(box->card.left + box->card.right) * 0.5f, i});
+        }
+    }
+    if (order.empty()) {
+        return;
+    }
+    std::sort(order.begin(), order.end(),
+              [](const Entry& a, const Entry& b) { return a.center < b.center; });
+
     std::vector<Item> reordered;
     reordered.reserve(order.size());
     for (const Entry& entry : order) {
-        if (entry.index >= 0 && entry.index < static_cast<int>(plugin_->items().size())) {
-            reordered.push_back(plugin_->items()[static_cast<size_t>(entry.index)]);
+        reordered.push_back(plugin_->items()[static_cast<size_t>(entry.index)]);
+    }
+    if (reordered.size() != plugin_->items().size()) {
+        return;
+    }
+
+    /* 目标槽位由最终顺序决定；先把槽位钉到目标，再用 rackOffsetX 把每张卡
+       从松手时的视觉位置缓动回 0。这样两边一起走 1.1 的 180ms ease，
+       但最终位置严格按最终顺序，不会留下两张卡叠在一起。 */
+    const std::vector<float> targets = view_.TargetLefts(reordered);
+    std::vector<std::pair<int, float>> oldLefts;
+    oldLefts.reserve(plugin_->items().size());
+    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
+        if (const CardBox* box = view_.Card(i)) {
+            oldLefts.push_back({plugin_->items()[static_cast<size_t>(i)].id,
+                                box->card.left});
         }
     }
-    if (reordered.size() != plugin_->items().size()) return;
-    for (auto& item : reordered) {
-        item.rackOffsetX = 0.0f;
+    for (size_t i = 0; i < reordered.size(); ++i) {
+        float oldLeft = targets[i];
+        for (const auto& entry : oldLefts) {
+            if (entry.first == reordered[i].id) {
+                oldLeft = entry.second;
+                break;
+            }
+        }
+        reordered[i].rackOffsetX = oldLeft - targets[i];
     }
+
+    view_.SnapSlotsTo(reordered, targets);
     plugin_->items() = std::move(reordered);
     offsetAnims_.clear();
+    const uint64_t now = rack::NowMs();
+    for (auto& item : plugin_->items()) {
+        if (std::abs(item.rackOffsetX) > 0.35f) {
+            offsetAnims_.push_back({item.id, item.rackOffsetX, 0.0f, now, 180.0f});
+            item.shakeStartMs = now;
+            item.shakeAmp = 2.2f;
+        }
+    }
     plugin_->SaveItems();
     needsLayout_ = true;
     if (hwnd()) {
         Reposition();
         Render();
-        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+        if (!offsetAnims_.empty()) {
+            swingUntil_ = std::max(swingUntil_, now + 1250);
+            SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+        }
     }
 }
 
@@ -468,6 +660,9 @@ void RackWindow::SetDragTransparent(bool on)
     const LONG_PTR updated = on ? (style | WS_EX_TRANSPARENT) : (style & ~WS_EX_TRANSPARENT);
     if (updated != style) {
         SetWindowLongPtrW(hwnd(), GWL_EXSTYLE, updated);
+        SetWindowPos(hwnd(), nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_FRAMECHANGED);
     }
 }
 
@@ -539,10 +734,24 @@ void RackWindow::Animate()
         return;
     }
     const uint64_t now = rack::NowMs();
-    if (!pendingPinPath_.empty() && now >= pendingPinAt_) {
+    if (pendingPinKind_ != PendingPin::None && now >= pendingPinAt_) {
+        const PendingPin kind = pendingPinKind_;
+        pendingPinKind_ = PendingPin::None;
         const std::wstring path = std::move(pendingPinPath_);
+        const std::wstring text = std::move(pendingPinText_);
+        const std::vector<std::wstring> paths = std::move(pendingPinPaths_);
         pendingPinPath_.clear();
-        if (plugin_) plugin_->PinImageFile(path);
+        pendingPinText_.clear();
+        pendingPinPaths_.clear();
+        if (plugin_) {
+            if (kind == PendingPin::Image) {
+                plugin_->PinImageFileAt(path, pendingPinAnchor_.x, pendingPinAnchor_.y);
+            } else if (kind == PendingPin::Text) {
+                plugin_->PinTextToDesktopAt(text, pendingPinAnchor_.x, pendingPinAnchor_.y);
+            } else if (kind == PendingPin::Files) {
+                plugin_->PinFilesToDesktopAt(paths, pendingPinAnchor_.x, pendingPinAnchor_.y);
+            }
+        }
     }
     if (pendingAdjustId_ >= 0 && now >= pendingAdjustAt_) {
         const int id = pendingAdjustId_;
@@ -603,6 +812,18 @@ void RackWindow::Animate()
     StepSpring(paperPos_, paperVelocity_, paperTarget, dt, 0.38f, 0.80f);
     const bool paperSettled = std::abs(paperPos_ - paperTarget) < 0.003f;
 
+    if (cardScaleAnimating_) {
+        const float t = rack::Clamp(
+            static_cast<float>(now - cardScaleAnimStart_) / 220.0f, 0.0f, 1.0f);
+        if (t >= 1.0f) {
+            cardScaleValue_ = cardScaleTarget_;
+            cardScaleAnimating_ = false;
+        } else {
+            cardScaleValue_ =
+                rack::Lerp(cardScaleFrom_, cardScaleTarget_, rack::EaseOutCubic(t));
+        }
+    }
+
     Reposition();
     Render();
 
@@ -612,10 +833,10 @@ void RackWindow::Animate()
     const bool hoverSettled =
         std::abs(basketHover_ - basketHoverTarget_) < 0.003f &&
         std::abs(cardHover_ - cardHoverTarget_) < 0.003f && paperSettled;
-    if (!animating_ && offsetAnims_.empty() && pendingAdjustId_ < 0 &&
+    if (!animating_ && !cardScaleAnimating_ && offsetAnims_.empty() && pendingAdjustId_ < 0 &&
         now >= swingUntil_ && now >= shakeUntil_ && hoverSettled && !view_.HasRemoved() &&
         !view_.HasSliding() &&
-        !view_.HasArrival() && pendingPinPath_.empty()) {
+        !view_.HasArrival() && pendingPinKind_ == PendingPin::None) {
         if (hideWhenRemovalsDone_ && plugin_->items().empty()) {
             hideWhenRemovalsDone_ = false;
             if (plugin_->config().autoRetract) {
@@ -639,8 +860,47 @@ void RackWindow::Animate()
 
 void RackWindow::NormalizeSpacing(float ms)
 {
-    /* 布局负责所有水平位置；不再在动画过程中改 `rackOffsetX`，避免和弹簧冲突。 */
-    (void)ms;
+    if (!plugin_ || !hwnd()) {
+        return;
+    }
+    struct Entry {
+        float left = 0.0f;
+        int index = -1;
+    };
+    std::vector<Entry> order;
+    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
+        if (const CardBox* box = view_.Card(i)) {
+            order.push_back({box->card.left, i});
+        }
+    }
+    std::sort(order.begin(), order.end(),
+              [](const Entry& a, const Entry& b) { return a.left < b.left; });
+
+    const float gap = view_.DefaultGap();
+    const uint64_t now = rack::NowMs();
+    float previousRight = 0.0f;
+    bool first = true;
+    bool changed = false;
+    for (const auto& entry : order) {
+        const CardBox* box = view_.Card(entry.index);
+        if (!box) continue;
+        float left = box->card.left;
+        const float width = box->card.right - box->card.left;
+        if (!first && left - previousRight < gap) {
+            const float shift = gap - (left - previousRight);
+            Item& item = plugin_->items()[static_cast<size_t>(entry.index)];
+            item.rackOffsetX += shift;
+            offsetAnims_.push_back(
+                {item.id, item.rackOffsetX - shift, item.rackOffsetX, now, ms});
+            left += shift;
+            changed = true;
+        }
+        previousRight = left + width;
+        first = false;
+    }
+    if (changed) {
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
 }
 
 void RackWindow::Reposition()
@@ -662,7 +922,7 @@ void RackWindow::Reposition()
     const float s = scale_;
     const float maxWidth = static_cast<float>(work.right - work.left);
     const RackLayout layout = view_.Layout(plugin_->items(), maxWidth, s, expand_,
-                                           plugin_->config().CardScale());
+                                           cardScaleValue_);
     const int width = std::max(1, static_cast<int>(std::lround(layout.width)));
     int height = std::max(1, static_cast<int>(std::lround(layout.height)));
     if (view_.HasFalling() || view_.HasArrival()) {
@@ -728,6 +988,12 @@ void RackWindow::Tick()
         lastInside_ = rack::NowMs();
         return;
     }
+    /* 菜单命令可能打开模态编辑器/取色器；在命令真正跑完前
+       不要让自动收回先把绳子拉上去。 */
+    if (menuActionPending_) {
+        lastInside_ = rack::NowMs();
+        return;
+    }
     RefreshHistoryDisabled();
     plugin_->SyncHostTheme();
     if (menuOpen_) {
@@ -739,10 +1005,11 @@ void RackWindow::Tick()
         // 同时把 PinMenu 的低级鼠标钩子摘掉（如果它比弹窗活得久的话），
         // 否则它会一直吞掉桌面上的点击。
         plugin_->CloseMenu();
-        // 常驻模式不因菜单关闭而自动收回。
-        if (plugin_->config().autoRetract) {
-            Collapse();
-        }
+        /* 菜单关闭和命令回调之间可能有几十毫秒空档。这里不能立刻
+           Collapse，否则点“编辑”会先看到卡片收回、编辑器再展开。
+           给命令一个宽限期，真正的收起交给 autoHide。 */
+        lastInside_ = rack::NowMs();
+        menuCloseGraceUntil_ = lastInside_ + 500;
         Render();
         return;
     }
@@ -945,7 +1212,8 @@ void RackWindow::UpdateHover()
         !dragStarted_ && !plugin_->PreviewPinned() && !hotkeyPinned_ &&
         !view_.HasRemoved()) {
         const uint64_t autoHide = static_cast<uint64_t>(std::max(0, plugin_->config().autoHideMs));
-        const uint64_t hideAt = std::max(peekUntil_, lastInside_ + autoHide);
+        const uint64_t hideAt =
+            std::max(std::max(peekUntil_, lastInside_ + autoHide), menuCloseGraceUntil_);
         if (now >= hideAt) {
             Collapse();
         }
@@ -975,30 +1243,30 @@ void RackWindow::UpdateAccessoryHover(const RackHit& hit)
 
 void RackWindow::SetClickThrough(bool enabled)
 {
-    if (!hwnd() || clickThrough_ == enabled) {
+    if (!hwnd()) {
         return;
     }
-    LONG_PTR style = GetWindowLongPtrW(hwnd(), GWL_EXSTYLE);
+    const LONG_PTR style = GetWindowLongPtrW(hwnd(), GWL_EXSTYLE);
+    const bool actual = (style & WS_EX_TRANSPARENT) != 0;
+    if (actual == enabled && clickThrough_ == enabled) {
+        return;
+    }
     const LONG_PTR next =
         enabled ? (style | WS_EX_TRANSPARENT) : (style & ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT));
     if (next != style) {
         SetWindowLongPtrW(hwnd(), GWL_EXSTYLE, next);
     }
+    /* WS_EX_TRANSPARENT 在分层窗口上偶尔要重新算一次非客户区才生效。 */
+    SetWindowPos(hwnd(), nullptr, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     clickThrough_ = enabled;
 }
 
-void RackWindow::UpdateClickThrough(const RackHit& hit)
+void RackWindow::UpdateClickThrough()
 {
-    /* 卡片、便签、配件保持可交互，但透明缝隙（包括绳子空着的部分）
-       要让点击穿到下面的窗口。 */
-    const bool interactive =
-        expand_ > 0.9f && hit.part != RackPart::None &&
-        (hit.part == RackPart::Card || hit.part == RackPart::Note ||
-         hit.part == RackPart::Close || hit.part == RackPart::Lock ||
-         hit.part == RackPart::Basket || hit.part == RackPart::Envelope ||
-         hit.part == RackPart::Clip);
+    /* 展开时整窗可命中，透明缝隙交给 WM_NCHITTEST；完全收起时才整体穿透。 */
     const bool keepMouse = mouseDown_ || dragStarted_;
-    SetClickThrough(!keepMouse && !interactive);
+    SetClickThrough(!keepMouse && expand_ < 0.05f);
 }
 
 void RackWindow::UpdatePreview()
@@ -1009,22 +1277,28 @@ void RackWindow::UpdatePreview()
     POINT cursor{};
     GetCursorPos(&cursor);
 
-    RackPart part = RackPart::None;
-    RackHit hit;
-    hit.index = HitIndexAtCursor(&part);
-    hit.part = part;
+    const RackHit hit = HitAtCursor();
+    const RackPart part = hit.part;
     const int index = hit.index;
+    const int colorIndex = part == RackPart::CardColor ? hit.colorIndex : -1;
+    const int colorPart = part == RackPart::CardColor ? hit.colorPart : -1;
     const bool overPreview = PointOverPreview(cursor);
     const uint64_t now = rack::NowMs();
     UpdateAccessoryHover(hit);
-    UpdateClickThrough(hit);
+    UpdateClickThrough();
     bool visualChanged = false;
 
     /* 卡片上的锁定/关闭小控件：把光标压在哪个上告诉 view，做悬停高亮。 */
-    if (static_cast<int>(hit.part) != lastHoverPart_ || hit.index != lastHoverPartIndex_) {
-        lastHoverPart_ = static_cast<int>(hit.part);
-        lastHoverPartIndex_ = hit.index;
+    const bool hoverChanged =
+        static_cast<int>(part) != lastHoverPart_ || index != lastHoverPartIndex_ ||
+        colorIndex != lastHoverColorIndex_ || colorPart != lastHoverColorPart_;
+    if (hoverChanged) {
+        lastHoverPart_ = static_cast<int>(part);
+        lastHoverPartIndex_ = index;
+        lastHoverColorIndex_ = colorIndex;
+        lastHoverColorPart_ = colorPart;
         view_.SetHoverPart(lastHoverPart_, lastHoverPartIndex_);
+        view_.SetHoverColor(lastHoverColorIndex_, lastHoverColorPart_);
         visualChanged = true;
     }
 
@@ -1160,7 +1434,8 @@ int RackWindow::HitIndexAtCursor(RackPart* outPart) const
         *outPart = hit.part;
     }
     if (hit.part == RackPart::Card || hit.part == RackPart::Note ||
-        hit.part == RackPart::Close || hit.part == RackPart::Lock) {
+        hit.part == RackPart::Close || hit.part == RackPart::Lock ||
+        hit.part == RackPart::CardLink || hit.part == RackPart::CardColor) {
         return hit.index;
     }
     return -1;
@@ -1278,6 +1553,17 @@ void RackWindow::CopyItem(int index)
         return;
     }
     const Item& copyItem = plugin_->items()[index];
+    /* 单色颜色卡：整卡单击默认复制 hex（带 alpha 时是 8 位）。多色卡整卡复制原文。 */
+    if (copyItem.cardType == card::Type::Color) {
+        std::vector<card::Rgba> colors;
+        if (card::ParseColors(copyItem.note, colors) && colors.size() == 1) {
+            clipboard::CopyText(card::HexText(colors.front()));
+            view_.ShowCopyToast(index, rack::NowMs() + 900);
+            if (hwnd()) SetTimer(hwnd(), kTimerCopyToast, 900, nullptr);
+            Render();
+            return;
+        }
+    }
     /* SVG 卡片复制的是 SVG 代码本身，粘贴到 Figma / Illustrator 里是矢量；
        不另存 .svg 文件。 */
     const std::wstring svgText = plugin_->SvgText(index);
@@ -1287,6 +1573,12 @@ void RackWindow::CopyItem(int index)
         clipboard::CopyText(copyItem.note);
     } else if (copyItem.kind == 0) {
         clipboard::CopyImage(copyItem.path);
+    } else if (!copyItem.paths.empty()) {
+        if (copyItem.paths.size() > 1) {
+            clipboard::CopyFilePaths(copyItem.paths);
+        } else {
+            clipboard::CopyFilePath(copyItem.paths.front());
+        }
     } else if (!copyItem.path.empty()) {
         clipboard::CopyFilePath(copyItem.path);
     } else {
@@ -1296,6 +1588,115 @@ void RackWindow::CopyItem(int index)
     if (hwnd()) {
         SetTimer(hwnd(), kTimerCopyToast, 900, nullptr);
     }
+    Render();
+}
+
+void RackWindow::OpenCardLink(int index)
+{
+    if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) return;
+    const Item& item = plugin_->items()[static_cast<size_t>(index)];
+    if (item.cardType != card::Type::Link || item.note.empty()) return;
+    /* 单击已经打开过，双击不再重复开第二个标签页。 */
+    const uint64_t now = rack::NowMs();
+    if (lastLinkOpenIndex_ == index &&
+        now - lastLinkOpenMs_ < static_cast<uint64_t>(GetDoubleClickTime())) {
+        return;
+    }
+    lastLinkOpenIndex_ = index;
+    lastLinkOpenMs_ = now;
+    ShellExecuteW(hwnd(), L"open", item.note.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void RackWindow::CopyCardColor(int index, int colorIndex, int part)
+{
+    if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) return;
+    const Item& item = plugin_->items()[static_cast<size_t>(index)];
+    std::vector<card::Rgba> colors;
+    if (!card::ParseColors(item.note, colors) || colorIndex < 0 ||
+        colorIndex >= static_cast<int>(colors.size())) {
+        return;
+    }
+    const card::Rgba& color = colors[static_cast<size_t>(colorIndex)];
+    const std::wstring text = part == 2 ? card::RgbText(color) : card::HexText(color);
+    clipboard::CopyText(text);
+    const uint64_t now = rack::NowMs();
+    view_.ShowCopyToast(index, now + 900);
+    view_.ShowColorFlash(item.id, colorIndex, part == 2 ? 2 : 1, now + 900);
+    if (hwnd()) SetTimer(hwnd(), kTimerCopyToast, 900, nullptr);
+    Render();
+}
+
+bool RackWindow::ScrollColorCard(int index, int delta)
+{
+    if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
+        return false;
+    }
+    Item& item = plugin_->items()[static_cast<size_t>(index)];
+    if (item.cardType != card::Type::Color) return false;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    ScreenToClient(hwnd(), &cursor);
+    if (!view_.ColorContentContains(index, static_cast<float>(cursor.x),
+                                    static_cast<float>(cursor.y))) {
+        return false;
+    }
+    std::vector<card::Rgba> colors;
+    if (!card::ParseColors(item.note, colors) || colors.empty()) return false;
+    const float cardScale = plugin_->config().CardScale();
+    const float rowHeight = 36.0f * scale_ * cardScale;
+    const float bodyHeight = (150.0f - 33.0f) * scale_ * cardScale;
+    const float maxScroll = std::max(
+        0.0f, static_cast<float>(colors.size()) * rowHeight + 4.0f * scale_ * cardScale -
+                  bodyHeight);
+    if (maxScroll <= 0.0f) return false;
+    const int steps = delta / WHEEL_DELTA;
+    if (steps == 0) return false;
+    item.colorScroll =
+        rack::Clamp(item.colorScroll - static_cast<float>(steps) * rowHeight, 0.0f, maxScroll);
+    Reposition();
+    Render();
+    return true;
+}
+
+void RackWindow::PickCardColor(int index)
+{
+    if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) return;
+    Item& item = plugin_->items()[static_cast<size_t>(index)];
+    if (!card::HasAccent(item.cardType)) return;
+    const uint32_t current = item.accentSet ? item.accent : card::DefaultAccent(item.cardType);
+    const std::wstring initial = card::HexText(card::Rgba{
+        static_cast<uint8_t>((current >> 16) & 0xFF),
+        static_cast<uint8_t>((current >> 8) & 0xFF),
+        static_cast<uint8_t>(current & 0xFF), 255});
+    std::wstring text = initial;
+    NoteEditor::CardLook look;
+    look.type = item.cardType;
+    look.accent = current;
+    look.accentSet = true;
+    look.cardScale = plugin_->config().CardScale();
+    look.colorMode = true;
+    Theme uiTheme = plugin_->host()
+                        ? Theme::HostUi(plugin_->host(), plugin_->host()->user)
+                        : Theme::MenuStyle(plugin_->theme().dark);
+    const D2D1_RECT_F card = CardScreenRect(index);
+    const RECT anchor{ static_cast<LONG>(std::lround(card.left)),
+                       static_cast<LONG>(std::lround(card.top)),
+                       static_cast<LONG>(std::lround(card.right)),
+                       static_cast<LONG>(std::lround(card.bottom)) };
+    if (!NoteEditor::Edit(hwnd(), util::GetDllModule(), &plugin_->graphics(), uiTheme,
+                          L"颜色", anchor, initial, text, nullptr, nullptr, nullptr, look)) {
+        return;
+    }
+    std::vector<card::Rgba> colors;
+    if (!card::ParseColors(text, colors) || colors.empty()) {
+        return;
+    }
+    const card::Rgba& picked = colors.front();
+    item.accent = (static_cast<uint32_t>(picked.r) << 16) |
+                  (static_cast<uint32_t>(picked.g) << 8) |
+                  static_cast<uint32_t>(picked.b);
+    item.accentSet = true;
+    plugin_->SaveItems();
     Render();
 }
 
@@ -1423,6 +1824,14 @@ void RackWindow::RemoveItem(int index, bool toBasket)
     Reposition();
     Render();
 }
+void RackWindow::QueueEditNote(int index)
+{
+    pendingEditIndex_ = index;
+    if (hwnd()) {
+        SetTimer(hwnd(), kTimerEditStart, 30, nullptr);
+    }
+}
+
 void RackWindow::EditNote(int index)
 {
     if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
@@ -1431,7 +1840,26 @@ void RackWindow::EditNote(int index)
     DismissPreview();
     const Item& item = plugin_->items()[index];
     const int noteColor = item.noteColor;
-    const std::wstring title = item.path.empty() ? L"便签" : L"给这张截图写一句用途";
+    const bool textLike = item.cardType == card::Type::Note ||
+                          item.cardType == card::Type::Text ||
+                          item.cardType == card::Type::Link ||
+                          item.cardType == card::Type::Color;
+    const bool fileLike = item.cardType == card::Type::File ||
+                          item.cardType == card::Type::Video ||
+                          item.cardType == card::Type::Music;
+    const bool readOnly = fileLike;
+    const bool hideCard = textLike || fileLike;
+    std::vector<std::wstring> filePaths = item.paths;
+    if (filePaths.empty() && !item.path.empty()) {
+        filePaths.push_back(item.path);
+    }
+    const bool foldersOnly = card::AllPathsAreFolders(filePaths);
+    std::wstring title = item.cardType == card::Type::Image
+                             ? L"给这张截图写一句用途"
+                             : card::TypeLabel(item.cardType);
+    if (item.cardType == card::Type::File) {
+        title = card::FileLabel(filePaths);
+    }
     RECT anchor{};
     const D2D1_RECT_F card = CardScreenRect(index);
     if (card.right > card.left && card.bottom > card.top) {
@@ -1441,39 +1869,72 @@ void RackWindow::EditNote(int index)
         anchor.bottom = static_cast<LONG>(std::lround(card.bottom));
     }
     std::wstring text = item.note;
-    const bool noteCard = item.path.empty();
-    if (noteCard) {
-        /* 编辑器第一帧出来后（onShown）才把卡片藏掉，避免中间闪一下空档。 */
+    if (fileLike) {
+        /* 全是文件夹时显示完整地址；文件/混搭只显示名字。 */
+        text.clear();
+        if (!filePaths.empty()) {
+            for (const auto& path : filePaths) {
+                if (!text.empty()) text += L'\n';
+                text += foldersOnly ? path : card::FileName(path);
+            }
+        } else if (!item.label.empty()) {
+            text = item.label;
+        }
+    }
+    if (hideCard) {
+        /* 文本和文件都用同一套编辑卡片：第一帧出来后才把绳子上的卡片藏掉。 */
         editingNote_ = true;
         Expand(false);
     }
+    NoteEditor::CardLook look;
+    look.type = item.cardType;
+    look.accent = item.accentSet ? item.accent : card::DefaultAccent(item.cardType);
+    look.accentSet = true;
+    look.createdAt = item.createdAt;
+    look.cardScale =
+        item.cardType == card::Type::Image ? 1.0f : plugin_->config().CardScale();
+    look.colorMode = card::HasAccent(item.cardType);
+    look.readOnly = readOnly;
     Theme uiTheme = plugin_->host()
                         ? Theme::HostUi(plugin_->host(), plugin_->host()->user)
                         : Theme::MenuStyle(plugin_->theme().dark);
     const bool saved = NoteEditor::Edit(
         hwnd(), util::GetDllModule(), &plugin_->graphics(), uiTheme, title, anchor, text, text,
-        [this, index, noteCard]() {
-            if (!noteCard) {
+        [this, index, hideCard]() {
+            if (!hideCard) {
                 return;
             }
             view_.SetEditingCard(index);
             Render();
         },
         nullptr,
-        /* 便签已经返回夹子：先把下面这张卡片画出来，编辑器再淡出，交接看不出缝。 */
-        [this, noteCard]() {
-            if (!noteCard) {
+        /* 卡片已经返回夹子：先把下面这张卡片画出来，编辑器再淡出。 */
+        [this, hideCard]() {
+            if (!hideCard) {
                 return;
             }
             view_.SetEditingCard(-1);
             Render();
+        },
+        look,
+        [this, index](uint32_t rgb) {
+            if (!plugin_ || index < 0 ||
+                index >= static_cast<int>(plugin_->items().size())) {
+                return;
+            }
+            Item& edited = plugin_->items()[static_cast<size_t>(index)];
+            edited.accent = rgb & 0xFFFFFFu;
+            edited.accentSet = true;
+            plugin_->SaveItems();
+            Render();
         });
-    if (noteCard) {
+    if (hideCard) {
         view_.SetEditingCard(-1);
         editingNote_ = false;
     }
     if (saved) {
-        if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
+        if (!fileLike && index >= 0 &&
+            index < static_cast<int>(plugin_->items().size())) {
             plugin_->SetItemNote(index, text, noteColor);
         }
         hovered_ = -1;
@@ -1499,7 +1960,13 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         return;
     }
     batchMenu_.Close();
-    const bool noteItem = plugin_->items()[index].path.empty() && !plugin_->items()[index].note.empty();
+    const Item& menuEntry = plugin_->items()[index];
+    const bool noteItem = menuEntry.path.empty() && !menuEntry.note.empty();
+    const bool textLike = menuEntry.cardType == card::Type::Note ||
+                          menuEntry.cardType == card::Type::Text ||
+                          menuEntry.cardType == card::Type::Link ||
+                          menuEntry.cardType == card::Type::Color;
+    const bool accentable = card::HasAccent(menuEntry.cardType);
 
     if (plugin_->host() && plugin_->host()->show_menu) {
         SnowAirMenuItem batch[4]{};
@@ -1512,7 +1979,7 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         batch[3].label = L"全部取下";
         batch[3].id = kMenuBatchAll;
 
-        SnowAirMenuItem main[8]{};
+        SnowAirMenuItem main[12]{};
         int n = 0;
         auto add = [&](const wchar_t* label, int id, int flags = 0) {
             main[n].label = label;
@@ -1521,6 +1988,7 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
             ++n;
         };
         add(L"打开", kMenuOpen);
+        if (textLike || accentable) add(L"编辑", kMenuEdit);
         add(L"另存为…", kMenuSaveAs);
         if (!noteItem) add(L"打开位置", kMenuShowInFolder);
         add(L"", 0, SNOWAIR_MENU_SEPARATOR);
@@ -1528,9 +1996,12 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         add(L"批量取下", kMenuBatch);
         main[n - 1].submenu = batch;
         main[n - 1].submenu_count = 4;
-        add(L"", 0, SNOWAIR_MENU_SEPARATOR);
-        /* 便签记录归轻雪：没有「销毁」这一项，取下卡片记录仍在剪切板历史里。 */
-        if (!noteItem) add(L"移至回收站", kMenuRecycle);
+        /* 便签记录归轻雪：没有「销毁」这一项；没有这一项时也不要留一条
+           多余的分隔线。 */
+        if (!noteItem) {
+            add(L"", 0, SNOWAIR_MENU_SEPARATOR);
+            add(L"移至回收站", kMenuRecycle);
+        }
 
         menuIndex_ = index;
         plugin_->host()->show_menu(plugin_->host()->user, main, n, screen.x, screen.y,
@@ -1553,13 +2024,16 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
     };
 
     action(L"打开", kMenuOpen);
+    if (textLike || accentable) action(L"编辑", kMenuEdit);
     action(L"另存为…", kMenuSaveAs);
     if (!noteItem) action(L"打开位置", kMenuShowInFolder);
     separator();
     action(L"取下内容", kMenuRemove);
     action(L"批量取下  ›", kMenuBatch);
-    separator();
-    if (!noteItem) action(L"移至回收站", kMenuRecycle);
+    if (!noteItem) {
+        separator();
+        action(L"移至回收站", kMenuRecycle);
+    }
 
     const bool menuDark = plugin_->host() && plugin_->host()->is_dark
                               ? plugin_->host()->is_dark(plugin_->host()->user) != 0
@@ -1568,14 +2042,20 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
     const POINT menuPoint = screen;
     menu_.Show(items, screen, workArea_, scale_, Theme::MenuStyle(menuDark),
                [this, index, menuPoint](int command) {
+                   menuActionPending_ = true;
                    if (command == kMenuBatch) {
                        this->menu_.Close();
                        this->ShowBatchMenu(index, menuPoint);
                    } else {
                        this->HandleMenuCommand(index, command);
                    }
+                   menuActionPending_ = false;
                },
-               [this]() { menuOpen_ = false; });
+               [this]() {
+                   menuOpen_ = false;
+                   lastInside_ = rack::NowMs();
+                   menuCloseGraceUntil_ = lastInside_ + 500;
+               });
     if (!menu_.showing()) {
         menuOpen_ = false;
     }
@@ -1585,7 +2065,9 @@ void RackWindow::MenuSelected(void* user, int id)
 {
     auto* window = static_cast<RackWindow*>(user);
     if (window) {
+        window->menuActionPending_ = true;
         window->HandleMenuCommand(window->menuIndex_, id);
+        window->menuActionPending_ = false;
     }
 }
 
@@ -1613,8 +2095,16 @@ void RackWindow::ShowBatchMenu(int index, POINT screen)
                               : plugin_->theme().dark;
     menuOpen_ = true;
     batchMenu_.Show(items, screen, workArea_, scale_, Theme::MenuStyle(menuDark),
-                    [this, index](int command) { HandleMenuCommand(index, command); },
-                    [this]() { menuOpen_ = false; });
+                    [this, index](int command) {
+                        menuActionPending_ = true;
+                        HandleMenuCommand(index, command);
+                        menuActionPending_ = false;
+                    },
+                    [this]() {
+                        menuOpen_ = false;
+                        lastInside_ = rack::NowMs();
+                        menuCloseGraceUntil_ = lastInside_ + 500;
+                    });
     if (!batchMenu_.showing()) {
         menuOpen_ = false;
     }
@@ -1644,8 +2134,16 @@ void RackWindow::ShowGeneralMenu(POINT screen)
                               ? plugin_->host()->is_dark(plugin_->host()->user) != 0
                               : (plugin_ ? plugin_->theme().dark : false);
     menu_.Show(items, screen, workArea_, scale_, Theme::MenuStyle(menuDark),
-               [this](int command) { HandleMenuCommand(-1, command); },
-               [this]() { menuOpen_ = false; });
+               [this](int command) {
+                   menuActionPending_ = true;
+                   HandleMenuCommand(-1, command);
+                   menuActionPending_ = false;
+               },
+               [this]() {
+                   menuOpen_ = false;
+                   lastInside_ = rack::NowMs();
+                   menuCloseGraceUntil_ = lastInside_ + 500;
+               });
     if (!menu_.showing()) {
         menuOpen_ = false;
     }
@@ -1676,9 +2174,22 @@ void RackWindow::HandleMenuCommand(int index, int command)
 
     const Item& menuItem = plugin_->items()[index];
     const bool noteItem = menuItem.path.empty() && !menuItem.note.empty();
+    const bool textLike = menuItem.cardType == card::Type::Note ||
+                          menuItem.cardType == card::Type::Text ||
+                          menuItem.cardType == card::Type::Link ||
+                          menuItem.cardType == card::Type::Color;
     if (command == kMenuOpen) {
-        if (noteItem) EditNote(index);
-        else OpenItem(index);
+        if (menuItem.cardType == card::Type::Link) {
+            OpenCardLink(index);
+        } else if (textLike) {
+            QueueEditNote(index);
+        } else {
+            OpenItem(index);
+        }
+    } else if (command == kMenuEdit) {
+        QueueEditNote(index);
+    } else if (command == kMenuEditColor) {
+        PickCardColor(index);
     } else if (command == kMenuSaveAs) {
         SaveItemAs(index);
     } else if (command == kMenuShowInFolder) {
@@ -1714,7 +2225,7 @@ void RackWindow::HandleMenuCommand(int index, int command)
     } else if (command == kMenuEditPaint) {
         EditItemInPaint(index);
     } else if (command == kMenuNote) {
-        EditNote(index);
+        QueueEditNote(index);
     } else if (command >= kMenuColorBase && command <= kMenuColorBase + 2) {
         SetNoteColor(index, static_cast<int>(command - kMenuColorBase));
     }
@@ -1811,6 +2322,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         case kTimerCopyToast:
             KillTimer(hwnd(), kTimerCopyToast);
             view_.ClearCopyToast();
+            view_.ClearColorFlash();
             Render();
             return 0;
         case kTimerFakeCursor:
@@ -1835,10 +2347,30 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         case kTimerEditWatch:
             CheckEditing();
             return 0;
+        case kTimerEditStart: {
+            KillTimer(hwnd(), kTimerEditStart);
+            const int index = pendingEditIndex_;
+            pendingEditIndex_ = -1;
+            if (index >= 0) {
+                EditNote(index);
+            }
+            return 0;
+        }
         default:
             break;
         }
         break;
+
+    case kMsgRackRightClick: {
+        /* 低层鼠标钩子在右键落到桌面之前先截住，避免偶发穿透。 */
+        const int index = static_cast<int>(wParam);
+        if (plugin_ && !menuOpen_ && index >= 0 &&
+            index < static_cast<int>(plugin_->items().size())) {
+            const POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ShowItemMenu(index, screen);
+        }
+        return 0;
+    }
 
     case kMsgTopBarClick:
         /* 顶栏被点了一下：用户已经用完，立即收回。
@@ -1849,26 +2381,64 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         }
         return 0;
 
+    case kMsgColorWheel: {
+        /* 低层鼠标钩子把滚轮从「前台窗口」抢过来：颜色卡数量超过 3 个时，
+           指针放在卡上就能滚动查看。 */
+        const RackHit hit = HitAtCursor();
+        if ((hit.part == RackPart::Card || hit.part == RackPart::CardColor) &&
+            ScrollColorCard(hit.index, static_cast<int>(wParam))) {
+            return 0;
+        }
+        return 0;
+    }
+
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+
+    case WM_NCHITTEST: {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd(), &point);
+        if (expand_ < 0.05f) {
+            return HTTRANSPARENT;
+        }
+        /* 卡片/夹子范围先按轴对齐包围盒兜底：命中测试受旋转、动画和空隙影响，
+           偶尔会把卡片上的点判成 None，右键就漏到桌面。 */
+        const float px = static_cast<float>(point.x);
+        const float py = static_cast<float>(point.y);
+        const float pad = 10.0f * scale_;
+        for (int i = 0;; ++i) {
+            const CardBox* box = view_.CardAt(i);
+            if (!box) break;
+            if (px >= box->card.left - pad && px <= box->card.right + pad &&
+                py >= box->pinTop - pad && py <= box->card.bottom + pad) {
+                return HTCLIENT;
+            }
+        }
+        const RackHit hit = view_.HitTest(px, py, scale_);
+        if (hit.part == RackPart::None || hit.part == RackPart::Background) {
+            return HTTRANSPARENT;
+        }
+        return HTCLIENT;
+    }
 
     case WM_SETCURSOR: {
         const RackHit hit = HitAtCursor();
         /* 只有真正能点的东西才给手型：绳子本身只是装饰。
            便签的夹子点了没任何效果，也不给点击提示（光标保持箭头）。 */
-        bool clickable = hit.part == RackPart::Card || hit.part == RackPart::Note ||
-                         hit.part == RackPart::Close || hit.part == RackPart::Lock ||
-                         hit.part == RackPart::Basket || hit.part == RackPart::Envelope;
+        /* 卡片本体用普通箭头；只有链接正文、颜色块和真正的按钮给手型。 */
+        bool clickable = hit.part == RackPart::Close || hit.part == RackPart::Lock ||
+                         hit.part == RackPart::Basket || hit.part == RackPart::Envelope ||
+                         hit.part == RackPart::CardLink || hit.part == RackPart::CardColor;
         if (hit.part == RackPart::Clip && plugin_ && hit.index >= 0 &&
             hit.index < static_cast<int>(plugin_->items().size())) {
             const Item& item = plugin_->items()[static_cast<size_t>(hit.index)];
-            clickable = item.kind == 0 && !item.path.empty();
+            clickable = CanPinItem(item);
         }
         if (clickable) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
-        /* 落在窗口上但不可点：明确给箭头，别让下层窗口的光标透上来。 */
+        /* 落在窗口上但不可点：明确返回箭头，避免下层窗口的光标透出。 */
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         return TRUE;
     }
@@ -1909,13 +2479,16 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             plugin_->OpenClipboard(screen.x, screen.y);
             return 0;
         }
-        if (hit.part == RackPart::Card || hit.part == RackPart::Note) {
+        if (hit.part == RackPart::Card || hit.part == RackPart::Note ||
+            hit.part == RackPart::CardLink || hit.part == RackPart::CardColor) {
             if (hit.index < 0 || hit.index >= static_cast<int>(plugin_->items().size())) {
                 return 0;
             }
             pressed_ = hit.index;
             pressItemId_ = plugin_->items()[hit.index].id;
             pressedPart_ = hit.part;
+            pressColorIndex_ = hit.colorIndex;
+            pressColorPart_ = hit.colorPart;
             mouseDown_ = true;
             dragStarted_ = false;
             longPressFired_ = false;
@@ -1958,19 +2531,14 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
-        const Item* heldItem = plugin_->ItemById(pressItemId_);
-        const bool locked = heldItem && heldItem->locked;
-        /* 方向判定：横向为主才算「沿绳子移动」，纵向为主才算「拖出去」。
-           斜着拖动时先等方向明确，避免想拖出去却变成移动卡片。 */
+        /* 横向为主 = 沿绳子移动并重排；纵向为主 = 拖出去。
+           颜色行（色块/hex/rgb）单独处理成单色拖出，不参与整卡重排。 */
         const float horizontalRun = static_cast<float>(dx);
         const float verticalRun = static_cast<float>(dy);
         const bool horizontalDominant =
             horizontalRun > 12.0f * scale_ && horizontalRun >= verticalRun * 1.3f;
-        const bool verticalDominant =
-            verticalRun > 20.0f * scale_ && verticalRun > horizontalRun * 1.3f;
-        if (pressedPart_ == RackPart::Card && !cardDragging_ &&
-            (horizontalDominant || (locked && (horizontalRun > 4.0f * scale_ ||
-                                               verticalRun > 6.0f * scale_)))) {
+        const bool cardPress = pressedPart_ == RackPart::Card;
+        if (cardPress && horizontalDominant) {
             cardDragging_ = true;
             KillTimer(hwnd(), kTimerLongPress);
         }
@@ -1988,8 +2556,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                     item->rackOffsetX = desired;
                 }
             }
-            // 合并鼠标移动引发的重绘。全宽分层窗口按原始 125-1000Hz 重绘，
-            // 正是卡片在绳子附近抖动的原因；12ms 已经跟得住指针了。
             const uint64_t paintNow = rack::NowMs();
             if (lastCardDragPaint_ == 0 || paintNow - lastCardDragPaint_ >= 12) {
                 lastCardDragPaint_ = paintNow;
@@ -1998,10 +2564,79 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             }
             return 0;
         }
+        if (cardPress && !horizontalDominant) {
+            /* 纵向为主：走下面的拖出流程；方向未定时先等。 */
+            const bool verticalDominant =
+                verticalRun > 20.0f * scale_ && verticalRun > horizontalRun * 1.3f;
+            if (!verticalDominant) return 0;
+        }
 
-        if (pressedPart_ == RackPart::Card && !verticalDominant && !locked) {
-            /* 方向还没定：先什么都不做，等用户明确往哪个方向拖。 */
-            return 0;
+        /* 从颜色行的色块/hex/rgb 拖出：只带这一个颜色，ghost 是纯色块卡。 */
+        if (pressedPart_ == RackPart::CardColor && pressColorIndex_ >= 0) {
+            const int index = plugin_->IndexById(pressItemId_);
+            if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
+                const Item& item = plugin_->items()[static_cast<size_t>(index)];
+                std::vector<card::Rgba> colors;
+                if (card::ParseColors(item.note, colors) &&
+                    pressColorIndex_ < static_cast<int>(colors.size())) {
+                    const card::Rgba color = colors[static_cast<size_t>(pressColorIndex_)];
+                    const std::wstring text = card::ColorDragText(color);
+                    mouseDown_ = false;
+                    dragStarted_ = true;
+                    SetDragTransparent(true);
+                    RECT returnBand{};
+                    if (const RECT work = MonitorWorkArea(monitor_); work.right > work.left) {
+                        float bottom = 200.0f * scale_;
+                        if (const CardBox* box = view_.Card(index)) {
+                            bottom = std::max(bottom, box->card.bottom + 24.0f * scale_);
+                        }
+                        returnBand.left = work.left;
+                        returnBand.top = work.top;
+                        returnBand.right = work.right;
+                        returnBand.bottom = work.top + static_cast<LONG>(std::lround(bottom));
+                    }
+                    pressed_ = -1;
+                    pressedPart_ = RackPart::None;
+                    ReleaseCapture();
+
+                    bool dropped = false;
+                    dragdrop::DragOutcome outcome;
+                    view_.SetDragging(index);
+                    Render();
+                    const CardBox* dragBox = view_.Card(index);
+                    const int dragW = dragBox ? static_cast<int>(dragBox->card.right -
+                                                                 dragBox->card.left)
+                                              : static_cast<int>(150.0f * scale_);
+                    const int dragH = dragBox ? static_cast<int>(dragBox->card.bottom -
+                                                                 dragBox->card.top)
+                                              : static_cast<int>(150.0f * scale_);
+                    SIZE ghostSize{};
+                    HBITMAP ghost = view_.MakeColorGhost(color, dragW, dragH, &ghostSize);
+                    SetTimer(hwnd(), kTimerFakeCursor, 10, nullptr);
+                    const DWORD effect = dragdrop::BeginTextDrag(
+                        text, hwnd(), returnBand, ghost, ghostSize, dragW, dragH,
+                        4.0f * scale_, &dropped, &outcome, {}, true);
+                    KillTimer(hwnd(), kTimerFakeCursor);
+                    view_.SetDragging(-1);
+                    if (!outcome.cancelled && !outcome.returnedToRack) {
+                        clipboard::CopyText(text);
+                        POINT dropPoint{};
+                        GetCursorPos(&dropPoint);
+                        if (dragdrop::EditableAtPoint(dropPoint)) {
+                            ClickAt(dropPoint);
+                            Sleep(90);
+                        }
+                        SendPasteShortcut();
+                    } else if (outcome.returnedToRack) {
+                        ShakeCard(index);
+                    }
+                    if (effect == DROPEFFECT_NONE) Render();
+                    dragStarted_ = false;
+                    SetDragTransparent(false);
+                    Render();
+                    return 0;
+                }
+            }
         }
         KillTimer(hwnd(), kTimerLongPress);
         const int index = plugin_->IndexById(pressItemId_);
@@ -2042,8 +2677,32 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                SVG 的 ghost 仍是图片卡片，便签是便签卡片。 */
             const std::wstring svgText =
                 !dragItem.svgId.empty() ? plugin_->SvgText(index) : std::wstring();
-            const std::wstring dragText = svgText.empty() ? dragItem.note : svgText;
+            std::wstring dragText = svgText.empty() ? dragItem.note : svgText;
+            /* 单色卡拖整卡 = 该颜色；多色卡拖整卡仍是原文。 */
+            if (dragItem.cardType == card::Type::Color) {
+                std::vector<card::Rgba> colors;
+                if (card::ParseColors(dragItem.note, colors) && colors.size() == 1) {
+                    dragText = card::ColorDragText(colors.front());
+                }
+            }
             DWORD effect = DROPEFFECT_NONE;
+            const bool fileLike = dragItem.cardType == card::Type::File ||
+                                  dragItem.cardType == card::Type::Video ||
+                                  dragItem.cardType == card::Type::Music ||
+                                  dragItem.cardType == card::Type::Recording;
+            std::vector<std::wstring> dragFiles;
+            std::wstring fileDragText;
+            if (fileLike) {
+                dragFiles = dragItem.paths;
+                if (dragFiles.empty() && !dragItem.path.empty()) {
+                    dragFiles.push_back(dragItem.path);
+                }
+                for (size_t fi = 0; fi < dragFiles.size(); ++fi) {
+                    if (fi > 0) fileDragText += L'\n';
+                    fileDragText += dragFiles[fi];
+                }
+                if (fileDragText.empty()) fileDragText = dragItem.label;
+            }
             if (!dragText.empty()) {
                 SIZE ghostSize{};
                 /* 先让 view 画和绳子上完全一致的卡片 ghost；失败再用 PNG 预览兜底。 */
@@ -2055,6 +2714,14 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                                                  dragH, 4.0f * scale_, &dropped, &outcome, previewPath,
                                                  true);
                 KillTimer(hwnd(), kTimerFakeCursor);
+            } else if (fileLike && (!dragFiles.empty() || !fileDragText.empty())) {
+                /* 文件类：同时给 CF_HDROP 和完整路径文本，目标自己挑。
+                   纯文本框拿文本，上传区拿文件。 */
+                SIZE ghostSize{};
+                HBITMAP ghost = view_.MakeDragGhost(dragItem, dragW, dragH, &ghostSize);
+                effect = dragdrop::BeginTextDrag(
+                    fileDragText, hwnd(), returnBand, ghost, ghostSize, dragW, dragH,
+                    4.0f * scale_, &dropped, &outcome, {}, false, dragFiles);
             } else {
                 effect = dragdrop::BeginDrag(dragItem.path, hwnd(), returnBand, dragW, dragH, 4.0f * scale_,
                                             &dropped, &outcome);
@@ -2119,11 +2786,49 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                 const int index = plugin_->IndexById(pressItemId_);
                 if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
                     const Item& item = plugin_->items()[static_cast<size_t>(index)];
-                    if (item.kind == 0 && !item.path.empty()) {
-                        /* 卡片完全落下去之后再贴到桌面。 */
-                        pendingPinPath_ = item.path;
-                        pendingPinAt_ = rack::NowMs() + 560;
-                        RemoveItem(index, false);
+                    if (CanPinItem(item)) {
+                        PendingPin kind = PendingPin::None;
+                        pendingPinPath_.clear();
+                        pendingPinText_.clear();
+                        pendingPinPaths_.clear();
+                        if (const CardBox* box = view_.CardAt(index)) {
+                            POINT anchor{
+                                static_cast<LONG>((box->card.left + box->card.right) * 0.5f),
+                                static_cast<LONG>(box->card.bottom)};
+                            ClientToScreen(hwnd(), &anchor);
+                            pendingPinAnchor_ = anchor;
+                        } else {
+                            GetCursorPos(&pendingPinAnchor_);
+                            pendingPinAnchor_.y += 16;
+                        }
+                        if (item.kind == 0 && !item.path.empty()) {
+                            kind = PendingPin::Image;
+                            pendingPinPath_ = item.path;
+                        } else if (PinAsFiles(item)) {
+                            kind = PendingPin::Files;
+                            pendingPinPaths_ = item.paths;
+                            if (pendingPinPaths_.empty() && !item.path.empty()) {
+                                pendingPinPaths_.push_back(item.path);
+                            }
+                            if (pendingPinPaths_.empty()) kind = PendingPin::None;
+                        } else {
+                            pendingPinText_ = PinTextForItem(item);
+                            if (!pendingPinText_.empty()) {
+                                kind = PendingPin::Text;
+                            } else if (!item.path.empty()) {
+                                kind = PendingPin::Files;
+                                pendingPinPaths_.push_back(item.path);
+                            }
+                        }
+                        if (kind != PendingPin::None) {
+                            /* 图片离卡片近一点，文字/文件保持更远的正下方。 */
+                            const float gap = kind == PendingPin::Image ? 130.0f : 200.0f;
+                            pendingPinAnchor_.y += static_cast<LONG>(gap * scale_);
+                            /* 卡片完全落下去之后再贴到桌面；和图片夹子同一套节奏。 */
+                            pendingPinKind_ = kind;
+                            pendingPinAt_ = rack::NowMs() + 560;
+                            RemoveItem(index, false);
+                        }
                     }
                 }
             }
@@ -2159,7 +2864,11 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                 const int index = plugin_->IndexById(pressItemId_);
                 if (index >= 0 && hit.index == index) {
                     if (hit.part == RackPart::Note) {
-                        EditNote(index);
+                        QueueEditNote(index);
+                    } else if (hit.part == RackPart::CardLink) {
+                        OpenCardLink(index);
+                    } else if (hit.part == RackPart::CardColor) {
+                        CopyCardColor(index, hit.colorIndex, hit.colorPart);
                     } else if (hit.part == RackPart::Card) {
                         clickItemId_ = pressItemId_;
                         SetTimer(hwnd(), kTimerClick, GetDoubleClickTime() + 30, nullptr);
@@ -2182,15 +2891,36 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const RackHit hit = view_.HitTest(static_cast<float>(point.x),
                                           static_cast<float>(point.y), scale_);
-        if (hit.part == RackPart::Card && hit.index >= 0 &&
-            hit.index < static_cast<int>(plugin_->items().size())) {
-            /* 双击与右键“打开”走同一条命令：便签进编辑器，图片/文件交给 shell。 */
-            HandleMenuCommand(hit.index, kMenuOpen);
+        if (hit.index >= 0 && hit.index < static_cast<int>(plugin_->items().size())) {
+            if (hit.part == RackPart::CardLink) {
+                OpenCardLink(hit.index);
+            } else if (hit.part == RackPart::Card || hit.part == RackPart::CardColor) {
+                /* 双击与右键“打开”走同一条命令：文字类进编辑器，链接开浏览器，
+                   图片/文件交给 shell。 */
+                HandleMenuCommand(hit.index, kMenuOpen);
+            }
         }
         return 0;
     }
 
+    case WM_RBUTTONDOWN:
+        if (hwnd()) SetCapture(hwnd());
+        return 0;
+
+    case WM_RBUTTONDBLCLK:
+        return 0;
+
+    /* 右键在卡片上打开自己的菜单后，不要让同一次右键继续落到桌面，
+       否则会出现桌面的右键菜单。 */
+    case WM_CONTEXTMENU:
+        return 0;
+
+    case WM_NCRBUTTONDOWN:
+    case WM_NCRBUTTONUP:
+        return 0;
+
     case WM_RBUTTONUP: {
+        if (hwnd()) ReleaseCapture();
         if (!plugin_) {
             return 0;
         }
@@ -2206,12 +2936,18 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        const RackHit hit = HitAtCursor();
+        if ((hit.part == RackPart::Card || hit.part == RackPart::CardColor) &&
+            ScrollColorCard(hit.index, GET_WHEEL_DELTA_WPARAM(wParam))) {
+            return 0;
+        }
         if (preview_.showing() && preview_.hwnd()) {
             SendMessageW(preview_.hwnd(), WM_MOUSEWHEEL, wParam, lParam);
             return 0;
         }
         return 0;
+    }
 
     case WM_CAPTURECHANGED:
         if (mouseDown_ && GetCapture() != hwnd()) {

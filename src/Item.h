@@ -1,13 +1,18 @@
 #pragma once
 
+#include "CardType.h"
 #include "Common.h"
 #include "Image.h"
 
 struct Item {
     int id = 0;
-    /* 0=图片, 1=便签(纯文字), 2=录屏, 3=其他文件 */
+    /* 0=图片, 1=文字类(便签/文本/链接/颜色), 2=录屏, 3=文件类 */
     int kind = 0;
-    std::wstring path;        /* file used for copy/open/drag */
+    /* 卡片实际形态；旧数据由 kind/path/thumb 推断。 */
+    card::Type cardType = card::Type::Image;
+    std::wstring path;        /* file used for copy/open/drag (first file) */
+    /* 多文件条目：全部文件路径，path 始终等于 paths.front()。 */
+    std::vector<std::wstring> paths;
     std::wstring sourcePath;  /* original SnowAir capture */
     std::wstring thumbPath;   /* 录屏封面（可为空） */
     /* SVG 卡片：path 是轻雪渲染的 PNG 预览，svgId 是轻雪剪切板记录的 id；
@@ -21,6 +26,13 @@ struct Item {
     std::wstring noteId;
     std::wstring note;
     int noteColor = 0;
+    /* 卡片创建时间（毫秒），头部第二行显示月-日 时:分。 */
+    long long createdAt = 0;
+    /* 每张卡自己的强调色；accentSet=false 时用 cardType 的默认色。 */
+    uint32_t accent = 0;
+    bool accentSet = false;
+    /* 颜色卡滚轮位置（运行时状态，不持久化）。 */
+    float colorScroll = 0.0f;
     float aspect = 1.0f;
     float rackOffsetX = 0.0f;   /* user-dragged position along the rope */
     bool locked = false;        /* locked cards can be moved but not dragged out */

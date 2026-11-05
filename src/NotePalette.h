@@ -44,20 +44,32 @@ inline NotePalette NotePaletteFor(int color, bool dark)
  */
 inline D2D1_COLOR_F NotePaperTop()
 {
-    return D2D1::ColorF(0xF4D476);
+    /* F3CD5F 以 30% 叠在白底上。 */
+    return D2D1::ColorF(0xFBF0CF);
 }
 
 inline D2D1_COLOR_F NotePaperBottom()
 {
-    return D2D1::ColorF(0xF7E3A7);
+    return D2D1::ColorF(0xFBF0CF);
+}
+
+inline D2D1_COLOR_F NotePaperHeader()
+{
+    return D2D1::ColorF(0xF3CD5F);
+}
+
+inline D2D1_COLOR_F NotePaperTitle()
+{
+    return D2D1::ColorF(0xFFFFFF);
 }
 
 inline D2D1_COLOR_F NotePaperEdge()
 {
-    return D2D1::ColorF(0xE0C97E);
+    return D2D1::ColorF(0xE9D094);
 }
 
 inline D2D1_COLOR_F NotePaperInk()
 {
-    return D2D1::ColorF(0x5A462A);
+    /* 便签正文跟普通卡片正文同色；只有深色纸面时才反白。 */
+    return D2D1::ColorF(0x515151);
 }

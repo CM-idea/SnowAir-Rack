@@ -1,4 +1,4 @@
 #pragma once
 
-#define SA_RACK_VERSION L"0.1.3"
-#define SA_RACK_VERSION_NUM 0, 1, 3, 0
+#define SA_RACK_VERSION L"0.1.4"
+#define SA_RACK_VERSION_NUM 0, 1, 4, 0

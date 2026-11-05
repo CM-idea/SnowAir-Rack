@@ -182,6 +182,11 @@ typedef struct SnowAirHost {
     int  (*entry_count)(void* user);
     void (*entry_refresh)(void* user);
     int  (*entry_get)(void* user, int index, SnowAirEntry* entry);
+    /*
+     * 可选：宿主 exe 导出的 SnowAirEntryPaths(user, index, out, capacity)。
+     * 返回 '\n' 分隔的全部文件路径字符数；旧宿主没有该导出，插件回退到 path。
+     * 这样多文件不需要改 SnowAirEntry 的大小，旧插件/旧宿主都安全。
+     */
     void (*entry_copy)(void* user, int index);
     int  (*entry_hang)(void* user, int index);      /* 1 = hung on the rack */
     void (*entry_delete)(void* user, int index);    /* deletes history record too */

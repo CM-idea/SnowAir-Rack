@@ -32,7 +32,8 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
                     SIZE ghostSize,
                     int cardWidth, int cardHeight, float frameWidth, bool* dropped,
                     DragOutcome* outcome, const std::wstring& previewPath = std::wstring(),
-                    bool pasteOnly = false);
+                    bool pasteOnly = false,
+                    const std::vector<std::wstring>& files = {});
 
 /* 拖拽期间统一设置「箭头 + 复制框」光标。 */
 void SetDragCursor();

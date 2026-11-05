@@ -22,6 +22,8 @@ struct Theme {
     int index = 0;
 
     void Load(const SnowAirHost* host, void* user);
+    /* 弹窗取消按钮的统一底色（普通/悬停），编辑卡片和信封弹窗复用。 */
+    D2D1_COLOR_F PopupCancelBg(bool hover) const;
     static Theme Fallback(bool dark);
     static Theme RackTheme(int index);
     static Theme MenuStyle(bool dark);

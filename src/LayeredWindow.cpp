@@ -208,18 +208,36 @@ void LayeredWindow::Render()
         return;
     }
 
-    if (supersample_ && width_ * 2 <= 8192 && height_ * 2 <= 8192) {
+    if (supersample_) {
         if (!hiTarget_ || hiWidth_ != width_ || hiHeight_ != height_) {
             hiTarget_.Reset();
-            const HRESULT createHr = target_->CreateCompatibleRenderTarget(
-                D2D1::SizeF(static_cast<float>(width_), static_cast<float>(height_)),
-                hiTarget_.GetAddressOf());
-            if (SUCCEEDED(createHr) && hiTarget_) {
+            hiScale_ = 1.0f;
+            /* 不同 D2D 软件目标的上限不一样；2x 建不出来就退 1.5x/1.25x。
+               位图按 width*scale 建，DPI 也乘同样的 scale，这样 DIP 尺寸
+               始终是 width×height，Paint 用原坐标，不会再放大画面。 */
+            /* 3x/4x 再用双线性缩回会只采样 2x2，反而更锐、更闪；
+               2x 双线性正好 2x2，配合 cubic 缩回最稳。 */
+            static const float kFactors[] = {2.0f, 1.5f, 1.25f};
+            for (float factor : kFactors) {
+                const float hiW = static_cast<float>(width_) * factor;
+                const float hiH = static_cast<float>(height_) * factor;
+                if (hiW > 8192.0f || hiH > 8192.0f) {
+                    continue;
+                }
+                const HRESULT createHr = target_->CreateCompatibleRenderTarget(
+                    D2D1::SizeF(hiW, hiH), hiTarget_.GetAddressOf());
+                if (createHr != S_OK || !hiTarget_) {
+                    hiTarget_.Reset();
+                    continue;
+                }
                 hiWidth_ = width_;
                 hiHeight_ = height_;
-                hiTarget_->SetDpi(192.0f, 192.0f);
+                hiScale_ = factor;
+                hiTarget_->SetDpi(96.0f * factor, 96.0f * factor);
                 hiTarget_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 hiTarget_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                RackLog(L"LayeredWindow: supersample %dx%d x%.2f", width_, height_, factor);
+                break;
             }
         }
         if (hiTarget_) {
@@ -235,11 +253,13 @@ void LayeredWindow::Render()
                     target_->BeginDraw();
                     target_->SetTransform(D2D1::Matrix3x2F::Identity());
                     target_->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
-                    target_->SetTransform(D2D1::Matrix3x2F::Scale(0.5f, 0.5f));
+                    target_->SetTransform(D2D1::Matrix3x2F::Scale(1.0f / hiScale_,
+                                                                 1.0f / hiScale_));
                     target_->DrawBitmap(
                         bitmap.Get(),
-                        D2D1::RectF(0.0f, 0.0f, static_cast<float>(width_ * 2),
-                                    static_cast<float>(height_ * 2)),
+                        D2D1::RectF(0.0f, 0.0f,
+                                    static_cast<float>(width_) * hiScale_,
+                                    static_cast<float>(height_) * hiScale_),
                         1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     hr = target_->EndDraw();
                     if (SUCCEEDED(hr)) {

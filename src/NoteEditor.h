@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CardType.h"
 #include "Common.h"
 #include "LayeredWindow.h"
 #include "Theme.h"
@@ -22,6 +23,17 @@ class Graphics;
  */
 class NoteEditor : public LayeredWindow {
 public:
+    /* 打开动画第一帧要盖住的那张卡片长什么样：便签纸 / 文字卡 / 截图旁的小纸条。 */
+    struct CardLook {
+        card::Type type = card::Type::Note;
+        uint32_t accent = 0;
+        bool accentSet = false;
+        long long createdAt = 0;
+        float cardScale = 1.0f; /* 晾衣架的小/中/大；开场第一帧字号要跟它一致 */
+        bool colorMode = false;  /* 显示强调色色板 */
+        bool readOnly = false;   /* 文件卡：只显示文字，不编辑正文 */
+    };
+
     /*
      * 打开模态编辑器，返回 true 表示用户点了“完成”。
      * `anchor` 是被编辑便签卡片的屏幕矩形：打开从这里开始，收回也返回这里。
@@ -32,7 +44,9 @@ public:
                      const std::wstring& initial, std::wstring& text,
                      std::function<void()> onShown = nullptr,
                      std::function<void(const RECT&)> onClosed = nullptr,
-                     std::function<void()> onLanded = nullptr);
+                     std::function<void()> onLanded = nullptr,
+                     const CardLook& look = CardLook{},
+                     std::function<void(uint32_t)> onAccent = nullptr);
 
 protected:
     void Paint(ID2D1RenderTarget* target) override;
@@ -45,6 +59,8 @@ private:
         D2D1_RECT_F title{};
         D2D1_RECT_F close{};
         D2D1_RECT_F field{};
+        D2D1_RECT_F editArea{};
+        D2D1_RECT_F swatches[9]{};
         D2D1_RECT_F hint{};
         D2D1_RECT_F cancel{};
         D2D1_RECT_F save{};
@@ -61,6 +77,9 @@ private:
     IDWriteTextFormat* MorphFormat(float size);
     Layout Measure() const;
     Hot HitTest(float x, float y) const;
+    int SwatchAt(float x, float y) const;
+    uint32_t EditColorValue() const;
+    void SetEditColor(uint32_t rgb);
     std::wstring EditText() const;
     void Finish(bool accepted);
     void CompleteFinish();
@@ -71,6 +90,7 @@ private:
     static LRESULT CALLBACK EditThunk(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     Theme theme_{};
+    CardLook look_;
     std::wstring title_;
     std::wstring initial_;
     std::wstring result_;
@@ -88,10 +108,12 @@ private:
     float formatScale_ = 0.0f;
     Hot hot_ = Hot::None;
     Hot pressed_ = Hot::None;
+    int pressedSwatch_ = -1;
     bool done_ = false;
     bool accepted_ = false;
     std::function<void(const RECT&)> onClosed_;
     std::function<void()> onLanded_;
+    std::function<void(uint32_t)> onAccent_;
     bool morphing_ = false;
     bool closing_ = false;
     bool pendingAccepted_ = false;
@@ -114,6 +136,9 @@ private:
     ComPtr<IDWriteTextFormat> titleFormat_;
     ComPtr<IDWriteTextFormat> hintFormat_;
     ComPtr<IDWriteTextFormat> buttonFormat_;
+    /* 开场第一帧的卡片头：和 RackView 的 12/8.5 对齐。 */
+    ComPtr<IDWriteTextFormat> cardTitleFormat_;
+    ComPtr<IDWriteTextFormat> cardMetaFormat_;
     /* 收回动画里正文要连续缩放，字号是插值出来的，单独缓存一个 format。 */
     ComPtr<IDWriteTextFormat> morphFormat_;
     float morphFormatSize_ = -1.0f;

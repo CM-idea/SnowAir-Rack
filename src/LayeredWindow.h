@@ -79,6 +79,7 @@ private:
     ComPtr<ID2D1BitmapRenderTarget> hiTarget_;
     int hiWidth_ = 0;
     int hiHeight_ = 0;
+    float hiScale_ = 1.0f;
     bool supersample_ = false;
     bool classRegistered_ = false;
     POINT presentAt_{};

@@ -5,6 +5,14 @@ namespace {
 
 } /* namespace */
 
+D2D1_COLOR_F Theme::PopupCancelBg(bool hover) const
+{
+    if (hover) {
+        return dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xD4D4D4);
+    }
+    return card;
+}
+
 Theme Theme::Fallback(bool dark)
 {
     Theme theme;

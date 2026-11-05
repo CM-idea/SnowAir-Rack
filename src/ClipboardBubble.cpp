@@ -13,6 +13,20 @@
 
 namespace {
 
+/* 可选宿主导出：多文件条目返回 '\n' 分隔的全部路径。旧宿主没有就回退单 path。 */
+using EntryPathsFn = int (*)(void* user, int index, wchar_t* out, int capacity);
+
+EntryPathsFn HostEntryPaths()
+{
+    static EntryPathsFn fn = []() -> EntryPathsFn {
+        HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<EntryPathsFn>(
+                          GetProcAddress(host, "SnowAirEntryPaths"))
+                    : nullptr;
+    }();
+    return fn;
+}
+
 constexpr float kBubbleW = 380.0f;
 constexpr float kArrowH = 9.0f;
 constexpr float kPad = 12.0f;
@@ -332,6 +346,13 @@ void ClipboardBubble::LoadEntries()
         entry.hostIndex = i;
         entry.label = raw.label;
         entry.path = raw.path;
+        if (auto pathsFn = HostEntryPaths()) {
+            std::vector<wchar_t> paths(16384, L'\0');
+            const int length = pathsFn(host_->user, i, paths.data(),
+                                       static_cast<int>(paths.size()));
+            if (length > 0) entry.paths = SplitLines(paths.data());
+        }
+        if (entry.paths.empty() && !entry.path.empty()) entry.paths.push_back(entry.path);
         entry.thumb = raw.thumb;
         entry.kind = raw.kind;
         entry.source = raw.source;
@@ -1648,7 +1669,7 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
          b.contentBorder);
     make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xF5F4F4), b.chipBg);
     /* 搜索框是主输入区，比面板明显一档；右侧 +/齿轮是辅助按钮，浅色下压到接近面板。 */
-    make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xEDEDED), b.searchBg);
+    make(theme_.dark ? util::Rgb(0x1A1A1A) : util::Rgb(0xF5F4F4), b.searchBg);
     make(theme_.dark ? util::Rgb(0x3A3A3A) : util::Rgb(0xF5F4F4), b.iconBg);
     make(theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xE5E5E5), b.iconHover);
     /* 分类设置处于选中态时常驻一个更明显的底，图标同时变绿。 */
@@ -2179,8 +2200,6 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
         const float radius = 16.0f * s;
         target->FillRoundedRectangle(D2D1::RoundedRect(card, radius, radius),
                                      b.modalCard.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(card, radius, radius),
-                                     b.modalBorder.Get(), 1.0f * s);
     };
 
     if (noteEditorOpen_) {
@@ -2195,15 +2214,10 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
         target->FillRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
-                                     b.modalCard.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
-                                     b.modalBorder.Get(), 1.0f * s);
+                                     b.searchBg.Get());
         target->FillRoundedRectangle(
             D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
             hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
-        target->DrawRoundedRectangle(
-            D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s), b.modalBorder.Get(),
-            1.0f * s);
         target->FillRoundedRectangle(
             D2D1::RoundedRect(layout.save, 6.0f * s, 6.0f * s),
             hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
@@ -2289,14 +2303,10 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
                                                top + 86.0f * s, ok.left - 8.0f * s,
                                                top + 116.0f * s);
         target->FillRoundedRectangle(D2D1::RoundedRect(field, 6.0f * s, 6.0f * s),
-                                     b.modalCard.Get());
-        target->DrawRoundedRectangle(D2D1::RoundedRect(field, 6.0f * s, 6.0f * s),
-                                     b.modalBorder.Get(), 1.0f * s);
+                                     b.searchBg.Get());
         target->FillRoundedRectangle(
             D2D1::RoundedRect(cancel, 6.0f * s, 6.0f * s),
             hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
-        target->DrawRoundedRectangle(
-            D2D1::RoundedRect(cancel, 6.0f * s, 6.0f * s), b.modalBorder.Get(), 1.0f * s);
         target->FillRoundedRectangle(
             D2D1::RoundedRect(ok, 6.0f * s, 6.0f * s),
             hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
@@ -2344,9 +2354,7 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
 
     /* 内联输入框：标签 chip 与输入光标共用一条流；输入框本体由 modalEdit_ 覆盖。 */
     target->FillRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
-                                 b.modalCard.Get());
-    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.field, 6.0f * s, 6.0f * s),
-                                 b.modalBorder.Get(), 1.0f * s);
+                                 b.searchBg.Get());
     for (const auto& c : layout.tagChips) {
         const D2D1_ROUNDED_RECT rounded = D2D1::RoundedRect(c.rect, 4.0f * s, 4.0f * s);
         target->FillRoundedRectangle(rounded, b.tagBg.Get());
@@ -2356,8 +2364,6 @@ void ClipboardBubble::PaintModals(ID2D1RenderTarget* target, const Brushes& b)
     target->FillRoundedRectangle(
         D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
         hoveredModalButton_ == 1 ? b.tagHover.Get() : b.card.Get());
-    target->DrawRoundedRectangle(D2D1::RoundedRect(layout.cancel, 6.0f * s, 6.0f * s),
-                                 b.modalBorder.Get(), 1.0f * s);
     target->FillRoundedRectangle(
         D2D1::RoundedRect(layout.save, 6.0f * s, 6.0f * s),
         hoveredModalButton_ == 2 ? b.primaryHover.Get() : b.primary.Get());
@@ -3125,9 +3131,9 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                                  static_cast<BYTE>(theme_.fg.g * 255.0f),
                                  static_cast<BYTE>(theme_.fg.b * 255.0f)));
             const bool modalField = (source == modalEdit_ || source == noteEdit_);
-            const D2D1_COLOR_F fill = modalField
-                                          ? (theme_.dark ? util::Rgb(0x262626) : util::Rgb(0xFFFFFF))
-                                          : (theme_.dark ? util::Rgb(0x4A4A4A) : util::Rgb(0xEDEDED));
+            const D2D1_COLOR_F fill =
+                theme_.dark ? util::Rgb(0x1A1A1A) : util::Rgb(0xF5F4F4);
+            (void)modalField;
             const COLORREF bg = RGB(static_cast<BYTE>(fill.r * 255.0f),
                                     static_cast<BYTE>(fill.g * 255.0f),
                                     static_cast<BYTE>(fill.b * 255.0f));
@@ -3370,8 +3376,11 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                                     entryId = id;
                                 }
                             }
+                            const bool isNote =
+                                std::find(entry.tags.begin(), entry.tags.end(), L"便签") !=
+                                entry.tags.end();
                             onHangEntry_(entry.kind, entry.label, entry.path, entry.thumb,
-                                         entryId);
+                                         entryId, entry.createdAt, entry.paths, isNote);
                             Close();
                         } else if (entry.kind == SNOWAIR_ENTRY_TEXT && onHangText_) {
                             onHangText_(entry.label);

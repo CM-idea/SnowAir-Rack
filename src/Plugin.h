@@ -22,6 +22,9 @@ public:
 
     void OnCapture(const wchar_t* path);
     void OnQuickHang(const wchar_t* path);
+    /* 快速贴屏接管：文本 / 文件或文件夹都直接上绳；图片仍走 OnQuickHang。 */
+    bool QuickHang(int kind, const std::wstring& text,
+                   const std::vector<std::wstring>& paths);
     void OnHangText(const std::wstring& text);
     void OnHangImage(const std::wstring& path, const std::wstring& svgId = std::wstring());
     /* SVG 卡片：按轻雪记录 id 取回代码，复制/拖拽用；取不到返回空。 */
@@ -30,10 +33,19 @@ public:
     bool CopyCardText(int index);
     /* 统一上绳：kind = SNOWAIR_ENTRY_*；entryId 只在文本条目上有值（轻雪的记录 id）。 */
     void OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
-                     const std::wstring& thumb, const std::wstring& entryId);
+                     const std::wstring& thumb, const std::wstring& entryId, long long createdAt,
+                     const std::vector<std::wstring>& paths, bool isNote);
+    /* 仅供 HostSim 预览用的入口：直接挂一张文字/文件卡。 */
+    void DebugHangText(const std::wstring& text, bool note);
+    void DebugHangFile(const std::wstring& path);
     /* 点击图片卡片的夹子：把图片贴到桌面。 */
-    void PinItemToDesktop(int index);
     void PinImageFile(const std::wstring& path);
+    void PinTextToDesktop(const std::wstring& text);
+    void PinFilesToDesktop(const std::vector<std::wstring>& paths);
+    /* 指定卡片正下方锚点（屏幕坐标：centerX / 卡片底边 y）。 */
+    void PinImageFileAt(const std::wstring& path, int centerX, int topY);
+    void PinTextToDesktopAt(const std::wstring& text, int centerX, int topY);
+    void PinFilesToDesktopAt(const std::vector<std::wstring>& paths, int centerX, int topY);
     void OnSettingChanged(const wchar_t* key);
     int SettingsCount() const;
     bool SettingsGet(int index, SnowAirSettingDesc* out) const;
@@ -85,7 +97,8 @@ private:
      * 轻雪剪切板历史里仍是一条带「便签」标签的普通文本。
      */
     void SyncNotes();
-    void AddNoteItem(const std::wstring& text, const std::wstring& noteId);
+    void AddNoteItem(const std::wstring& text, const std::wstring& noteId,
+                     card::Type type = card::Type::Note, long long createdAt = 0);
     bool CreateNoteRecord(const std::wstring& text, std::wstring& noteId);
     bool ReadNoteRecord(const std::wstring& noteId, std::wstring& text);
     bool UpdateNoteRecord(const std::wstring& noteId, const std::wstring& text);

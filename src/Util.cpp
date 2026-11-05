@@ -406,6 +406,38 @@ HGLOBAL MakeDropFilesHandle(const std::wstring& path)
     return handle;
 }
 
+HGLOBAL MakeDropFilesHandle(const std::vector<std::wstring>& paths)
+{
+    if (paths.empty()) {
+        return nullptr;
+    }
+    size_t chars = 0;
+    for (const auto& path : paths) {
+        chars += path.size() + 1;
+    }
+    const size_t bytes = sizeof(DROPFILES) + (chars + 1) * sizeof(wchar_t);
+    HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+    if (!handle) {
+        return nullptr;
+    }
+    auto* drop = static_cast<DROPFILES*>(GlobalLock(handle));
+    if (!drop) {
+        GlobalFree(handle);
+        return nullptr;
+    }
+    drop->pFiles = sizeof(DROPFILES);
+    drop->fWide = TRUE;
+    auto* text = reinterpret_cast<wchar_t*>(reinterpret_cast<BYTE*>(drop) + sizeof(DROPFILES));
+    for (const auto& path : paths) {
+        std::memcpy(text, path.c_str(), path.size() * sizeof(wchar_t));
+        text += path.size();
+        *text++ = L'\0';
+    }
+    *text = L'\0';
+    GlobalUnlock(handle);
+    return handle;
+}
+
 D2D1_COLOR_F Rgb(uint32_t rgb)
 {
     return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,

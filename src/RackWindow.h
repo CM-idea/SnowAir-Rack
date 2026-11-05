@@ -31,11 +31,13 @@ public:
     /* 拖拽期间让绳子对鼠标透明：OLE 每次移动都要做命中测试，
        一块全宽分层窗口挡在指针下面会明显拖慢拖拽。 */
     void SetDragTransparent(bool on);
-    /* 展开期间监听屏幕顶边的点击：点一下就收回。 */
+    /* 展开期间监听屏幕顶边点击和卡片右键。 */
     void SetTopBarWatch(bool enabled);
     bool IsTopBarPoint(POINT screen) const;
+    int CardIndexAtScreen(POINT screen) const;
     static LRESULT CALLBACK TopBarHookProc(int code, WPARAM wParam, LPARAM lParam);
     static RackWindow* topBarOwner_;
+    bool rightCardDown_ = false;
     HHOOK topBarHook_ = nullptr;
     bool expanded() const { return expand_ > 0.5f; }
 
@@ -59,6 +61,7 @@ private:
         kTimerClick,
         kTimerLongPress,
         kTimerEditWatch,
+        kTimerEditStart,
     kTimerCopyToast,
     kTimerFakeCursor,
     };
@@ -66,6 +69,8 @@ private:
     enum MenuId {
         kMenuCopy = 1,
         kMenuOpen,
+        kMenuEdit,
+        kMenuEditColor,
         kMenuEditPaint,
         kMenuSaveAs,
         kMenuShowInFolder,
@@ -92,7 +97,7 @@ private:
     void UpdateHover();
     void UpdatePreview();
     void UpdateAccessoryHover(const RackHit& hit);
-    void UpdateClickThrough(const RackHit& hit);
+    void UpdateClickThrough();
     void SetClickThrough(bool enabled);
     void CheckEditing();
 
@@ -106,10 +111,19 @@ private:
     void HidePreviewNow();
     void CopyItem(int index);
     void OpenItem(int index);
+    /* 链接正文单击：打开默认浏览器（双击不重复开）。 */
+    void OpenCardLink(int index);
+    /* 颜色卡单个色块/hex/rgb：只复制这个颜色。part 0=色块 1=hex 2=rgb。 */
+    void CopyCardColor(int index, int colorIndex, int part);
+    /* 颜色卡滚轮：返回 true 表示这次滚轮已被色卡吃掉。 */
+    bool ScrollColorCard(int index, int delta);
+    /* 右键「编辑颜色」：改这张卡的头部强调色（便签是整张纸的主色）。 */
+    void PickCardColor(int index);
     void EditItemInPaint(int index);
     void SaveItemAs(int index);
     void RemoveItem(int index, bool toBasket = true);
     void EditNote(int index);
+    void QueueEditNote(int index);
     void SetNoteColor(int index, int color);
     void ShowItemMenu(int index, POINT screen);
     void ShowBatchMenu(int index, POINT screen);
@@ -173,6 +187,10 @@ private:
     int pressed_ = -1;
     int pressItemId_ = -1;
     RackPart pressedPart_ = RackPart::None;
+    int pressColorIndex_ = -1;
+    int pressColorPart_ = 0;
+    uint64_t lastLinkOpenMs_ = 0;
+    int lastLinkOpenIndex_ = -1;
     bool mouseDown_ = false;
     bool dragStarted_ = false;
     bool cardDragging_ = false;
@@ -190,8 +208,15 @@ private:
     std::vector<OffsetAnim> offsetAnims_;
     int pendingAdjustId_ = -1;
     uint64_t pendingAdjustAt_ = 0;
+    uint64_t menuCloseGraceUntil_ = 0;
+    bool menuActionPending_ = false;
     /* 点夹子贴图：等卡片下落动画走一半，再触发原生贴图。 */
+    enum class PendingPin { None, Image, Text, Files };
+    PendingPin pendingPinKind_ = PendingPin::None;
     std::wstring pendingPinPath_;
+    std::wstring pendingPinText_;
+    std::vector<std::wstring> pendingPinPaths_;
+    POINT pendingPinAnchor_{};
     uint64_t pendingPinAt_ = 0;
 
     void FinishCardDrag(int id);
@@ -203,6 +228,15 @@ private:
     int clickItemId_ = -1;
     int lastHoverPart_ = -1;
     int lastHoverPartIndex_ = -1;
+    int lastHoverColorIndex_ = -1;
+    int lastHoverColorPart_ = -1;
+    int pendingEditIndex_ = -1;
+    int lastCardSize_ = -1;
+    float cardScaleValue_ = 1.0f;
+    float cardScaleFrom_ = 1.0f;
+    float cardScaleTarget_ = 1.0f;
+    uint64_t cardScaleAnimStart_ = 0;
+    bool cardScaleAnimating_ = false;
     /* 便签编辑器开着时绳子保持展开，不自动收回。 */
     bool editingNote_ = false;
 

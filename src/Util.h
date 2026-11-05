@@ -40,6 +40,8 @@ float ScaleForMonitor(HMONITOR monitor);
 
 /* 单个文件路径的 CF_HDROP 数据块（调用方负责 GlobalFree / 交给剪贴板）。 */
 HGLOBAL MakeDropFilesHandle(const std::wstring& path);
+/* 多文件 CF_HDROP；paths 为空返回 nullptr。 */
+HGLOBAL MakeDropFilesHandle(const std::vector<std::wstring>& paths);
 
 /* 0xRRGGBB -> 不透明颜色。 */
 D2D1_COLOR_F Rgb(uint32_t rgb);

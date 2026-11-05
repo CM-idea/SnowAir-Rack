@@ -429,6 +429,9 @@ public:
         if (pngMime) {
             formats_[count_++] = MakeFormat(pngMime);
         }
+        /* 拖到纯文本框时给路径文本；支持上传的区域仍优先拿文件/图片。 */
+        formats_[count_++] = MakeFormat(CF_UNICODETEXT);
+        formats_[count_++] = MakeFormat(CF_TEXT);
     }
 
     /* IUnknown 接口 */
@@ -507,6 +510,32 @@ public:
             }
         } else if (format->cfFormat == CF_HDROP) {
             handle = util::MakeDropFilesHandle(path_);
+        } else if (format->cfFormat == CF_UNICODETEXT) {
+            const size_t bytes = (path_.size() + 1) * sizeof(wchar_t);
+            handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+            if (handle) {
+                void* target = GlobalLock(handle);
+                if (target) {
+                    std::memcpy(target, path_.c_str(), path_.size() * sizeof(wchar_t));
+                    GlobalUnlock(handle);
+                }
+            }
+        } else if (format->cfFormat == CF_TEXT) {
+            const int need = WideCharToMultiByte(CP_ACP, 0, path_.c_str(),
+                                                  static_cast<int>(path_.size()), nullptr, 0,
+                                                  nullptr, nullptr);
+            handle = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                                 static_cast<size_t>(need) + 1);
+            if (handle) {
+                auto* target = static_cast<char*>(GlobalLock(handle));
+                if (target) {
+                    WideCharToMultiByte(CP_ACP, 0, path_.c_str(),
+                                        static_cast<int>(path_.size()), target, need, nullptr,
+                                        nullptr);
+                    target[need] = '\0';
+                    GlobalUnlock(handle);
+                }
+            }
         } else if (format->cfFormat == RegisterClipboardFormatW(L"PNG") ||
                    format->cfFormat == RegisterClipboardFormatW(L"image/png")) {
             handle = MakeBytesHandle(png_);
@@ -535,6 +564,7 @@ public:
         const UINT png = RegisterClipboardFormatW(L"PNG");
         const UINT pngMime = RegisterClipboardFormatW(L"image/png");
         bool known = format->cfFormat == CF_DIB || format->cfFormat == CF_HDROP ||
+                     format->cfFormat == CF_UNICODETEXT || format->cfFormat == CF_TEXT ||
                      (png != 0 && format->cfFormat == png) ||
                      (pngMime != 0 && format->cfFormat == pngMime);
         bool supported = known && (format->tymed & TYMED_HGLOBAL);
@@ -636,7 +666,7 @@ private:
     LONG ref_ = 1;
     std::wstring path_;
     std::vector<BYTE> png_;
-    FORMATETC formats_[4]{};
+    FORMATETC formats_[6]{};
     HGLOBAL dib_ = nullptr;
     UINT count_ = 0;
     std::vector<ExtraFormat> extra_;
@@ -645,8 +675,9 @@ private:
 /* 便签正文的拖拽数据对象：只提供文本，设计软件收到的是文字本身。 */
 class RackTextDataObject final : public IDataObject {
 public:
-    RackTextDataObject(std::wstring text, bool exposeFormats)
-        : text_(std::move(text)), expose_(exposeFormats) {}
+    RackTextDataObject(std::wstring text, bool exposeFormats,
+                       std::vector<std::wstring> files = {})
+        : text_(std::move(text)), files_(std::move(files)), expose_(exposeFormats) {}
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override
     {
@@ -701,6 +732,8 @@ public:
                     GlobalUnlock(handle);
                 }
             }
+        } else if (format->cfFormat == CF_HDROP && !files_.empty()) {
+            handle = util::MakeDropFilesHandle(files_);
         } else if (format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT) {
             const int need = WideCharToMultiByte(CP_ACP, 0, text_.c_str(),
                                                  static_cast<int>(text_.size()), nullptr, 0,
@@ -743,7 +776,8 @@ public:
             return DV_E_FORMATETC;
         }
         const bool known = format->cfFormat == CF_UNICODETEXT ||
-                           format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT;
+                           format->cfFormat == CF_TEXT || format->cfFormat == CF_OEMTEXT ||
+                           (format->cfFormat == CF_HDROP && !files_.empty());
         if (!known || !(format->tymed & TYMED_HGLOBAL) ||
             (format->lindex != -1 && format->lindex != 0)) {
             return DV_E_FORMATETC;
@@ -779,16 +813,18 @@ public:
         if (!expose_) {
             return E_NOTIMPL;
         }
-        FORMATETC formats[2]{};
-        formats[0].cfFormat = CF_UNICODETEXT;
-        formats[1].cfFormat = CF_TEXT;
-        for (FORMATETC& format : formats) {
-            format.ptd = nullptr;
-            format.dwAspect = DVASPECT_CONTENT;
-            format.lindex = -1;
-            format.tymed = TYMED_HGLOBAL;
+        FORMATETC formats[3]{};
+        UINT count = 0;
+        formats[count++].cfFormat = CF_UNICODETEXT;
+        formats[count++].cfFormat = CF_TEXT;
+        if (!files_.empty()) formats[count++].cfFormat = CF_HDROP;
+        for (UINT i = 0; i < count; ++i) {
+            formats[i].ptd = nullptr;
+            formats[i].dwAspect = DVASPECT_CONTENT;
+            formats[i].lindex = -1;
+            formats[i].tymed = TYMED_HGLOBAL;
         }
-        return SHCreateStdEnumFmtEtc(2, formats, out);
+        return SHCreateStdEnumFmtEtc(count, formats, out);
     }
 
     HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC*, DWORD, IAdviseSink*, DWORD*) override
@@ -811,6 +847,7 @@ private:
 
     LONG ref_ = 1;
     std::wstring text_;
+    std::vector<std::wstring> files_;
     bool expose_ = true;
 };
 
@@ -1237,7 +1274,8 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
 DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMAP ghost,
                     SIZE ghostSize,
                     int cardWidth, int cardHeight, float frameWidth, bool* dropped,
-                    DragOutcome* outcome, const std::wstring& previewPath, bool pasteOnly)
+                    DragOutcome* outcome, const std::wstring& previewPath, bool pasteOnly,
+                    const std::vector<std::wstring>& files)
 {
     (void)rack;
     if (dropped) *dropped = false;
@@ -1260,7 +1298,7 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
     HWND dragPreview = dragBitmap ? CreateDragPreview(dragBitmap, dragSize.cx, dragSize.cy)
                                   : nullptr;
 
-    auto* data = new (std::nothrow) RackTextDataObject(text, !pasteOnly);
+    auto* data = new (std::nothrow) RackTextDataObject(text, !pasteOnly, files);
     auto* source = new (std::nothrow) RackDropSource(dragPreview, returnBand, outcome, std::wstring(),
                                                       std::wstring(), pasteOnly);
     if (!data || !source) {

@@ -1,6 +1,6 @@
 # Build output
-dist/
-build/
+/dist/
+/build/
 
 # Visual Studio / MSVC
 .vs/
@@ -14,24 +14,28 @@ build/
 *.idb
 *.log
 
+# Local test harness (not published)
+/tests/
+
+# Local runtime assets (not published)
+/assets/
+
 # Test artifacts
-drop-target/
-tests/assets/*.tmp
-HostSim.log
-shot*.png
-*-crop.png
+/drop-target/
+/shot*.png
+/*-crop.png
 
-# Local reference checkouts (third-party; not part of this repository)
-参考/
+# Local reference assets (not part of the plugin)
+/referto/
+/images/
+/font_*/
 
-# OS
+# Local docs
+/DESIGN.md
+
+# OS / app-local data
 Thumbs.db
 desktop.ini
 /rack.json
 *.bat
 THIRD_PARTY_NOTICES.md
-referto/
-images/
-
-# Local docs (not published)
-DESIGN.md

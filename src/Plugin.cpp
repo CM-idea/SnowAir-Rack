@@ -6,6 +6,7 @@
 #include "RackWindow.h"
 #include "Util.h"
 
+#include <chrono>
 #include <cstdarg>
 #include <filesystem>
 
@@ -24,6 +25,51 @@ const wchar_t* kDescMaxItems = L"超出后最早的一张会自动落下";
 
 /* 便签在轻雪剪切板里的标签，同时也用它把便签和普通文本区分开。 */
 constexpr wchar_t kNoteTag[] = L"便签";
+
+bool IsTextCardType(card::Type type)
+{
+    return type == card::Type::Note || type == card::Type::Text ||
+           type == card::Type::Link || type == card::Type::Color;
+}
+
+bool SamePathList(const std::vector<std::wstring>& left,
+                  const std::vector<std::wstring>& right)
+{
+    if (left.size() != right.size()) return false;
+    std::vector<bool> used(right.size(), false);
+    for (const auto& value : left) {
+        bool found = false;
+        for (size_t i = 0; i < right.size(); ++i) {
+            if (!used[i] && util::SamePath(value, right[i])) {
+                used[i] = true;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/* 颜色去重键：只忽略 hex 的 # 前缀、大小写和空白，不把 rgb() 和 hex 混为一谈。 */
+std::wstring ColorDedupKey(const std::wstring& text)
+{
+    std::wstring out;
+    bool pendingSpace = false;
+    for (wchar_t ch : text) {
+        if (std::iswspace(ch)) {
+            pendingSpace = !out.empty();
+            continue;
+        }
+        if (ch == L'#') continue;
+        if (pendingSpace) {
+            out.push_back(L' ');
+            pendingSpace = false;
+        }
+        out.push_back(static_cast<wchar_t>(std::towlower(ch)));
+    }
+    return out;
+}
 
 std::wstring TrimNoteText(std::wstring text)
 {
@@ -51,6 +97,17 @@ const SnowAirPlugin kDescriptor = {
 };
 
 } /* namespace */
+
+/* HostSim 预览用的调试入口；不参与正常宿主流程。 */
+extern "C" __declspec(dllexport) void SnowAirRackDebugHang(int kind, const wchar_t* value)
+{
+    if (!value) return;
+    if (kind == 1) {
+        Plugin::Instance().DebugHangFile(value);
+    } else {
+        Plugin::Instance().DebugHangText(value, kind == 2);
+    }
+}
 
 Plugin& Plugin::Instance()
 {
@@ -169,8 +226,9 @@ bool Plugin::Init(const SnowAirHost* host)
         clipboard_->SetOnHangImage([this](const std::wstring& path) { OnHangImage(path); });
         clipboard_->SetOnHangEntry(
             [this](int kind, const std::wstring& label, const std::wstring& path,
-                   const std::wstring& thumb, const std::wstring& entryId) {
-                OnHangEntry(kind, label, path, thumb, entryId);
+                   const std::wstring& thumb, const std::wstring& entryId, long long createdAt,
+                   const std::vector<std::wstring>& paths, bool isNote) {
+                OnHangEntry(kind, label, path, thumb, entryId, createdAt, paths, isNote);
             });
     }
 
@@ -244,10 +302,13 @@ void Plugin::OnCapture(const wchar_t* path)
 
     Item item;
     item.id = nextId_++;
+    item.kind = 0;
+    item.cardType = card::Type::Image;
     item.path = full;
+    item.paths.push_back(full);
     item.sourcePath = full;
     item.aspect = static_cast<float>(width) / static_cast<float>(height);
-    // 截图入场动画现在由 arrival 动画负责，不要再叠一层旧的落位弹簧。
+    // 截图入场动画由 arrival 负责，不再叠加旧的落位弹簧。
     item.addedMs = 0;
     if (host_->capture_rect && !manualHang_) {
         int cx = 0, cy = 0, cw = 0, ch = 0;
@@ -307,7 +368,10 @@ void Plugin::OnHangImage(const std::wstring& path, const std::wstring& svgId)
     }
     Item item;
     item.id = nextId_++;
+    item.kind = 0;
+    item.cardType = svgId.empty() ? card::Type::Image : card::Type::Svg;
     item.path = full;
+    item.paths.push_back(full);
     item.sourcePath = full;
     item.svgId = svgId;
     item.aspect = aspect;
@@ -337,11 +401,12 @@ void Plugin::OnHangImage(const std::wstring& path, const std::wstring& svgId)
 }
 
 void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring& path,
-                         const std::wstring& thumb, const std::wstring& entryId)
+                         const std::wstring& thumb, const std::wstring& entryId,
+                         long long createdAt, const std::vector<std::wstring>& paths, bool isNote)
 {
     if (!initialized_) return;
     /* 轻雪把剪切板里的 SVG 代码渲染成了 PNG（thumb）；上绳按图片处理，
-       和轻雪历史卡片看到的是同一张图。普通文字没有 thumb，仍走便签。 */
+       和轻雪历史卡片看到的是同一张图。普通文字没有 thumb，走文本/链接/颜色/便签。 */
     if (kind == SNOWAIR_ENTRY_TEXT && !thumb.empty() && util::FileExists(thumb)) {
         /* 轻雪已经渲染好 PNG 预览；卡片只记记录 id，复制/拖拽时按 id 读回 SVG 代码。 */
         OnHangImage(thumb, entryId);
@@ -354,12 +419,21 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
             return;
         }
         if (const int existing = FindNoteItem(entryId); existing >= 0) {
+            /* 记录没变，但类型可能在旧版本里被当成便签；同时纠正。 */
+            Item& item = items_[static_cast<size_t>(existing)];
+            const card::Type type = isNote ? card::Type::Note : card::TextType(item.note);
+            if (item.cardType != type || (createdAt > 0 && item.createdAt <= 0)) {
+                item.cardType = type;
+                if (createdAt > 0 && item.createdAt <= 0) item.createdAt = createdAt;
+                SaveItems();
+            }
             NudgeExistingItem(existing);
             return;
         }
         std::wstring text;
         if (!ReadNoteRecord(entryId, text) || text.empty()) return;
-        AddNoteItem(text, entryId);
+        const card::Type type = isNote ? card::Type::Note : card::TextType(text);
+        AddNoteItem(text, entryId, type, createdAt);
         return;
     }
 
@@ -367,13 +441,19 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
     item.id = nextId_++;
     item.addedMs = 0;
     item.label = label;
+    item.createdAt = createdAt;
+    for (const auto& file : paths) {
+        if (!file.empty()) item.paths.push_back(util::FullPath(file));
+    }
+    if (item.paths.empty() && !path.empty()) item.paths.push_back(util::FullPath(path));
+    item.path = item.paths.empty() ? std::wstring() : item.paths.front();
     if (kind == SNOWAIR_ENTRY_IMAGE) {
-        if (path.empty()) return;
+        if (item.path.empty()) return;
         item.kind = 0;
-        item.path = util::FullPath(path);
+        item.cardType = card::Type::Image;
         item.sourcePath = item.path;
         item.mtime = util::FileWriteTime(item.path);
-    item.contentHash = util::FileContentHash(item.path);
+        item.contentHash = util::FileContentHash(item.path);
 
         UINT width = 0, height = 0;
         if (graphics_ && SUCCEEDED(graphics_->images().GetSize(item.path, width, height)) &&
@@ -383,18 +463,19 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
             item.aspect = 1.4f;
         }
     } else if (kind == SNOWAIR_ENTRY_MEDIA) {
-        /* 录屏：优先用封面，没封面就退化成纯文字卡片。 */
+        /* 录屏：有封面沿用照片卡；没封面用新的视频卡。 */
         item.kind = 2;
         item.aspect = 16.0f / 9.0f;
-        if (!path.empty()) {
-            item.path = util::FullPath(path);
+        if (!item.path.empty()) {
             item.sourcePath = item.path;
             item.mtime = util::FileWriteTime(item.path);
-    item.contentHash = util::FileContentHash(item.path);
+            item.contentHash = util::FileContentHash(item.path);
         }
+        item.cardType = card::Type::Video;
         const std::wstring cover = thumb.empty() ? std::wstring() : util::FullPath(thumb);
         if (!cover.empty() && util::FileExists(cover)) {
             item.thumbPath = cover;
+            item.cardType = card::Type::Recording;
             UINT width = 0, height = 0;
             if (graphics_ &&
                 SUCCEEDED(graphics_->images().GetSize(cover, width, height)) &&
@@ -404,19 +485,19 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         }
 
     } else {
-        /* 文件 / 其他：纯色卡片 + 文件夹图标，文字用条目名。 */
+        /* 文件 / 音频 / 视频：新卡片；混搭一律按文件。 */
         item.kind = 3;
-        item.aspect = 1.4f;
-        if (!path.empty()) {
-            item.path = util::FullPath(path);
+        item.aspect = 1.0f;
+        item.cardType = card::FileType(item.paths);
+        if (!item.path.empty()) {
             item.sourcePath = item.path;
             item.mtime = util::FileWriteTime(item.path);
-    item.contentHash = util::FileContentHash(item.path);
+            item.contentHash = util::FileContentHash(item.path);
         }
         if (item.label.empty() && !item.path.empty()) {
             item.label = std::filesystem::path(item.path).filename().wstring();
         }
-        if (item.label.empty()) return;
+        if (item.label.empty() && item.paths.empty()) return;
     }
 
     /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
@@ -433,40 +514,6 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         window_->OnItemsChanged(true);
     }
     SaveItems();
-}
-
-void Plugin::PinItemToDesktop(int index)
-{
-    if (index < 0 || index >= static_cast<int>(items_.size())) {
-        return;
-    }
-    const Item& item = items_[static_cast<size_t>(index)];
-    if (item.kind != 0 || item.path.empty()) {
-        return;
-    }
-    /* 优先调用宿主导出的原生贴图（带落下动效）；旧宿主没有该导出时再退回内置窗口。 */
-    using PinImageFileFn = void (*)(const wchar_t*);
-    static PinImageFileFn hostPin = []() -> PinImageFileFn {
-        const HMODULE host = GetModuleHandleW(nullptr);
-        return host ? reinterpret_cast<PinImageFileFn>(
-                          GetProcAddress(host, "SnowAirPinImageFile"))
-                    : nullptr;
-    }();
-    if (hostPin) {
-        hostPin(item.path.c_str());
-        return;
-    }
-    if (!graphics_) {
-        return;
-    }
-    if (!pinWindow_) {
-        pinWindow_ = std::make_unique<PinWindow>();
-    }
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    if (!pinWindow_->Open(graphics_.get(), item.path, cursor)) {
-        RackLog(L"PinWindow: failed to pin %s", item.path.c_str());
-    }
 }
 
 void Plugin::PinImageFile(const std::wstring& path)
@@ -496,6 +543,126 @@ void Plugin::PinImageFile(const std::wstring& path)
     pinWindow_->Open(graphics_.get(), path, cursor);
 }
 
+void Plugin::PinTextToDesktop(const std::wstring& text)
+{
+    if (text.empty()) return;
+    using PinTextFn = void (*)(const wchar_t*);
+    static PinTextFn hostPin = []() -> PinTextFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinTextFn>(
+                          GetProcAddress(host, "SnowAirPinText"))
+                    : nullptr;
+    }();
+    if (hostPin) hostPin(text.c_str());
+}
+
+void Plugin::PinFilesToDesktop(const std::vector<std::wstring>& paths)
+{
+    if (paths.empty()) return;
+    using PinFilesFn = void (*)(const wchar_t* const*, int);
+    static PinFilesFn hostPin = []() -> PinFilesFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinFilesFn>(
+                          GetProcAddress(host, "SnowAirPinFiles"))
+                    : nullptr;
+    }();
+    if (!hostPin) return;
+    std::vector<const wchar_t*> raw;
+    raw.reserve(paths.size());
+    for (const auto& path : paths) {
+        if (!path.empty()) raw.push_back(path.c_str());
+    }
+    if (!raw.empty()) hostPin(raw.data(), static_cast<int>(raw.size()));
+}
+
+void Plugin::PinImageFileAt(const std::wstring& path, int centerX, int topY)
+{
+    using PinAtFn = void (*)(const wchar_t*, int, int);
+    static PinAtFn hostPin = []() -> PinAtFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinAtFn>(
+                          GetProcAddress(host, "SnowAirPinImageFileAt"))
+                    : nullptr;
+    }();
+    if (hostPin) {
+        hostPin(path.c_str(), centerX, topY);
+    } else {
+        PinImageFile(path);
+    }
+}
+
+void Plugin::PinTextToDesktopAt(const std::wstring& text, int centerX, int topY)
+{
+    using PinAtFn = void (*)(const wchar_t*, int, int);
+    static PinAtFn hostPin = []() -> PinAtFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinAtFn>(
+                          GetProcAddress(host, "SnowAirPinTextAt"))
+                    : nullptr;
+    }();
+    if (hostPin) {
+        hostPin(text.c_str(), centerX, topY);
+    } else {
+        PinTextToDesktop(text);
+    }
+}
+
+void Plugin::PinFilesToDesktopAt(const std::vector<std::wstring>& paths, int centerX, int topY)
+{
+    using PinAtFn = void (*)(const wchar_t* const*, int, int, int);
+    static PinAtFn hostPin = []() -> PinAtFn {
+        const HMODULE host = GetModuleHandleW(nullptr);
+        return host ? reinterpret_cast<PinAtFn>(
+                          GetProcAddress(host, "SnowAirPinFilesAt"))
+                    : nullptr;
+    }();
+    if (!hostPin) {
+        PinFilesToDesktop(paths);
+        return;
+    }
+    std::vector<const wchar_t*> raw;
+    raw.reserve(paths.size());
+    for (const auto& path : paths) {
+        if (!path.empty()) raw.push_back(path.c_str());
+    }
+    if (!raw.empty()) {
+        hostPin(raw.data(), static_cast<int>(raw.size()), centerX, topY);
+    }
+}
+
+void Plugin::DebugHangText(const std::wstring& text, bool note)
+{
+    if (!initialized_ || text.empty()) return;
+    const card::Type type = note ? card::Type::Note : card::TextType(text);
+    AddNoteItem(text, std::wstring(), type,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+    if (window_) window_->OnItemsChanged(true);
+}
+
+void Plugin::DebugHangFile(const std::wstring& path)
+{
+    if (!initialized_ || path.empty()) return;
+    Item item;
+    item.id = nextId_++;
+    item.kind = 3;
+    item.path = util::FullPath(path);
+    item.paths.push_back(item.path);
+    item.sourcePath = item.path;
+    item.label = std::filesystem::path(item.path).filename().wstring();
+    item.cardType = card::FileType(item.paths);
+    item.createdAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    item.aspect = 1.0f;
+    item.mtime = util::FileWriteTime(item.path);
+    item.contentHash = util::FileContentHash(item.path);
+    items_.push_back(std::move(item));
+    if (window_) window_->OnItemsChanged(true);
+    SaveItems();
+}
+
 void Plugin::OnHangText(const std::wstring& text)
 {
     if (!initialized_) return;
@@ -519,15 +686,23 @@ void Plugin::OnHangText(const std::wstring& text)
     AddNoteItem(body, noteId);
 }
 
-void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId)
+void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId, card::Type type,
+                         long long createdAt)
 {
     Item item;
     item.id = nextId_++;
-    item.kind = 1; /* 便签 */
+    item.kind = 1; /* 文字类 */
+    item.cardType = type;
     item.note = text;
     item.noteId = noteId;
-    item.noteColor = 2; /* yellow sticky note */
-    item.aspect = 1.1f;
+    item.noteColor = type == card::Type::Note ? 2 : 0;
+    item.createdAt = createdAt;
+    if (item.createdAt <= 0) {
+        item.createdAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    }
+    item.aspect = 1.0f;
     item.addedMs = 0;   /* no drop-in spring: avoids a flicker on landing */
     /* 同一个内容已经在绳子上：不再挂第二张，仅使原卡片轻微晃动作为提示。 */
     if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
@@ -615,6 +790,13 @@ bool Plugin::CopyCardText(int index)
 {
     if (index < 0 || index >= static_cast<int>(items_.size()) || !host_) return false;
     const Item& item = items_[static_cast<size_t>(index)];
+    /* 单色颜色卡拖出：复制该颜色本身（带 alpha 用 rgba），不是整段原文。 */
+    if (item.cardType == card::Type::Color) {
+        std::vector<card::Rgba> colors;
+        if (card::ParseColors(item.note, colors) && colors.size() == 1) {
+            return clipboard::CopyText(card::ColorDragText(colors.front()));
+        }
+    }
     const std::wstring id = !item.svgId.empty() ? item.svgId : item.noteId;
     /* 优先走宿主的 entry_copy：它会 markOwnClipboardWrite，历史不会新增/置顶。 */
     const int hostIndex = FindHostEntryById(id);
@@ -635,19 +817,29 @@ int Plugin::FindDuplicateItem(const Item& item) const
         if (existing.kind != item.kind) {
             continue;
         }
-        if (item.kind == 1) {
-            /* 便签比正文：同样的文字不重复挂。 */
+        if (IsTextCardType(item.cardType) || item.kind == 1) {
+            /* 颜色卡：#34C759 与 34C759 是同一个色值，不重复上绳；
+               但 rgb(...) 和 hex 的卡片仍按不同格式保留。 */
+            if (item.cardType == card::Type::Color &&
+                existing.cardType == card::Type::Color && !item.note.empty() &&
+                ColorDedupKey(existing.note) == ColorDedupKey(item.note)) {
+                return i;
+            }
+            /* 文字类比正文：同样的文字不重复挂（便签/文本/链接/颜色互斥）。 */
             if (!item.note.empty() && existing.note == item.note) {
                 return i;
             }
-        } else if (!item.path.empty()) {
-            if (util::SamePath(existing.path, item.path)) {
+        } else if (!item.paths.empty()) {
+            if (SamePathList(existing.paths, item.paths)) {
                 return i;
             }
-            /* 路径不同但内容指纹相同：同一张图放在不同位置，也算重复。 */
-            if (item.contentHash != 0 && existing.contentHash == item.contentHash) {
+            /* 单文件路径不同但内容指纹相同：同一张图放在不同位置，也算重复。 */
+            if (item.paths.size() == 1 && item.contentHash != 0 &&
+                existing.contentHash == item.contentHash) {
                 return i;
             }
+        } else if (!item.path.empty() && util::SamePath(existing.path, item.path)) {
+            return i;
         } else if (!item.label.empty() && existing.label == item.label) {
             return i;
         }
@@ -714,6 +906,24 @@ void Plugin::SyncNotes()
             it->note = text;
             changed = true;
         }
+        if (it->createdAt <= 0 && host_ && host_->entry_get) {
+            const int hostIndex = FindHostEntryById(it->noteId);
+            if (hostIndex >= 0) {
+                SnowAirEntry entry{};
+                if (host_->entry_get(host_->user, hostIndex, &entry) && entry.created_at > 0) {
+                    it->createdAt = entry.created_at;
+                    changed = true;
+                }
+            }
+        }
+        /* 文本/链接/颜色可能被外部改过内容：保持类型标签跟内容一致；便签永远还是便签。 */
+        if (IsTextCardType(it->cardType) && it->cardType != card::Type::Note) {
+            const card::Type type = card::TextType(text);
+            if (it->cardType != type) {
+                it->cardType = type;
+                changed = true;
+            }
+        }
         ++it;
     }
     if (changed) {
@@ -730,6 +940,67 @@ void Plugin::OnQuickHang(const wchar_t* path)
     OnCapture(path);
     manualHang_ = false;
     config_.autoCapture = autoCapture;
+}
+
+bool Plugin::QuickHang(int kind, const std::wstring& text,
+                       const std::vector<std::wstring>& paths)
+{
+    if (!initialized_) return false;
+    if (kind == SNOWAIR_ENTRY_TEXT) {
+        const std::wstring body = TrimNoteText(text);
+        if (body.empty()) return false;
+        std::wstring entryId;
+        if (host_ && host_->entry_create_text) {
+            wchar_t id[128]{};
+            if (host_->entry_create_text(host_->user, body.c_str(), L"", id,
+                                         static_cast<int>(std::size(id)))) {
+                entryId = id;
+            }
+        }
+        if (!entryId.empty()) {
+            const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+            OnHangEntry(SNOWAIR_ENTRY_TEXT, body, L"", L"", entryId, now, {}, false);
+            return true;
+        }
+        DebugHangText(body, false);
+        return true;
+    }
+
+    if (kind == SNOWAIR_ENTRY_FILES) {
+        if (paths.empty()) return false;
+        Item item;
+        item.id = nextId_++;
+        item.kind = 3;
+        for (const auto& path : paths) {
+            if (path.empty()) continue;
+            item.paths.push_back(util::FullPath(path));
+        }
+        if (item.paths.empty()) return false;
+        item.path = item.paths.front();
+        item.label = std::filesystem::path(item.path).filename().wstring();
+        item.createdAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        item.aspect = 1.0f;
+        item.sourcePath = item.path;
+        item.mtime = util::FileWriteTime(item.path);
+        item.contentHash = util::FileContentHash(item.path);
+        item.cardType = card::FileType(item.paths);
+        if (const int duplicate = FindDuplicateItem(item); duplicate >= 0) {
+            NudgeExistingItem(duplicate);
+            return true;
+        }
+        items_.push_back(std::move(item));
+        while (static_cast<int>(items_.size()) > config_.maxItems) {
+            RemoveItemData(0);
+        }
+        if (window_) window_->OnItemsChanged(true);
+        SaveItems();
+        return true;
+    }
+    return false;
 }
 
 void Plugin::OnSettingChanged(const wchar_t* key)
@@ -884,6 +1155,11 @@ void Plugin::SetItemNote(int index, const std::wstring& text, int color)
         }
         item.note = body;
         item.noteColor = rack::ClampInt(color, 0, 2);
+        /* 内容改完重新判定类型标签：链接不再是链接 → 文本，文本变成 URL → 链接。
+           便签永远保持便签；强调色不随类型变化（item.accent 不动）。 */
+        if (item.cardType != card::Type::Note) {
+            item.cardType = card::TextType(body);
+        }
         if (window_) {
             if (item.note.empty()) {
                 window_->DismissPreview();
@@ -1000,7 +1276,7 @@ void Plugin::CloseMenu()
 
 void Plugin::OpenHistory()
 {
-    /* 历史入口已经被用户停用：即使命中测试晚了半拍，也不要再打开。 */
+    /* 历史入口已停用：即使命中测试延迟，也不再打开。 */
     if (HistoryDisabled()) {
         return;
     }
@@ -1121,6 +1397,21 @@ void RackLog(const wchar_t* format, ...)
     _vsnwprintf_s(buffer, _TRUNCATE, format, args);
     va_end(args);
     Plugin::Instance().LogMessage(buffer);
+}
+
+/* 可选导出：宿主快速贴屏把文字/文件交给晾衣架。旧宿主没有这个符号时会自动
+   退回系统贴屏，不影响兼容性。 */
+extern "C" __declspec(dllexport) int SnowAirRackQuickHang(
+    int kind, const wchar_t* text, const wchar_t* const* paths, int count)
+{
+    std::vector<std::wstring> list;
+    if (paths && count > 0) {
+        list.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            if (paths[i]) list.emplace_back(paths[i]);
+        }
+    }
+    return Plugin::Instance().QuickHang(kind, text ? text : L"", list) ? 1 : 0;
 }
 
 extern "C" SNOWAIR_PLUGIN_EXPORT const SnowAirPlugin* SnowAirPluginEntry(void)
