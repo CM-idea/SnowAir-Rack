@@ -263,6 +263,7 @@ void LayeredWindow::Render()
                         1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
                     hr = target_->EndDraw();
                     if (SUCCEEDED(hr)) {
+                        AfterDraw(memoryDC_, bits_, width_, height_);
                         Present();
                     } else if (hr == D2DERR_RECREATE_TARGET) {
                         InvalidateSurface();

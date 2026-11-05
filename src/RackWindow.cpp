@@ -453,33 +453,44 @@ int RackWindow::CardIndexAtScreen(POINT screen) const
 LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     /* 右键在按下阶段就截住：分层窗口偶发命中失败时，这次右键不会先落到桌面。
-       其他 UI 持有指针（菜单/编辑器/拖拽/剪贴板面板）时放行。 */
+       判断依据改成「指针下最顶层的窗口是不是晾衣架」：宿主菜单、剪贴板面板、
+       预览窗或别的程序盖在卡片上时放行，剩下卡片上的右键一律由晾衣架打开菜单。 */
     if (code == HC_ACTION && (wParam == WM_RBUTTONDOWN || wParam == WM_RBUTTONUP) &&
         topBarOwner_ && topBarOwner_->hwnd() && topBarOwner_->plugin_) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (!mouse) return CallNextHookEx(nullptr, code, wParam, lParam);
         if (wParam == WM_RBUTTONUP) {
             if (topBarOwner_->rightCardDown_) {
+                const bool recent = rack::NowMs() - topBarOwner_->rightCardDownAt_ < 1000;
                 topBarOwner_->rightCardDown_ = false;
-                return 1;
-            }
-        } else if (!topBarOwner_->rightCardDown_ && !topBarOwner_->menuOpen_ &&
-                   !topBarOwner_->dragStarted_ && !topBarOwner_->editingNote_ &&
-                   !topBarOwner_->plugin_->MenuOpen()) {
-            if (topBarOwner_->plugin_->ClipboardOpen()) {
-                POINT cur{};
-                GetCursorPos(&cur);
-                if (topBarOwner_->plugin_->ClipboardContains(cur)) {
-                    return CallNextHookEx(nullptr, code, wParam, lParam);
+                topBarOwner_->rightCardDownAt_ = 0;
+                if (recent) {
+                    return 1;
                 }
             }
-            const int index = topBarOwner_->CardIndexAtScreen(mouse->pt);
-            if (index >= 0) {
-                topBarOwner_->rightCardDown_ = true;
-                PostMessageW(topBarOwner_->hwnd(), kMsgRackRightClick,
-                             static_cast<WPARAM>(index),
-                             MAKELPARAM(mouse->pt.x, mouse->pt.y));
-                return 1;
+        } else {
+            /* 新的一次右键按下永远重新开始计数。上一轮如果只收到 down
+               没收到 up（宿主菜单抢走/钩子重装），不能让标志卡住，
+               否则下一次右键的 up 会被吞掉，卡片上的右键就变成死区。 */
+            topBarOwner_->rightCardDown_ = false;
+            topBarOwner_->rightCardDownAt_ = 0;
+            if (!topBarOwner_->menuOpen_ && !topBarOwner_->dragStarted_ &&
+                !topBarOwner_->editingNote_) {
+                const int index = topBarOwner_->CardIndexAtScreen(mouse->pt);
+                if (index >= 0) {
+                    /* 只处理真正落在晾衣架上的点。WindowFromPoint 会把宿主菜单、
+                       剪贴板面板和其它顶层窗口优先返回，避免把它们的右键抢走。 */
+                    const HWND under = WindowFromPoint(mouse->pt);
+                    if (under != topBarOwner_->hwnd()) {
+                        return CallNextHookEx(nullptr, code, wParam, lParam);
+                    }
+                    topBarOwner_->rightCardDown_ = true;
+                    topBarOwner_->rightCardDownAt_ = rack::NowMs();
+                    PostMessageW(topBarOwner_->hwnd(), kMsgRackRightClick,
+                                 static_cast<WPARAM>(index),
+                                 MAKELPARAM(mouse->pt.x, mouse->pt.y));
+                    return 1;
+                }
             }
         }
     }
@@ -504,8 +515,8 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
             }
         }
     }
-    if (code == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN) &&
-        topBarOwner_ && topBarOwner_->hwnd()) {
+    if (code == HC_ACTION && wParam == WM_LBUTTONDOWN && topBarOwner_ &&
+        topBarOwner_->hwnd()) {
         const auto* mouse = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
         if (mouse && topBarOwner_->IsTopBarPoint(mouse->pt)) {
             PostMessageW(topBarOwner_->hwnd(), kMsgTopBarClick, 0, 0);
@@ -689,7 +700,8 @@ void RackWindow::Collapse()
     if (view_.HasRemoved()) {
         return;
     }
-    SetClickThrough(true);
+    /* 收起动画期间卡片还在画面上，仍然要能接住右键；
+       整窗穿透只留到完全收起之后（见 Animate）。 */
     hotkeyPinned_ = false;
     expanding_ = false;
     peekUntil_ = 0;
@@ -827,8 +839,9 @@ void RackWindow::Animate()
     Reposition();
     Render();
 
-    /* 只在展开时挂钩子：收起状态点顶边是「拉下来」，不该再收回。 */
-    SetTopBarWatch(expand_ > 0.9f);
+    /* 展开、收起动画期间都挂着：卡片还在画面上时，右键都必须先被这里接住。
+       完全收起后由 Animate 摘掉，顶边点击的「拉下来」不需要钩子。 */
+    SetTopBarWatch(expand_ > 0.05f);
 
     const bool hoverSettled =
         std::abs(basketHover_ - basketHoverTarget_) < 0.003f &&
@@ -1010,6 +1023,9 @@ void RackWindow::Tick()
            给命令一个宽限期，真正的收起交给 autoHide。 */
         lastInside_ = rack::NowMs();
         menuCloseGraceUntil_ = lastInside_ + 500;
+        /* 菜单开着的那段时间如果窗口被设成穿透，这里立刻恢复；
+           否则紧接着的右键会直接落到桌面。 */
+        UpdateClickThrough();
         Render();
         return;
     }
@@ -1017,8 +1033,10 @@ void RackWindow::Tick()
         hostMenuWasOpen_ = true;
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
-        // 弹窗是独立窗口：让它外面的点击穿到桌面，而不是被全宽的晾衣架窗口拦截。
-        SetClickThrough(true);
+        /* 菜单是独立的置顶窗口，不需要把晾衣架整窗变穿透。
+           以前这里 SetClickThrough(true)，菜单一开卡片就真的点不到了：
+           紧接着右键另一张卡时，这次点击会穿透到桌面，弹出系统右键菜单。 */
+        SetClickThrough(false);
         lastInside_ = rack::NowMs();
         return;
     }
@@ -1026,14 +1044,13 @@ void RackWindow::Tick()
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
         lastInside_ = rack::NowMs();
-        /* 面板仅在自身区域内优先：搜索条和绳子有重叠，重叠处让给面板，
-           否则面板上的点击会被全宽的绳子窗口拦截。面板之外（绳子上挂着的
-           卡片）仍然由晾衣架接管 —— 此前窗口整体穿透，面板没盖住的卡片上的
-           点击会传递到下层窗口，正好被面板挡着，很容易误触。 */
+        /* 面板只在面板窗口自己的矩形里优先（面板是置顶窗口，盖住的地方
+           本来就轮不到晾衣架；万一被晾衣架盖住，WM_NCHITTEST 会在那一块
+           返回 HTTRANSPARENT）。面板之外的卡片仍然要能正常右键，
+           所以这里不能再把整个晾衣架窗口设成穿透。 */
         POINT cursor{};
         GetCursorPos(&cursor);
         if (plugin_->ClipboardContains(cursor)) {
-            SetClickThrough(true);
             return;
         }
     }
@@ -1264,9 +1281,11 @@ void RackWindow::SetClickThrough(bool enabled)
 
 void RackWindow::UpdateClickThrough()
 {
-    /* 展开时整窗可命中，透明缝隙交给 WM_NCHITTEST；完全收起时才整体穿透。 */
+    /* 只有完全收起、画面上什么都不剩时才整窗穿透；展开/收起动画期间
+       卡片仍然看得见，必须留给命中测试，否则右键会掉到桌面。
+       透明缝隙由逐像素 alpha + WM_NCHITTEST 负责。 */
     const bool keepMouse = mouseDown_ || dragStarted_;
-    SetClickThrough(!keepMouse && expand_ < 0.05f);
+    SetClickThrough(!keepMouse && expand_ <= 0.001f);
 }
 
 void RackWindow::UpdatePreview()
@@ -2006,6 +2025,9 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         menuIndex_ = index;
         plugin_->host()->show_menu(plugin_->host()->user, main, n, screen.x, screen.y,
                                    this, &RackWindow::MenuSelected);
+        /* 从这一刻起就知道是宿主菜单。菜单弹在自己窗口上面时，
+           第一次落在卡片上的左键只负责把菜单关掉，不要再触发复制。 */
+        hostMenuWasOpen_ = true;
         return;
     }
 
@@ -2265,6 +2287,81 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
     }
 }
 
+void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
+{
+    (void)dc;
+    if (!plugin_ || !bits || width <= 0 || height <= 0) {
+        return;
+    }
+    auto* pixels = static_cast<BYTE*>(bits);
+    /* 给卡片范围补一层「能看见但看不见」的 alpha=1 底：
+       分层窗口的命中测试只看 alpha，圆角外侧、贴边那一两像素和
+       便签纸右下折角都是 alpha=0，鼠标点上去会直接穿过窗口落到桌面。
+       把这些像素的 alpha 抬到 1（RGB 仍是 0，颜色上完全看不出来），
+       后续由 WM_NCHITTEST 决定这一块到底算不算卡片。 */
+    const int pad = std::max(2, static_cast<int>(std::lround(10.0f * scale_)));
+    auto raiseRect = [&](float left, float top, float right, float bottom) {
+        const int x0 = std::max(0, static_cast<int>(std::floor(left)) - pad);
+        const int y0 = std::max(0, static_cast<int>(std::floor(top)) - pad);
+        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(right)) + pad);
+        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(bottom)) + pad);
+        for (int y = y0; y <= y1; ++y) {
+            BYTE* row = pixels + static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
+            for (int x = x0; x <= x1; ++x) {
+                BYTE* pixel = row + static_cast<size_t>(x) * 4u;
+                if (pixel[3] == 0) {
+                    pixel[3] = 1;
+                }
+            }
+        }
+    };
+
+    for (int i = 0;; ++i) {
+        const CardBox* box = view_.CardAt(i);
+        if (!box) {
+            break;
+        }
+        raiseRect(box->card.left, box->card.top, box->card.right, box->card.bottom);
+        /* 夹子和卡片上沿之间的那一小段也算卡片，右键不会从缝里漏下去。 */
+        raiseRect(box->card.left, box->pinTop, box->card.right,
+                  box->card.top + 2.0f * scale_);
+        if (box->hasNote) {
+            raiseRect(box->note.left, box->note.top, box->note.right, box->note.bottom);
+        }
+    }
+
+    /* 绳子本身只有 1.6~2.3px 宽，AA 之后真正 alpha=255 的像素更少。
+       沿绳子的下垂曲线补 ±4px 的命中带，右键落在绳子上不会穿到桌面；
+       带子以外的空白仍然是 alpha=0，照常让给桌面。 */
+    const RackLayout& layout = view_.layout();
+    if (layout.expanded && layout.lineEnd > layout.lineStart) {
+        const float span = layout.lineEnd - layout.lineStart;
+        /* 展开动画里绳子整体带着 retract 偏移，命中带也要跟着走，
+           否则动画途中右键会从绳子上漏下去。 */
+        const float retract = (1.0f - rack::Clamp(expand_, 0.0f, 1.0f)) *
+                              -(layout.lineY + layout.sag + 24.0f * scale_);
+        const int x0 = std::max(0, static_cast<int>(std::floor(layout.lineStart - 6.0f * scale_)));
+        const int x1 = std::min(width - 1,
+                                static_cast<int>(std::ceil(layout.lineEnd + 6.0f * scale_)));
+        const int band = std::max(2, static_cast<int>(std::lround(4.0f * scale_)));
+        for (int x = x0; x <= x1; ++x) {
+            const float t = rack::Clamp((static_cast<float>(x) - layout.lineStart) / span, 0.0f,
+                                        1.0f);
+            const float y = layout.lineY + retract + 4.0f * layout.sag * t * (1.0f - t);
+            const int y0 = std::max(0, static_cast<int>(std::floor(y)) - band);
+            const int y1 = std::min(height - 1, static_cast<int>(std::ceil(y)) + band);
+            for (int row = y0; row <= y1; ++row) {
+                BYTE* pixel = pixels + (static_cast<size_t>(row) * static_cast<size_t>(width) +
+                                        static_cast<size_t>(x)) *
+                                           4u;
+                if (pixel[3] == 0) {
+                    pixel[3] = 1;
+                }
+            }
+        }
+    }
+}
+
 void RackWindow::Paint(ID2D1RenderTarget* target)
 {
     if (!plugin_) {
@@ -2396,9 +2493,17 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         return MA_NOACTIVATE;
 
     case WM_NCHITTEST: {
-        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        POINT screen{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        POINT point = screen;
         ScreenToClient(hwnd(), &point);
-        if (expand_ < 0.05f) {
+        if (expand_ <= 0.001f) {
+            return HTTRANSPARENT;
+        }
+        /* 剪贴板面板是独立置顶窗口。如果它被晾衣架压住（某些操作会把
+           晾衣架重新提到最上面），在面板矩形里让出点击，避免面板被
+           「全宽晾衣架」挡住；不能用 WS_EX_TRANSPARENT 整窗让，
+           那会把卡片上的右键一起送进桌面。 */
+        if (plugin_ && plugin_->ClipboardOpen() && plugin_->ClipboardContains(screen)) {
             return HTTRANSPARENT;
         }
         /* 卡片/夹子范围先按轴对齐包围盒兜底：命中测试受旋转、动画和空隙影响，
@@ -2445,6 +2550,13 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
 
     case WM_LBUTTONDOWN: {
         if (!plugin_) {
+            return 0;
+        }
+        /* 宿主的右键菜单刚被这一下左键关掉：这次点击只用来收菜单，
+           不要再顺手复制/拖动卡片。 */
+        if (hostMenuWasOpen_ && !plugin_->MenuOpen()) {
+            hostMenuWasOpen_ = false;
+            UpdateClickThrough();
             return 0;
         }
         if (CursorOverLine() && expand_ < 0.3f) {
@@ -2927,8 +3039,15 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const RackHit hit = view_.HitTest(static_cast<float>(point.x),
                                           static_cast<float>(point.y), scale_);
-        if (hit.part == RackPart::Card && hit.index >= 0 &&
-            hit.index < static_cast<int>(plugin_->items().size())) {
+        /* 卡片上任何位置都能开菜单：夹子、便签纸、色块、链接正文和
+           悬停才出现的锁定/关闭按钮也算。右键只负责开菜单，
+           不会执行这些控件的单击动作。 */
+        const bool onCard = hit.index >= 0 &&
+                            (hit.part == RackPart::Card || hit.part == RackPart::Note ||
+                             hit.part == RackPart::Clip || hit.part == RackPart::Close ||
+                             hit.part == RackPart::Lock || hit.part == RackPart::CardLink ||
+                             hit.part == RackPart::CardColor);
+        if (onCard && hit.index < static_cast<int>(plugin_->items().size()) && !menuOpen_) {
             POINT screen = point;
             ClientToScreen(hwnd(), &screen);
             ShowItemMenu(hit.index, screen);

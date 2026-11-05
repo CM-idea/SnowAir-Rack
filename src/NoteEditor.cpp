@@ -78,7 +78,7 @@ D2D1_COLOR_F RgbColor(uint32_t rgb)
 
 bool UsesDarkInk(const D2D1_COLOR_F& accent)
 {
-    return 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b > 0.72f;
+    return 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b > 0.85f;
 }
 
 D2D1_COLOR_F Black()
@@ -818,7 +818,7 @@ void NoteEditor::Paint(ID2D1RenderTarget* target)
     if (flatLook) {
         cardAccent = RgbColor(look_.accentSet ? look_.accent : card::DefaultAccent(look_.type));
         headerColor = cardAccent;
-        cardTitleColor = UsesDarkInk(cardAccent) ? D2D1::ColorF(0.12f, 0.12f, 0.12f) : White();
+        cardTitleColor = UsesDarkInk(cardAccent) ? D2D1::ColorF(0.318f, 0.318f, 0.318f) : White();
         cardBodyColor = D2D1::ColorF(0.318f, 0.318f, 0.318f);
         paperTop = White();
         paperBottom = White();

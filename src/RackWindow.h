@@ -38,6 +38,7 @@ public:
     static LRESULT CALLBACK TopBarHookProc(int code, WPARAM wParam, LPARAM lParam);
     static RackWindow* topBarOwner_;
     bool rightCardDown_ = false;
+    uint64_t rightCardDownAt_ = 0;
     HHOOK topBarHook_ = nullptr;
     bool expanded() const { return expand_ > 0.5f; }
 
@@ -52,6 +53,7 @@ public:
 protected:
     void BeforeDraw(ID2D1RenderTarget* target) override;
     void Paint(ID2D1RenderTarget* target) override;
+    void AfterDraw(HDC dc, void* bits, int width, int height) override;
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) override;
 
 private:

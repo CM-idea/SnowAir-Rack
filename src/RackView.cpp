@@ -307,7 +307,8 @@ D2D1_COLOR_F MixColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t)
 bool AccentUsesDarkInk(const D2D1_COLOR_F& accent)
 {
     const float luminance = 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b;
-    return luminance > 0.72f;
+    /* 只有接近白/特别浅的头部才用深字；普通彩色头部保持白字。 */
+    return luminance > 0.85f;
 }
 
 int ColorCountFor(const Item& item)
@@ -1251,6 +1252,8 @@ void RackView::BeginArrival(int index)
     arrivalIndex_ = index;
     arrivalStartMs_ = rack::NowMs();
     arrivalStart_ = D2D1::Point2F(layout_.width * 0.5f, layout_.height * 0.72f);
+    arrivalW_ = 0.0f;
+    arrivalH_ = 0.0f;
     arrivalStartSet_ = false;
 }
 
@@ -1277,7 +1280,15 @@ float RackView::AnimationHeight() const
         bottom = std::max(bottom, layout_.lineY + layout_.sag + 160.0f * s + 560.0f * s);
     }
     if (HasArrival()) {
-        const float half = std::max(arrivalH_, 120.0f * s) * 0.5f;
+        /* 文本/便签入场没有 captureH，起始高度和 DrawArrival 一样按目标
+           卡高的 1.35 倍算；否则窗口只按 120*s 加高，底部会被裁掉。 */
+        float startH = arrivalH_;
+        if (startH <= 0.0f && arrivalIndex_ >= 0 &&
+            arrivalIndex_ < static_cast<int>(cards_.size())) {
+            const CardBox& target = cards_[static_cast<size_t>(arrivalIndex_)];
+            startH = (target.card.bottom - target.card.top) * 1.35f;
+        }
+        const float half = std::max(startH, 120.0f * s) * 0.5f;
         bottom = std::max(bottom, arrivalStart_.y + half + 32.0f * s);
     }
     return bottom;
@@ -2170,7 +2181,7 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
     const D2D1_COLOR_F accent = AccentFor(item);
     const bool darkInk = AccentUsesDarkInk(accent);
     const D2D1_COLOR_F headerInk =
-        darkInk ? D2D1::ColorF(0.12f, 0.12f, 0.12f) : D2D1::ColorF(1.0f, 1.0f, 1.0f);
+        darkInk ? D2D1::ColorF(0.318f, 0.318f, 0.318f) : D2D1::ColorF(1.0f, 1.0f, 1.0f);
     const D2D1_RECT_F header =
         D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
     const D2D1_RECT_F body =
