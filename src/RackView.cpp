@@ -1083,16 +1083,10 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         arrivalIndex_ = -1;
     }
 
-    if (expanded && layout.content.right > layout.content.left &&
-        layout.content.bottom > layout.content.top) {
-        ComPtr<ID2D1SolidColorBrush> hit;
-        if (SUCCEEDED(target->CreateSolidColorBrush(
-                D2D1::ColorF(theme.canvas.r, theme.canvas.g, theme.canvas.b, 1.0f / 255.0f),
-                hit.GetAddressOf()))) {
-            target->FillRoundedRectangle(
-                D2D1::RoundedRect(layout.content, 10.0f * s, 10.0f * s), hit.Get());
-        }
-    }
+    /* 不再给 layout.content 铺 1/255 的「命中底」。
+       分层窗口的鼠标命中只看 alpha：铺了底之后整块内容区都算窗口，
+       卡片之间/绳子下方的空白会把点击全部拦下来，下面的程序点不到。
+       可交互区域由 RackWindow::AfterDraw 只给绳子、卡片本体和配件补 alpha。 */
 
     lineRetract_ =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) *
@@ -1142,17 +1136,9 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         return base;
     };
 
-    /* 阴影必须全部先画，否则后画的卡片阴影会盖到前一张的白边上。 */
-    for (size_t i = 0; i < cards_.size() && i < items.size(); ++i) {
-        if (static_cast<int>(i) == arrivalIndex_) continue;
-        if (static_cast<int>(i) == editingCard_) continue;
-        if (IsNewCard(items[i])) {
-            continue; /* 新式卡不画外发光/阴影，避免四周出现灰色毛边。 */
-        }
-        CardBox box = cards_[i];
-        ShiftCard(box, CardEntryOffset(items[i]));
-        DrawCardShadow(target, box, s, static_cast<int>(i) == hovered);
-    }
+    /* 图片卡的外阴影不再绘制：阴影是半透明像素，分层窗口的命中测试
+       只看 alpha，18px 的阴影会把卡片之间的空隙也占成可点击区域，
+       右键点缝隙时下面的程序收不到。卡片本体仍保留描边和圆角。 */
 
     auto drawGroup = [&](size_t i, bool isHovered) {
         if (static_cast<int>(i) == arrivalIndex_) return;
@@ -2765,7 +2751,8 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
         D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
 
     target->SetTransform(D2D1::Matrix3x2F::Rotation(box.angle + swayAngle, center));
-    DrawShadow(target, box.note, 2.0f * s, 2.0f * s, 5.0f * s, 0.12f);
+    /* 便签条的外阴影同样不画：它是 alpha>0 的空白像素，
+       会把卡片下方的点击一起吃掉。 */
 
     ComPtr<ID2D1SolidColorBrush> fill;
     ComPtr<ID2D1SolidColorBrush> edge;

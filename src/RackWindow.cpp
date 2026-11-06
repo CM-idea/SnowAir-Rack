@@ -115,6 +115,33 @@ bool NearlySameRect(const RECT& a, const RECT& b)
            std::abs(a.right - b.right) <= 2 && std::abs(a.bottom - b.bottom) <= 2;
 }
 
+D2D1_POINT_2F RotateAroundPoint(D2D1_POINT_2F point, D2D1_POINT_2F center, float degrees)
+{
+    const float radians = degrees * 3.1415926535f / 180.0f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float dx = point.x - center.x;
+    const float dy = point.y - center.y;
+    return D2D1::Point2F(center.x + dx * c - dy * s, center.y + dx * s + dy * c);
+}
+
+/* 悬停时卡片最多放大到这个倍数，命中形状和绘制保持一致。 */
+constexpr float kCardHoverScale = 1.05f;
+
+bool RoundedRectContains(float x, float y, float left, float top, float right, float bottom,
+                         float radius)
+{
+    if (x < left || x > right || y < top || y > bottom) {
+        return false;
+    }
+    radius = std::max(0.0f, std::min(radius, std::min(right - left, bottom - top) * 0.5f));
+    const float cx = std::clamp(x, left + radius, right - radius);
+    const float cy = std::clamp(y, top + radius, bottom - radius);
+    const float dx = x - cx;
+    const float dy = y - cy;
+    return dx * dx + dy * dy <= radius * radius;
+}
+
 } /* namespace */
 
 RackWindow::RackWindow() = default;
@@ -427,7 +454,6 @@ bool RackWindow::IsTopBarPoint(POINT screen) const
 int RackWindow::CardIndexAtScreen(POINT screen) const
 {
     if (!hwnd()) return -1;
-    /* 先精确命中；卡片旋转或动画中命中可能为空，再用轴对齐包围盒兜底。 */
     POINT client = screen;
     ScreenToClient(hwnd(), &client);
     const float px = static_cast<float>(client.x);
@@ -438,16 +464,111 @@ int RackWindow::CardIndexAtScreen(POINT screen) const
         hit.part != RackPart::Envelope) {
         return hit.index;
     }
-    const float pad = 10.0f * scale_;
+    /* 旋转/悬停放大后的卡片边缘用和绘制完全一致的形状再兜一次，
+       不再用 10px 的轴对齐包围盒——那会把卡片旁边的空白也吃进来。 */
+    const float extra = 2.5f * scale_;
     for (int i = 0;; ++i) {
         const CardBox* box = view_.CardAt(i);
         if (!box) break;
-        if (px >= box->card.left - pad && px <= box->card.right + pad &&
-            py >= box->pinTop - pad && py <= box->card.bottom + pad) {
+        if (PointInCardShape(*box, px, py, extra) ||
+            (box->hasNote && PointInNoteShape(*box, px, py, extra))) {
             return i;
         }
     }
     return -1;
+}
+
+bool RackWindow::PointInCardShape(const CardBox& box, float x, float y, float extra) const
+{
+    const D2D1_POINT_2F pivot =
+        D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
+    D2D1_POINT_2F local = RotateAroundPoint(D2D1::Point2F(x, y), pivot, -box.angle);
+    /* 反向抵消悬停放大：绘制时卡片以夹子为原点放大到 1.05 倍。 */
+    local.x = pivot.x + (local.x - pivot.x) / kCardHoverScale;
+    local.y = pivot.y + (local.y - pivot.y) / kCardHoverScale;
+
+    const float left = box.card.left - extra;
+    const float top = box.card.top - extra;
+    const float right = box.card.right + extra;
+    const float bottom = box.card.bottom + extra;
+    if (right <= left || bottom <= top) {
+        return false;
+    }
+    float radius = 0.0f;
+    if (box.cardType == card::Type::Note) {
+        radius = 0.0f; /* 便签是方角纸卡 */
+    } else if (box.flat) {
+        radius = (box.card.right - box.card.left) / 10.0f;
+    } else {
+        radius = 12.0f * scale_;
+    }
+    return RoundedRectContains(local.x, local.y, left, top, right, bottom, radius);
+}
+
+bool RackWindow::PointInNoteShape(const CardBox& box, float x, float y, float extra) const
+{
+    if (!box.hasNote || box.note.right <= box.note.left || box.note.bottom <= box.note.top) {
+        return false;
+    }
+    const D2D1_POINT_2F pivot =
+        D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
+    const D2D1_POINT_2F local = RotateAroundPoint(D2D1::Point2F(x, y), pivot, -box.angle);
+    return local.x >= box.note.left - extra && local.x <= box.note.right + extra &&
+           local.y >= box.note.top - extra && local.y <= box.note.bottom + extra;
+}
+
+bool RackWindow::PointHittable(POINT screen) const
+{
+    if (!hwnd()) {
+        return false;
+    }
+    POINT client = screen;
+    ScreenToClient(hwnd(), &client);
+    return AlphaAt(client.x, client.y);
+}
+
+void RackWindow::CheckMissingFiles()
+{
+    if (!plugin_ || !hwnd() || dragStarted_ || mouseDown_ || menuOpen_ || editingNote_ ||
+        plugin_->MenuOpen()) {
+        return;
+    }
+
+    std::vector<int> missing;
+    const auto& items = plugin_->items();
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        const Item& item = items[static_cast<size_t>(i)];
+        if (item.kind == 1 || item.editing) {
+            continue; /* 便签/正在编辑的不看文件 */
+        }
+        std::vector<std::wstring> paths = item.paths;
+        if (paths.empty() && !item.path.empty()) {
+            paths.push_back(item.path);
+        }
+        if (paths.empty()) {
+            continue;
+        }
+        bool anyExists = false;
+        for (const auto& path : paths) {
+            if (!path.empty() &&
+                GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                anyExists = true;
+                break;
+            }
+        }
+        if (!anyExists) {
+            missing.push_back(i);
+        }
+    }
+
+    /* 从后往前移除，前面的索引不受影响；每张卡都走正常的掉落动画。 */
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        if (*it >= 0 && *it < static_cast<int>(plugin_->items().size())) {
+            RackLog(L"RackWindow: 文件已不存在，卡片自动落下: %s",
+                    plugin_->items()[static_cast<size_t>(*it)].path.c_str());
+            RemoveItem(*it, false);
+        }
+    }
 }
 
 LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lParam)
@@ -478,10 +599,13 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
                 !topBarOwner_->editingNote_) {
                 const int index = topBarOwner_->CardIndexAtScreen(mouse->pt);
                 if (index >= 0) {
-                    /* 只处理真正落在晾衣架上的点。WindowFromPoint 会把宿主菜单、
-                       剪贴板面板和其它顶层窗口优先返回，避免把它们的右键抢走。 */
+                    /* 只处理真正落在晾衣架上的点：
+                       - WindowFromPoint 确认没有菜单/面板/别的窗口压在卡片上；
+                       - PointHittable 看该像素 alpha 是否 > 0，空白区域（alpha=0）
+                         一律放行，交给下面真正的前台程序。 */
                     const HWND under = WindowFromPoint(mouse->pt);
-                    if (under != topBarOwner_->hwnd()) {
+                    if (under != topBarOwner_->hwnd() ||
+                        !topBarOwner_->PointHittable(mouse->pt)) {
                         return CallNextHookEx(nullptr, code, wParam, lParam);
                     }
                     topBarOwner_->rightCardDown_ = true;
@@ -702,6 +826,7 @@ void RackWindow::Collapse()
     }
     /* 收起动画期间卡片还在画面上，仍然要能接住右键；
        整窗穿透只留到完全收起之后（见 Animate）。 */
+    missingChecked_ = false;
     hotkeyPinned_ = false;
     expanding_ = false;
     peekUntil_ = 0;
@@ -868,6 +993,13 @@ void RackWindow::Animate()
         hovered_ = -1;
         DismissPreview();
         SetClickThrough(true);
+        missingChecked_ = false;
+    }
+    /* 每次完全展开后只查一次文件是否还在；不在就按正常掉落动画取下。
+       不做定时轮询：用户要求「下次展开时检查」。 */
+    if (!animating_ && expand_ >= 0.99f && !missingChecked_) {
+        missingChecked_ = true;
+        CheckMissingFiles();
     }
 }
 
@@ -2294,25 +2426,19 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
         return;
     }
     auto* pixels = static_cast<BYTE*>(bits);
-    /* 给卡片范围补一层「能看见但看不见」的 alpha=1 底：
-       分层窗口的命中测试只看 alpha，圆角外侧、贴边那一两像素和
-       便签纸右下折角都是 alpha=0，鼠标点上去会直接穿过窗口落到桌面。
-       把这些像素的 alpha 抬到 1（RGB 仍是 0，颜色上完全看不出来），
-       后续由 WM_NCHITTEST 决定这一块到底算不算卡片。 */
-    const int pad = std::max(2, static_cast<int>(std::lround(10.0f * scale_)));
-    auto raiseRect = [&](float left, float top, float right, float bottom) {
-        const int x0 = std::max(0, static_cast<int>(std::floor(left)) - pad);
-        const int y0 = std::max(0, static_cast<int>(std::floor(top)) - pad);
-        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(right)) + pad);
-        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(bottom)) + pad);
-        for (int y = y0; y <= y1; ++y) {
-            BYTE* row = pixels + static_cast<size_t>(y) * static_cast<size_t>(width) * 4u;
-            for (int x = x0; x <= x1; ++x) {
-                BYTE* pixel = row + static_cast<size_t>(x) * 4u;
-                if (pixel[3] == 0) {
-                    pixel[3] = 1;
-                }
-            }
+    /* 给卡片本身补一层「能看见但看不见」的 alpha=1 底：
+       分层窗口的命中测试只看 alpha，圆角/贴边/锁定按钮附近的 AA 像素
+       可能是 alpha=0，右键会直接穿过窗口落到桌面。
+       只补卡片真正画出来的形状（含旋转和悬停放大）外加 2.5px，
+       卡片旁边的空白不补，仍然 alpha=0 交给下面的程序。 */
+    const float extra = 2.5f * scale_;
+    const int margin = static_cast<int>(std::ceil(26.0f * scale_));
+    auto setOpaque = [&](int x, int y) {
+        BYTE* pixel = pixels + (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                static_cast<size_t>(x)) *
+                                   4u;
+        if (pixel[3] == 0) {
+            pixel[3] = 1;
         }
     };
 
@@ -2321,18 +2447,51 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
         if (!box) {
             break;
         }
-        raiseRect(box->card.left, box->card.top, box->card.right, box->card.bottom);
-        /* 夹子和卡片上沿之间的那一小段也算卡片，右键不会从缝里漏下去。 */
-        raiseRect(box->card.left, box->pinTop, box->card.right,
-                  box->card.top + 2.0f * scale_);
-        if (box->hasNote) {
-            raiseRect(box->note.left, box->note.top, box->note.right, box->note.bottom);
+        const int x0 = std::max(0, static_cast<int>(std::floor(box->card.left)) - margin);
+        const int y0 = std::max(0, static_cast<int>(std::floor(box->card.top)) - margin);
+        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(box->card.right)) + margin);
+        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(box->card.bottom)) + margin);
+
+        const D2D1_POINT_2F pivot =
+            D2D1::Point2F((box->card.left + box->card.right) * 0.5f, box->card.top);
+        const float radians = box->angle * 3.1415926535f / 180.0f;
+        const float ca = std::cos(radians);
+        const float sa = std::sin(radians);
+        const float left = box->card.left - extra;
+        const float top = box->card.top - extra;
+        const float right = box->card.right + extra;
+        const float bottom = box->card.bottom + extra;
+        float radius = 0.0f;
+        if (box->cardType == card::Type::Note) {
+            radius = 0.0f;
+        } else if (box->flat) {
+            radius = (box->card.right - box->card.left) / 10.0f;
+        } else {
+            radius = 12.0f * scale_;
+        }
+
+        for (int y = y0; y <= y1; ++y) {
+            const float dy = static_cast<float>(y) + 0.5f - pivot.y;
+            for (int x = x0; x <= x1; ++x) {
+                const float dx = static_cast<float>(x) + 0.5f - pivot.x;
+                /* 反向旋转（-angle）+ 反向悬停放大，得到卡片本地坐标。
+                   每张卡只算一次三角函数，逐像素只做乘加。 */
+                const float lx = pivot.x + dx * ca + dy * sa;
+                const float ly = pivot.y - dx * sa + dy * ca;
+                if (RoundedRectContains(pivot.x + (lx - pivot.x) / kCardHoverScale,
+                                        pivot.y + (ly - pivot.y) / kCardHoverScale, left, top,
+                                        right, bottom, radius) ||
+                    (box->hasNote && lx >= box->note.left - extra &&
+                     lx <= box->note.right + extra && ly >= box->note.top - extra &&
+                     ly <= box->note.bottom + extra)) {
+                    setOpaque(x, y);
+                }
+            }
         }
     }
 
     /* 绳子本身只有 1.6~2.3px 宽，AA 之后真正 alpha=255 的像素更少。
-       沿绳子的下垂曲线补 ±4px 的命中带，右键落在绳子上不会穿到桌面；
-       带子以外的空白仍然是 alpha=0，照常让给桌面。 */
+       沿绳子的下垂曲线补 ±2px 的命中带；带子以外的空白仍然是 alpha=0。 */
     const RackLayout& layout = view_.layout();
     if (layout.expanded && layout.lineEnd > layout.lineStart) {
         const float span = layout.lineEnd - layout.lineStart;
@@ -2343,7 +2502,7 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
         const int x0 = std::max(0, static_cast<int>(std::floor(layout.lineStart - 6.0f * scale_)));
         const int x1 = std::min(width - 1,
                                 static_cast<int>(std::ceil(layout.lineEnd + 6.0f * scale_)));
-        const int band = std::max(2, static_cast<int>(std::lround(4.0f * scale_)));
+        const int band = std::max(1, static_cast<int>(std::lround(2.0f * scale_)));
         for (int x = x0; x <= x1; ++x) {
             const float t = rack::Clamp((static_cast<float>(x) - layout.lineStart) / span, 0.0f,
                                         1.0f);
@@ -2351,12 +2510,7 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
             const int y0 = std::max(0, static_cast<int>(std::floor(y)) - band);
             const int y1 = std::min(height - 1, static_cast<int>(std::ceil(y)) + band);
             for (int row = y0; row <= y1; ++row) {
-                BYTE* pixel = pixels + (static_cast<size_t>(row) * static_cast<size_t>(width) +
-                                        static_cast<size_t>(x)) *
-                                           4u;
-                if (pixel[3] == 0) {
-                    pixel[3] = 1;
-                }
+                setOpaque(x, row);
             }
         }
     }
@@ -2506,16 +2660,16 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         if (plugin_ && plugin_->ClipboardOpen() && plugin_->ClipboardContains(screen)) {
             return HTTRANSPARENT;
         }
-        /* 卡片/夹子范围先按轴对齐包围盒兜底：命中测试受旋转、动画和空隙影响，
-           偶尔会把卡片上的点判成 None，右键就漏到桌面。 */
+        /* 卡片边缘用和绘制一致的形状命中（含旋转/悬停放大），
+           不再用 10px 轴对齐包围盒——卡片旁边的空白要留给下面的程序。 */
         const float px = static_cast<float>(point.x);
         const float py = static_cast<float>(point.y);
-        const float pad = 10.0f * scale_;
+        const float extra = 2.5f * scale_;
         for (int i = 0;; ++i) {
             const CardBox* box = view_.CardAt(i);
             if (!box) break;
-            if (px >= box->card.left - pad && px <= box->card.right + pad &&
-                py >= box->pinTop - pad && py <= box->card.bottom + pad) {
+            if (PointInCardShape(*box, px, py, extra) ||
+                (box->hasNote && PointInNoteShape(*box, px, py, extra))) {
                 return HTCLIENT;
             }
         }
@@ -3037,20 +3191,13 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        const RackHit hit = view_.HitTest(static_cast<float>(point.x),
-                                          static_cast<float>(point.y), scale_);
-        /* 卡片上任何位置都能开菜单：夹子、便签纸、色块、链接正文和
-           悬停才出现的锁定/关闭按钮也算。右键只负责开菜单，
-           不会执行这些控件的单击动作。 */
-        const bool onCard = hit.index >= 0 &&
-                            (hit.part == RackPart::Card || hit.part == RackPart::Note ||
-                             hit.part == RackPart::Clip || hit.part == RackPart::Close ||
-                             hit.part == RackPart::Lock || hit.part == RackPart::CardLink ||
-                             hit.part == RackPart::CardColor);
-        if (onCard && hit.index < static_cast<int>(plugin_->items().size()) && !menuOpen_) {
-            POINT screen = point;
-            ClientToScreen(hwnd(), &screen);
-            ShowItemMenu(hit.index, screen);
+        POINT screen = point;
+        if (hwnd()) ClientToScreen(hwnd(), &screen);
+        /* 用和钩子完全相同的卡片命中（含旋转/悬停边缘、夹子、便签纸），
+           卡片上任何位置右键都能开菜单，但空白区域不会走到这里。 */
+        const int index = CardIndexAtScreen(screen);
+        if (index >= 0 && index < static_cast<int>(plugin_->items().size()) && !menuOpen_) {
+            ShowItemMenu(index, screen);
         }
         return 0;
     }

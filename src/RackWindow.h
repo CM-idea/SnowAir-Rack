@@ -102,6 +102,14 @@ private:
     void UpdateClickThrough();
     void SetClickThrough(bool enabled);
     void CheckEditing();
+    /* 卡片/便签条的精确命中形状（含旋转与悬停放大），extra 是外扩像素。 */
+    bool PointInCardShape(const CardBox& box, float x, float y, float extra) const;
+    bool PointInNoteShape(const CardBox& box, float x, float y, float extra) const;
+    /* 指针下这个像素是否真的画了东西。分层窗口只看 alpha，
+       低级鼠标钩子用它把空白区域让给下面的程序。 */
+    bool PointHittable(POINT screen) const;
+    /* 图片/文件被删除后，把绳子上的卡片自动取下。 */
+    void CheckMissingFiles();
 
     RackHit HitAtCursor() const;
     int HitIndexAtCursor(RackPart* outPart = nullptr) const;
@@ -250,4 +258,6 @@ private:
     bool needsLayout_ = false;
     bool editingWatchActive_ = false;
     bool historyDisabled_ = false;
+    /* 每次展开只查一次文件是否还在；不做定时轮询。 */
+    bool missingChecked_ = false;
 };

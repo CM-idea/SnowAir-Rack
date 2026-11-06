@@ -75,6 +75,18 @@ POINT LayeredWindow::screenOrigin() const
     return POINT{rect.left, rect.top};
 }
 
+bool LayeredWindow::AlphaAt(int x, int y) const
+{
+    if (!bits_ || x < 0 || y < 0 || x >= surfaceWidth_ || y >= surfaceHeight_) {
+        return false;
+    }
+    const auto* pixels = static_cast<const BYTE*>(bits_);
+    const size_t offset =
+        (static_cast<size_t>(y) * static_cast<size_t>(surfaceWidth_) + static_cast<size_t>(x)) *
+        4u;
+    return pixels[offset + 3u] > 0;
+}
+
 bool LayeredWindow::EnsureSurface(int width, int height)
 {
     if (width <= 0 || height <= 0 || !memoryDC_) {

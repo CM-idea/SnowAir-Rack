@@ -27,6 +27,9 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
     float dpiScale() const { return dpiScale_; }
+    /* 当前提交画面上这个像素是否可见（alpha > 0）。分层窗口的鼠标
+       命中只看 alpha，低级鼠标钩子要按它判断“这个点到底是不是卡片”。 */
+    bool AlphaAt(int x, int y) const;
 
     void MoveTo(int x, int y, int w, int h);
     /* 仅移动位置：用现有画面做一次 UpdateLayeredWindow，拖动时不会闪。 */
