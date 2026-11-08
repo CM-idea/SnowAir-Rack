@@ -167,6 +167,8 @@ bool RackWindow::Init(Plugin* plugin, Graphics* graphics)
     cardScaleValue_ = plugin_->config().CardScale();
     cardScaleFrom_ = cardScaleValue_;
     cardScaleTarget_ = cardScaleValue_;
+    lastDisplayMode_ = plugin_->config().displayMode;
+    manuallyHidden_ = lastDisplayMode_ == kDisplayHotkey;
     if (!preview_.Init(graphics)) {
         RackLog(L"RackWindow: preview initialization failed");
         return false;
@@ -227,20 +229,24 @@ void RackWindow::OnItemsChanged(bool added)
         if (view_.HasRemoved()) {
             // 等最后一张卡片移入篮子再收起。
             hideWhenRemovalsDone_ = true;
-            EnsureVisible();
-            if (expand_ < 0.9f) {
-                expanding_ = true;
-                StartAnimation(1.0f);
+            if (!(manuallyHidden_ &&
+                  plugin_->config().displayMode != kDisplayHover)) {
+                EnsureVisible();
+                if (expand_ < 0.9f) {
+                    expanding_ = true;
+                    StartAnimation(1.0f);
+                }
             }
             if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
             Render();
             return;
         }
-        if (!plugin_->config().autoRetract) {
-            // 常驻模式下即使没有卡片也保留衣架本体，而不是把窗口整个收掉。
+        if (plugin_->config().displayMode != kDisplayHover) {
+            // 快捷键/常驻模式：没有卡片也保留衣架本体；手动隐藏时不要自动拉起。
             hideWhenRemovalsDone_ = false;
             EnsureVisible();
-            if (expand_ < 0.9f) {
+            if (plugin_->config().displayMode == kDisplayAlways && !manuallyHidden_ &&
+                expand_ < 0.9f) {
                 Expand(false);
             } else {
                 Render();
@@ -284,9 +290,19 @@ void RackWindow::OnItemsChanged(bool added)
                                   static_cast<float>(cursor.y));
         }
         if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
-        Expand(true);
+        /* 快捷键/常驻模式被手动隐藏时，新卡片只更新数据，不主动把绳子拉出来；
+           等用户按快捷键显示。悬停模式保持原来的「新卡片 peek」。 */
+        if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+            Render();
+        } else {
+            Expand(true);
+        }
     } else {
         EnsureVisible();
+        if (plugin_->config().displayMode == kDisplayAlways && !manuallyHidden_ &&
+            expand_ < 0.9f) {
+            Expand(false);
+        }
         Render();
     }
 }
@@ -311,6 +327,27 @@ void RackWindow::OnConfigChanged()
         return;
     }
     RefreshHistoryDisabled();
+    /* 显示方式切到快捷键/常驻时立刻按新模式摆好：
+       - 快捷键：先藏起来，等用户按快捷键
+       - 常驻：直接展开
+       - 悬停：显示绳子，等指针靠近 */
+    const int newDisplayMode = plugin_->config().displayMode;
+    if (newDisplayMode != lastDisplayMode_) {
+        lastDisplayMode_ = newDisplayMode;
+        manuallyHidden_ = newDisplayMode == kDisplayHotkey;
+        if (newDisplayMode != kDisplayHotkey) {
+            /* 切回悬停/常驻时，之前为快捷键模式排队的收起不应再生效。 */
+            collapseAfterPreview_ = false;
+        }
+        if (newDisplayMode == kDisplayHotkey) {
+            Collapse();
+        } else {
+            EnsureVisible();
+            if (newDisplayMode == kDisplayAlways) {
+                Expand(false);
+            }
+        }
+    }
     /* 尺寸档位变化：只记录目标档位，卡片宽度和槽位在 Animate 里逐帧缓动。
        不在这里清偏移/槽位，否则会跳变。 */
     const int newCardSize = plugin_->config().size;
@@ -336,8 +373,8 @@ void RackWindow::OnConfigChanged()
     needsLayout_ = true;
     Reposition();
     EnsureVisible();
-    /* 关闭「自动收回」后衣架常驻：任何配置变化都把它重新展开。 */
-    if (!plugin_->config().autoRetract && expand_ < 0.9f) {
+    /* 常驻模式：配置变化后保持展开；快捷键/悬停模式不在这里主动拉开。 */
+    if (newDisplayMode == kDisplayAlways && !manuallyHidden_ && expand_ < 0.9f) {
         Expand(false);
     }
     Render();
@@ -381,6 +418,11 @@ void RackWindow::RenderNow()
 void RackWindow::Expand(bool peek)
 {
     if (!plugin_) {
+        return;
+    }
+    /* 手动隐藏状态下，除了快捷键路径（会先清掉 manuallyHidden_），
+       任何自动展开都不能把绳子拉出来。 */
+    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
         return;
     }
     const uint64_t now = rack::NowMs();
@@ -775,6 +817,20 @@ void RackWindow::ToggleVisibility()
     if (!plugin_) {
         return;
     }
+    const int mode = plugin_->config().displayMode;
+    if (mode != kDisplayHover) {
+        /* 快捷键/常驻模式：纯手动开关，不受悬停和自动收回影响。 */
+        if (!manuallyHidden_ && (expanding_ || expanded())) {
+            manuallyHidden_ = true;
+            Collapse();
+        } else {
+            manuallyHidden_ = false;
+            collapseAfterPreview_ = false;
+            EnsureVisible();
+            Expand(false);
+        }
+        return;
+    }
     if (expanding_ || expanded()) {
         hotkeyPinned_ = false;
         Collapse();
@@ -819,8 +875,12 @@ void RackWindow::ShakeCard(int index)
 void RackWindow::Collapse()
 {
     if (plugin_ && plugin_->PreviewPinned()) {
+        /* 设置页的「晾衣架外观」正在 pin 住预览：现在收会被宿主立刻拉开。
+           记下来，等预览结束（rack.preview 变 false）再补一次收起。 */
+        collapseAfterPreview_ = true;
         return;
     }
+    collapseAfterPreview_ = false;
     if (view_.HasRemoved()) {
         return;
     }
@@ -994,6 +1054,11 @@ void RackWindow::Animate()
         DismissPreview();
         SetClickThrough(true);
         missingChecked_ = false;
+        /* 快捷键/常驻模式被手动关掉：收起动画结束后把窗口一起隐藏，
+           下次只能靠快捷键重新显示。 */
+        if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+            Hide();
+        }
     }
     /* 每次完全展开后只查一次文件是否还在；不在就按正常掉落动画取下。
        不做定时轮询：用户要求「下次展开时检查」。 */
@@ -1113,6 +1178,10 @@ void RackWindow::EnsureVisible()
     if (!hwnd() || !plugin_ || !plugin_->config().enabled || hiddenForFullscreen_) {
         return;
     }
+    /* 快捷键/常驻模式下被快捷键隐藏时，任何自动路径都不能再把窗口拉出来。 */
+    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+        return;
+    }
     if (!visible()) {
         if (!monitor_) {
             monitor_ = CursorMonitor();
@@ -1203,6 +1272,10 @@ void RackWindow::Tick()
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
         lastInside_ = rack::NowMs();
+    } else if (collapseAfterPreview_) {
+        /* 设置页的预览刚结束：把之前因为 pin 住而没执行的那次收起补上。 */
+        collapseAfterPreview_ = false;
+        Collapse();
     }
 
     if (!plugin_->config().enabled) {
@@ -1236,13 +1309,17 @@ void RackWindow::Tick()
         hiddenForFullscreen_ = false;
         EnsureVisible();
         Reposition();
-        if (!plugin_->config().autoRetract && expand_ < 0.9f) {
+        const int mode = plugin_->config().displayMode;
+        if (!manuallyHidden_ &&
+            (mode == kDisplayAlways || (mode == kDisplayHotkey && shownBeforeFullscreen_))) {
             Expand(false);
         }
+        shownBeforeFullscreen_ = false;
         Render();
     } else if (IsFullscreenOn(monitor_)) {
         DismissPreview();
         SetTopBarWatch(false);
+        shownBeforeFullscreen_ = !manuallyHidden_ && (expanding_ || expand_ > 0.5f);
         Hide();
         hiddenForFullscreen_ = true;
         expanding_ = false;
@@ -1335,8 +1412,9 @@ void RackWindow::UpdateHover()
     const bool overContent = CursorOverContent();
     const bool overPreview = PointOverPreview(cursor);
     const bool inside = overLine || overContent || overPreview;
+    const bool hoverMode = plugin_->config().displayMode == kDisplayHover;
 
-    if (overLine && !topBarSuppressed_ && expand_ < 0.3f) {
+    if (hoverMode && overLine && !topBarSuppressed_ && expand_ < 0.3f) {
         if (!lineHover_) {
             lineHover_ = true;
             hoverLineSince_ = now;
@@ -1346,7 +1424,7 @@ void RackWindow::UpdateHover()
         if (now - hoverLineSince_ >= static_cast<uint64_t>(delay)) {
             Expand(false);
         }
-    } else if (!overLine) {
+    } else if (!overLine || !hoverMode) {
         lineHover_ = false;
     }
 
@@ -2628,6 +2706,10 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
            便签编辑器开着时不动——那时候绳子本来就要一直展开。 */
         topBarSuppressed_ = true;
         if (expand_ > 0.5f && !editingNote_) {
+            if (plugin_ && plugin_->config().displayMode != kDisplayHover) {
+                /* 快捷键/常驻模式：顶栏点击也是一次手动隐藏。 */
+                manuallyHidden_ = true;
+            }
             Collapse();
         }
         return 0;
