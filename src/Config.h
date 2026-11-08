@@ -13,7 +13,7 @@ inline constexpr wchar_t kAutoCapture[] = L"rack.auto_capture";
 inline constexpr wchar_t kSize[] = L"rack.size";
 } /* namespace config_keys */
 
-/* 0=悬停展开，1=快捷键切换（默认隐藏），2=常驻展开（默认显示）。 */
+/* 0=悬停展开，1=快捷键切换（默认隐藏），2=常驻显示（默认显示）。 */
 inline constexpr int kDisplayHover = 0;
 inline constexpr int kDisplayHotkey = 1;
 inline constexpr int kDisplayAlways = 2;

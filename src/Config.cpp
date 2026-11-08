@@ -14,7 +14,7 @@ void RackConfig::Load(const SnowAirHost* host, void* user)
         mode = host->config_get_int(user, config_keys::kDisplayMode, -1);
     }
     if (mode < 0) {
-        /* 旧版本只有 rack.auto_retract：true → 悬停展开，false → 常驻展开。 */
+        /* 旧版本只有 rack.auto_retract：true → 悬停展开，false → 常驻显示。 */
         const bool legacyAuto =
             host->config_get_bool ? host->config_get_bool(user, config_keys::kAutoRetract, true)
                                   : true;

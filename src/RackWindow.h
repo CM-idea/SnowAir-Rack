@@ -260,7 +260,7 @@ private:
     bool historyDisabled_ = false;
     /* 每次展开只查一次文件是否还在；不做定时轮询。 */
     bool missingChecked_ = false;
-    /* 显示方式：0 悬停展开、1 快捷键切换、2 常驻展开。 */
+    /* 显示方式：0 悬停展开、1 快捷键切换、2 常驻显示。 */
     int lastDisplayMode_ = 0;
     /* 快捷键模式下手动隐藏：隐藏后不再被悬停/配置轮询自动拉起。 */
     bool manuallyHidden_ = false;
