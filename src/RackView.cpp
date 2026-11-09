@@ -1798,7 +1798,8 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
             target->DrawBitmap(envelopeFront->bitmap.Get(), dest, 1.0f,
                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         }
-        DrawCountBadge(target, envelopeCenter, badgeTop, clipboardCount, s);
+        // 信封打开的是「截图历史 + 剪切板」合并列表，角标也要算总数，不能只数剪切板
+        DrawCountBadge(target, envelopeCenter, badgeTop, clipboardCount + historyCount, s);
     }
 }
 

@@ -430,16 +430,26 @@ bool ClipboardBubble::IsSvgEntry(const Entry& entry) const
     return entry.kind == SNOWAIR_ENTRY_TEXT && !entry.thumb.empty();
 }
 
+namespace {
+/* 截图的细分来源都归「截图」分类（全屏 / 焦点窗口 / 长截图 / 自动保存） */
+bool IsCaptureSource(int source)
+{
+    return source == SNOWAIR_SOURCE_CAPTURE || source == SNOWAIR_SOURCE_FULLSCREEN ||
+           source == SNOWAIR_SOURCE_FOCUSED || source == SNOWAIR_SOURCE_LONG ||
+           source == SNOWAIR_SOURCE_AUTOSAVE;
+}
+} /* namespace */
+
 bool ClipboardBubble::CategoryMatches(const Entry& entry, const Category& category) const
 {
     switch (category.builtin) {
     case 0: return true;
-    case 1: return entry.source == SNOWAIR_SOURCE_CAPTURE;
+    case 1: return IsCaptureSource(entry.source);
     case 2: return entry.kind == SNOWAIR_ENTRY_TEXT && !IsSvgEntry(entry);
     case 3: return entry.source == SNOWAIR_SOURCE_RECORD;
     case 4:
         return (entry.kind == SNOWAIR_ENTRY_IMAGE || IsSvgEntry(entry)) &&
-               entry.source != SNOWAIR_SOURCE_CAPTURE;
+               !IsCaptureSource(entry.source);
     case 5: return entry.kind == SNOWAIR_ENTRY_FILES;
     default: break;
     }
@@ -1622,7 +1632,14 @@ std::wstring ClipboardBubble::TypeTagFor(const Entry& entry) const
     case SNOWAIR_ENTRY_FILES:
         return L"文件";
     default:
-        return entry.source == SNOWAIR_SOURCE_CAPTURE ? L"截图" : L"图片";
+        switch (entry.source) {
+        case SNOWAIR_SOURCE_FULLSCREEN: return L"截取全屏";
+        case SNOWAIR_SOURCE_FOCUSED:    return L"焦点窗口";
+        case SNOWAIR_SOURCE_LONG:       return L"长截图";
+        case SNOWAIR_SOURCE_AUTOSAVE:   return L"自动保存";
+        case SNOWAIR_SOURCE_CAPTURE:    return L"截图";
+        default:                        return L"图片";
+        }
     }
 }
 

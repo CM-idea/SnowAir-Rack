@@ -17,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "SnowAir"
             VALUE "FileDescription", "SnowAir Rack plugin"
-            VALUE "FileVersion", "0.1.5.0"
+            VALUE "FileVersion", "0.1.6.0"
             VALUE "InternalName", "rack"
             VALUE "OriginalFilename", "rack.dll"
             VALUE "ProductName", "SnowAir-Rack"
-            VALUE "ProductVersion", "0.1.5.0"
+            VALUE "ProductVersion", "0.1.6.0"
         END
     END
     BLOCK "VarFileInfo"
