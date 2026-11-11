@@ -202,6 +202,7 @@ bool Plugin::Init(const SnowAirHost* host)
     }
     /* 老数据没有内容指纹：把补算的结果写回去，下次启动就不用再算。 */
     SaveItems();
+    PruneRackQuickCache();
 
     window_ = std::make_unique<RackWindow>();
     if (!window_->Init(this, graphics_.get())) {
@@ -374,6 +375,10 @@ void Plugin::OnHangImage(const std::wstring& path, const std::wstring& svgId)
     item.paths.push_back(full);
     item.sourcePath = full;
     item.svgId = svgId;
+    // 快速上绳的 RackQuick 临时图归插件所有：卡片取下时直接删文件，不留在缓存目录里。
+    if (_wcsicmp(std::filesystem::path(full).parent_path().filename().c_str(), L"RackQuick") == 0) {
+        item.ownsFile = true;
+    }
     item.aspect = aspect;
     item.addedMs = 0;
     item.mtime = util::FileWriteTime(full);
@@ -1101,6 +1106,49 @@ bool Plugin::SettingsGet(int index, SnowAirSettingDesc* out) const
     }
     *out = desc;
     return true;
+}
+
+void Plugin::PruneRackQuickCache()
+{
+    wchar_t appData[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) == 0) {
+        return;
+    }
+    std::filesystem::path dir{appData};
+    dir /= L"SnowAir";
+    dir /= L"RackQuick";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return;
+    }
+
+    std::vector<std::wstring> keep;
+    for (Item& item : items_) {
+        if (!item.path.empty() &&
+            _wcsicmp(std::filesystem::path(item.path).parent_path().filename().c_str(),
+                     L"RackQuick") == 0) {
+            item.ownsFile = true;
+            keep.push_back(item.path);
+        }
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec || !entry.is_regular_file(ec)) continue;
+        const std::wstring path = entry.path().wstring();
+        if (_wcsicmp(entry.path().extension().c_str(), L".png") != 0) continue;
+        if (entry.path().filename().wstring().rfind(L"quick-", 0) != 0) continue;
+        bool referenced = false;
+        for (const auto& kept : keep) {
+            if (util::SamePath(kept, path)) {
+                referenced = true;
+                break;
+            }
+        }
+        if (!referenced) {
+            std::error_code removeEc;
+            std::filesystem::remove(entry.path(), removeEc);
+        }
+    }
 }
 
 void Plugin::RemoveItemData(int index)

@@ -736,19 +736,20 @@ void RackWindow::NormalizeLoadedSpacing()
 
 void RackWindow::FinishCardDrag(int id)
 {
-    (void)id;
     if (!plugin_) {
         return;
     }
     struct Entry {
         float center = 0.0f;
+        float left = 0.0f;
+        float width = 0.0f;
         int index = -1;
     };
     std::vector<Entry> order;
     for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
         if (const CardBox* box = view_.Card(i)) {
-            order.push_back(
-                {(box->card.left + box->card.right) * 0.5f, i});
+            order.push_back({(box->card.left + box->card.right) * 0.5f, box->card.left,
+                             box->card.right - box->card.left, i});
         }
     }
     if (order.empty()) {
@@ -766,38 +767,75 @@ void RackWindow::FinishCardDrag(int id)
         return;
     }
 
-    /* 目标槽位由最终顺序决定；先把槽位钉到目标，再用 rackOffsetX 把每张卡
-       从松手时的视觉位置缓动回 0。这样两边一起走 1.1 的 180ms ease，
-       但最终位置严格按最终顺序，不会留下两张卡叠在一起。 */
     const std::vector<float> targets = view_.TargetLefts(reordered);
-    std::vector<std::pair<int, float>> oldLefts;
-    oldLefts.reserve(plugin_->items().size());
-    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
-        if (const CardBox* box = view_.Card(i)) {
-            oldLefts.push_back({plugin_->items()[static_cast<size_t>(i)].id,
-                                box->card.left});
+    std::vector<float> oldOffsets(reordered.size(), 0.0f);
+    std::vector<float> offsets(reordered.size(), 0.0f);
+    for (size_t i = 0; i < reordered.size(); ++i) {
+        oldOffsets[i] = reordered[i].rackOffsetX;
+    }
+
+    /* 拖到「两倍槽位间距」以内就吸附回槽位；超过才保留落点。
+       之前是没有任何阈值，拖多远都会弹回。 */
+    const float snapDistance = 2.0f * view_.DefaultGap();
+    for (size_t i = 0; i < reordered.size(); ++i) {
+        const Entry& entry = order[i];
+        const float desired = entry.left - targets[i];
+        const bool dragged = reordered[i].id == id;
+        const bool wasFree = std::abs(oldOffsets[i]) > snapDistance;
+        if (dragged) {
+            offsets[i] = std::abs(desired) <= snapDistance ? 0.0f : desired;
+        } else if (wasFree) {
+            // 之前已经自由摆放的卡：保持它现在看到的绝对位置，不跟着重排弹走。
+            offsets[i] = desired;
+        } else {
+            offsets[i] = 0.0f;
         }
     }
+
+    /* 自由位置导致贴得太近/重叠时，整排回到槽位（用户说的“图片太多挤到一起才吸附”）。 */
+    struct FinalBox {
+        float left = 0.0f;
+        float right = 0.0f;
+    };
+    std::vector<FinalBox> finals;
+    finals.reserve(reordered.size());
     for (size_t i = 0; i < reordered.size(); ++i) {
-        float oldLeft = targets[i];
-        for (const auto& entry : oldLefts) {
-            if (entry.first == reordered[i].id) {
-                oldLeft = entry.second;
-                break;
-            }
+        const float left = targets[i] + offsets[i];
+        finals.push_back({left, left + order[i].width});
+    }
+    std::sort(finals.begin(), finals.end(),
+              [](const FinalBox& a, const FinalBox& b) { return a.left < b.left; });
+    bool crowded = false;
+    const float minGap = 6.0f * scale_;
+    for (size_t i = 1; i < finals.size(); ++i) {
+        if (finals[i].left - finals[i - 1].right < minGap) {
+            crowded = true;
+            break;
         }
-        reordered[i].rackOffsetX = oldLeft - targets[i];
+    }
+    if (crowded) {
+        std::fill(offsets.begin(), offsets.end(), 0.0f);
     }
 
     view_.SnapSlotsTo(reordered, targets);
     plugin_->items() = std::move(reordered);
     offsetAnims_.clear();
     const uint64_t now = rack::NowMs();
-    for (auto& item : plugin_->items()) {
-        if (std::abs(item.rackOffsetX) > 0.35f) {
-            offsetAnims_.push_back({item.id, item.rackOffsetX, 0.0f, now, 180.0f});
+    for (size_t i = 0; i < plugin_->items().size(); ++i) {
+        Item& item = plugin_->items()[i];
+        const float oldOffset = oldOffsets[i];
+        const float newOffset = offsets[i];
+        if (std::abs(newOffset) > 0.35f) {
+            // 保留位置：直接落到最终视觉位置，不再缓动回 0。
+            item.rackOffsetX = newOffset;
+        } else if (std::abs(oldOffset) > 0.35f) {
+            // 吸附回槽位：从当前偏移缓动到 0。
+            item.rackOffsetX = oldOffset;
+            offsetAnims_.push_back({item.id, oldOffset, 0.0f, now, 180.0f});
             item.shakeStartMs = now;
             item.shakeAmp = 2.2f;
+        } else {
+            item.rackOffsetX = 0.0f;
         }
     }
     plugin_->SaveItems();
@@ -1801,7 +1839,9 @@ void RackWindow::CopyItem(int index)
     } else if (copyItem.kind == 1) {
         clipboard::CopyText(copyItem.note);
     } else if (copyItem.kind == 0) {
-        clipboard::CopyImage(copyItem.path);
+        // 和拖拽保持同一条路径：只给 CF_HDROP，Adobe 按「粘贴文件」导入 PNG，
+        // 透明通道由文件本身带；位图剪贴板会被 Adobe 取走并洗成白底。
+        clipboard::CopyFilePath(copyItem.path);
     } else if (!copyItem.paths.empty()) {
         if (copyItem.paths.size() > 1) {
             clipboard::CopyFilePaths(copyItem.paths);

@@ -90,6 +90,8 @@ private:
     Plugin& operator=(const Plugin&) = delete;
 
     void RemoveItemData(int index);
+    /* 清掉 RackQuick 下已经不在任何卡片里的旧缓存图（永久删除）。 */
+    void PruneRackQuickCache();
 
     /*
      * 便签数据在轻雪：这里只是读写它剪切板里的文本记录。

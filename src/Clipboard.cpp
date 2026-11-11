@@ -103,6 +103,8 @@ HGLOBAL MakePngHandle(const std::vector<BYTE>& bytes)
 
 HGLOBAL MakeDibHandle(const DecodedImage& image)
 {
+    // 传统 CF_DIB：Adobe 拖拽只认这一份，因此必须是 32bpp 并保留 alpha。
+    // 之前这里把 alpha 强制写成 0xFF，正是拖进去变白底的根因。
     const size_t headerSize = sizeof(BITMAPINFOHEADER);
     const size_t stride = static_cast<size_t>(image.width) * 4;
     const size_t total = headerSize + stride * image.height;
@@ -131,15 +133,48 @@ HGLOBAL MakeDibHandle(const DecodedImage& image)
     for (UINT y = 0; y < image.height; ++y) {
         const BYTE* src = image.bgra.data() +
                           static_cast<size_t>(image.height - 1 - y) * stride;
-        for (UINT x = 0; x < image.width; ++x) {
-            dst[x * 4 + 0] = src[x * 4 + 0];
-            dst[x * 4 + 1] = src[x * 4 + 1];
-            dst[x * 4 + 2] = src[x * 4 + 2];
-            dst[x * 4 + 3] = 0xFF; /* CF_DIB consumers expect an opaque image */
-        }
+        // BGRA 原样拷贝，alpha 不再置 255
+        std::memcpy(dst, src, stride);
         dst += stride;
     }
 
+    GlobalUnlock(handle);
+    return handle;
+}
+
+HGLOBAL MakeDibV5Handle(const DecodedImage& image)
+{
+    // CF_DIBV5：32bpp + alpha 掩码。设计软件（Adobe）优先取这份，透明通道才能保留。
+    const size_t headerSize = sizeof(BITMAPV5HEADER);
+    const size_t stride = static_cast<size_t>(image.width) * 4;
+    const size_t total = headerSize + stride * image.height;
+    HGLOBAL handle = AllocGlobal(total);
+    if (!handle) {
+        return nullptr;
+    }
+    auto* base = static_cast<BYTE*>(GlobalLock(handle));
+    if (!base) {
+        GlobalFree(handle);
+        return nullptr;
+    }
+
+    auto* header = reinterpret_cast<BITMAPV5HEADER*>(base);
+    *header = {};
+    header->bV5Size = sizeof(BITMAPV5HEADER);
+    header->bV5Width = static_cast<LONG>(image.width);
+    header->bV5Height = -static_cast<LONG>(image.height); /* top-down */
+    header->bV5Planes = 1;
+    header->bV5BitCount = 32;
+    header->bV5Compression = BI_BITFIELDS;
+    header->bV5SizeImage = static_cast<DWORD>(stride * image.height);
+    header->bV5RedMask = 0x00FF0000;
+    header->bV5GreenMask = 0x0000FF00;
+    header->bV5BlueMask = 0x000000FF;
+    header->bV5AlphaMask = 0xFF000000;
+    header->bV5CSType = LCS_sRGB;
+    header->bV5Intent = LCS_GM_GRAPHICS;
+
+    std::memcpy(base + headerSize, image.bgra.data(), stride * image.height);
     GlobalUnlock(handle);
     return handle;
 }
@@ -208,6 +243,15 @@ HGLOBAL MakeDibFromFile(const std::wstring& path)
     return MakeDibHandle(image);
 }
 
+HGLOBAL MakeDibV5FromFile(const std::wstring& path)
+{
+    DecodedImage image;
+    if (!DecodeBgra(path, image)) {
+        return nullptr;
+    }
+    return MakeDibV5Handle(image);
+}
+
 bool CopyImage(const std::wstring& path)
 {
     if (!util::FileExists(path)) {
@@ -233,7 +277,9 @@ bool CopyImage(const std::wstring& path)
     if (EmptyClipboard()) {
         bool any = false;
         if (decoded) {
-            any |= SetHandleData(CF_DIB, MakeDibHandle(image));
+            // 只给 DIBV5：Adobe 粘贴会走带 alpha 的这份；再给 CF_DIB 会被它优先取走，
+            // 32bpp BI_RGB 的 alpha 一丢就成白底。Figma / 其他软件仍可从 DIBV5 或 PNG 取图。
+            any |= SetHandleData(CF_DIBV5, MakeDibV5Handle(image));
         }
         if (!png.empty()) {
             UINT pngFormat = RegisterClipboardFormatW(L"PNG");

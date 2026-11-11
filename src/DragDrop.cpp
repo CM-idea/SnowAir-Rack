@@ -413,25 +413,10 @@ class RackDataObject final : public IDataObject {
 public:
     explicit RackDataObject(const std::wstring& path) : path_(path)
     {
-        util::ReadFileBytes(path, png_);
-
-        /* 先给位图，再给文件，最后给 PNG 字节：
-           设计软件（Illustrator 等）优先取 CF_DIB，粘进去的是图片本身，
-           而不会把路径当成文本来排版；资源管理器这类只要文件的仍拿 CF_HDROP。 */
-        const UINT png = RegisterClipboardFormatW(L"PNG");
-        const UINT pngMime = RegisterClipboardFormatW(L"image/png");
-
-        formats_[count_++] = MakeFormat(CF_DIB);
+        /* 图片卡拖拽只给 CF_HDROP：和从资源管理器拖一个 PNG 完全同一条路径。
+           Adobe 的拖放通道不认 DIBV5/PNG，取 CF_DIB 又会把 alpha 洗成白底；
+           只给文件后它按「导入文件」处理，透明通道由 PNG 自己带，Figma 等也照常收。 */
         formats_[count_++] = MakeFormat(CF_HDROP);
-        if (png) {
-            formats_[count_++] = MakeFormat(png);
-        }
-        if (pngMime) {
-            formats_[count_++] = MakeFormat(pngMime);
-        }
-        /* 拖到纯文本框时给路径文本；支持上传的区域仍优先拿文件/图片。 */
-        formats_[count_++] = MakeFormat(CF_UNICODETEXT);
-        formats_[count_++] = MakeFormat(CF_TEXT);
     }
 
     /* IUnknown 接口 */
@@ -469,6 +454,9 @@ public:
         if (!format || !medium) {
             return E_INVALIDARG;
         }
+        if (format->cfFormat != CF_HDROP) {
+            return DV_E_FORMATETC;
+        }
         if (format->lindex != -1 && format->lindex != 0) {
             return DV_E_FORMATETC;
         }
@@ -501,7 +489,14 @@ public:
         }
 
         HGLOBAL handle = nullptr;
-        if (format->cfFormat == CF_DIB) {
+        if (format->cfFormat == CF_DIBV5) {
+            if (!dibV5_) {
+                dibV5_ = clipboard::MakeDibV5FromFile(path_);
+            }
+            if (dibV5_) {
+                handle = OleDuplicateData(dibV5_, CF_DIBV5, GMEM_MOVEABLE);
+            }
+        } else if (format->cfFormat == CF_DIB) {
             if (!dib_) {
                 dib_ = clipboard::MakeDibFromFile(path_);
             }
@@ -561,20 +556,11 @@ public:
         if (!format) {
             return E_INVALIDARG;
         }
-        const UINT png = RegisterClipboardFormatW(L"PNG");
-        const UINT pngMime = RegisterClipboardFormatW(L"image/png");
-        bool known = format->cfFormat == CF_DIB || format->cfFormat == CF_HDROP ||
-                     format->cfFormat == CF_UNICODETEXT || format->cfFormat == CF_TEXT ||
-                     (png != 0 && format->cfFormat == png) ||
-                     (pngMime != 0 && format->cfFormat == pngMime);
-        bool supported = known && (format->tymed & TYMED_HGLOBAL);
-        for (const ExtraFormat& extra : extra_) {
-            if (extra.format.cfFormat == format->cfFormat &&
-                (format->tymed & extra.medium.tymed)) {
-                supported = true;
-            }
+        if (format->cfFormat != CF_HDROP) {
+            return DV_E_FORMATETC;
         }
-        if (!supported || (format->lindex != -1 && format->lindex != 0)) {
+        if (!(format->tymed & TYMED_HGLOBAL) ||
+            (format->lindex != -1 && format->lindex != 0)) {
             return DV_E_FORMATETC;
         }
         return S_OK;
@@ -646,6 +632,10 @@ private:
         for (ExtraFormat& extra : extra_) {
             ReleaseStgMedium(&extra.medium);
         }
+        if (dibV5_) {
+            GlobalFree(dibV5_);
+            dibV5_ = nullptr;
+        }
         if (dib_) {
             GlobalFree(dib_);
             dib_ = nullptr;
@@ -666,7 +656,8 @@ private:
     LONG ref_ = 1;
     std::wstring path_;
     std::vector<BYTE> png_;
-    FORMATETC formats_[6]{};
+    FORMATETC formats_[7]{};
+    HGLOBAL dibV5_ = nullptr;
     HGLOBAL dib_ = nullptr;
     UINT count_ = 0;
     std::vector<ExtraFormat> extra_;
