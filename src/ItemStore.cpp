@@ -1,4 +1,5 @@
 #include "ItemStore.h"
+#include "Storage.h"
 
 #include "MiniJson.h"
 #include "Util.h"
@@ -74,11 +75,15 @@ bool ItemStore::Load(std::vector<Item>& items) const
 {
     items.clear();
     std::vector<BYTE> bytes;
-    const bool loaded = util::ReadFileBytes(FilePath(), bytes);
-    if (!loaded || bytes.empty()) {
-        return true;
+    std::string text;
+    const bool fromHost = RackHostDataLoad(host_, L"rack.items", text);
+    if (!fromHost) {
+        const bool loaded = util::ReadFileBytes(FilePath(), bytes);
+        if (!loaded || bytes.empty()) {
+            return true;
+        }
+        text.assign(bytes.begin(), bytes.end());
     }
-    std::string text(bytes.begin(), bytes.end());
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
         static_cast<unsigned char>(text[1]) == 0xBB &&
         static_cast<unsigned char>(text[2]) == 0xBF) {
@@ -221,6 +226,7 @@ bool ItemStore::Load(std::vector<Item>& items) const
         }
         items.push_back(std::move(item));
     }
+    if (!fromHost && !items.empty()) Save(items);
     return true;
 }
 
@@ -275,6 +281,8 @@ bool ItemStore::Save(const std::vector<Item>& items) const
         output += " }";
     }
     output += "\n  ]\n}\n";
+
+    if (RackHostDataSave(host_, L"rack.items", output)) return true;
 
     const std::wstring target = FilePath();
     const std::wstring temp = target + L".tmp";

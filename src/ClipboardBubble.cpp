@@ -1,4 +1,5 @@
 #include "ClipboardBubble.h"
+#include "Storage.h"
 #include "MiniJson.h"
 #include "Util.h"
 
@@ -472,12 +473,16 @@ void ClipboardBubble::LoadCategories()
         categories_.push_back(std::move(category));
     }
     std::vector<BYTE> bytes;
-    const std::wstring path = util::JoinPath(util::GetDataDir(), L"clip-categories.json");
-    if (!util::ReadFileBytes(path, bytes) || bytes.empty()) {
-        RefreshVisibleCategories();
-        return;
+    std::string text;
+    const bool fromHost = RackHostDataLoad(host_, L"rack.categories", text);
+    if (!fromHost) {
+        const std::wstring path = util::JoinPath(util::GetDataDir(), L"clip-categories.json");
+        if (!util::ReadFileBytes(path, bytes) || bytes.empty()) {
+            RefreshVisibleCategories();
+            return;
+        }
+        text.assign(bytes.begin(), bytes.end());
     }
-    std::string text(bytes.begin(), bytes.end());
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
         static_cast<unsigned char>(text[1]) == 0xBB &&
         static_cast<unsigned char>(text[2]) == 0xBF) {
@@ -551,6 +556,7 @@ void ClipboardBubble::LoadCategories()
             }
         }
     }
+    if (!fromHost) SaveCategories();
     RefreshVisibleCategories();
 }
 
@@ -585,6 +591,7 @@ void ClipboardBubble::SaveCategories()
         output += "]";
     }
     output += "\n  }\n}\n";
+    if (RackHostDataSave(host_, L"rack.categories", output)) return;
     const std::wstring path = util::JoinPath(util::GetDataDir(), L"clip-categories.json");
     if (!util::WriteFileBytes(path, output.data(), output.size())) {
         RackLog(L"ClipboardBubble: failed to write %s", path.c_str());

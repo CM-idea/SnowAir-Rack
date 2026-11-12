@@ -20,6 +20,7 @@ struct NoteEntry {
  */
 class NoteStore {
 public:
+    void SetHost(const SnowAirHost* host) { host_ = host; }
     bool Load();
     bool Save();
 
@@ -35,4 +36,5 @@ private:
 
     std::vector<std::pair<std::wstring, NoteEntry>> entries_;
     bool dirty_ = false;
+    const SnowAirHost* host_ = nullptr;
 };

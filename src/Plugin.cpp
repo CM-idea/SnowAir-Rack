@@ -130,6 +130,8 @@ bool Plugin::Init(const SnowAirHost* host)
     }
 
     host_ = host;
+    itemStore_.SetHost(host);
+    notes_.SetHost(host);
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (SUCCEEDED(hr)) {

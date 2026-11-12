@@ -1,5 +1,6 @@
 #include "NoteStore.h"
 #include "MiniJson.h"
+#include "Storage.h"
 #include "Util.h"
 
 std::wstring NoteStore::FilePath() const
@@ -13,11 +14,14 @@ bool NoteStore::Load()
     dirty_ = false;
 
     std::vector<BYTE> bytes;
-    if (!util::ReadFileBytes(FilePath(), bytes) || bytes.empty()) {
-        return true;
+    std::string text;
+    const bool fromHost = RackHostDataLoad(host_, L"rack.notes", text);
+    if (!fromHost) {
+        if (!util::ReadFileBytes(FilePath(), bytes) || bytes.empty()) {
+            return true;
+        }
+        text.assign(bytes.begin(), bytes.end());
     }
-
-    std::string text(bytes.begin(), bytes.end());
     /* 兼容带 UTF-8 BOM 的编辑器保存出来的文件。 */
     if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
         static_cast<unsigned char>(text[1]) == 0xBB &&
@@ -58,6 +62,7 @@ bool NoteStore::Load()
         }
         entries_.emplace_back(std::move(widePath), std::move(entry));
     }
+    if (!fromHost && !entries_.empty()) Save();
     return true;
 }
 
@@ -83,6 +88,11 @@ bool NoteStore::Save()
         output += " }";
     }
     output += "\n  ]\n}\n";
+
+    if (RackHostDataSave(host_, L"rack.notes", output)) {
+        dirty_ = false;
+        return true;
+    }
 
     std::wstring target = FilePath();
     std::wstring temp = target + L".tmp";

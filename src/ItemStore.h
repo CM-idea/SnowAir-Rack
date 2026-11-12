@@ -10,9 +10,11 @@
  */
 class ItemStore {
 public:
+    void SetHost(const SnowAirHost* host) { host_ = host; }
     bool Load(std::vector<Item>& items) const;
     bool Save(const std::vector<Item>& items) const;
 
 private:
     std::wstring FilePath() const;
+    const SnowAirHost* host_ = nullptr;
 };
