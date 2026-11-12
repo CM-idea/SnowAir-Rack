@@ -1117,7 +1117,7 @@ std::wstring ClipboardBubble::TooltipAt(float x, float y, D2D1_RECT_F* anchor) c
                 switch (actions[static_cast<size_t>(action)]) {
                 case 0: return L"复制";
                 case 1: return L"在文件夹中显示";
-                case 2: return L"挂到绳子上";
+                case 2: return L"挂起来";
                 case 3: return L"删除";
                 default: break;
                 }
