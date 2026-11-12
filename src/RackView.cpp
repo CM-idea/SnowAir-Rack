@@ -436,6 +436,7 @@ void RackView::LoadAssets(ID2D1RenderTarget* target)
     }
     assetsAttempted_ = true;
     const std::wstring dir = util::JoinPath(util::GetDllDir(), L"assets");
+    assetsDir_ = dir;
     /* 每张位图按接近实际显示尺寸的两倍解码。让 D2D 在绘制时把 340px 的
        信封缩到 70px，边缘会出现明显的台阶；这里先用 WIC Fant 缩好。 */
     const float assetScale = std::max(1.0f, scale_);
@@ -462,6 +463,32 @@ void RackView::LoadAssets(ID2D1RenderTarget* target)
                                  140.0f * assetScale, target, envelopeThemeFront_[i]);
     }
     LoadIconFont();
+}
+
+void RackView::ReleaseCachedImages()
+{
+    basket_.Reset();
+    for (auto& image : basketTheme_) image.Reset();
+    envelope_.Reset();
+    envelopeFront_.Reset();
+    letter_.Reset();
+    for (auto& image : envelopeThemeBack_) image.Reset();
+    for (auto& image : envelopeThemeFront_) image.Reset();
+    basketSrcPixels_.clear();
+    basketSrcPixels_.shrink_to_fit();
+    basketSrcW_ = 0;
+    basketSrcH_ = 0;
+    basketSrcTheme_ = -1;
+    basketSrcPixelSize_ = 0;
+    basketWarpBitmap_.Reset();
+    basketWarpPixels_.clear();
+    basketWarpPixels_.shrink_to_fit();
+    basketWarpW_ = 0;
+    basketWarpH_ = 0;
+    basketWarpAngle_ = 1e9f;
+    basketWarpPpd_ = 0.0f;
+    /* 允许下次展开重新走一遍 LoadAssets。 */
+    assetsAttempted_ = false;
 }
 
 void RackView::LoadIconFont()
@@ -1704,6 +1731,144 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
     }
 }
 
+namespace {
+
+/* D2D 的 Rotation(θ) 在屏幕坐标（y 向下）里对应的矩阵。 */
+void RotateByD2D(float& x, float& y, float degrees)
+{
+    const float r = degrees * 3.14159265f / 180.0f;
+    const float c = std::cos(r);
+    const float s = std::sin(r);
+    const float nx = c * x + s * y;
+    const float ny = -s * x + c * y;
+    x = nx;
+    y = ny;
+}
+
+} /* namespace */
+
+bool RackView::EnsureBasketPixels(int themeIndex, UINT pixelSize)
+{
+    if (!graphics_ || assetsDir_.empty() || pixelSize == 0) {
+        return false;
+    }
+    if (basketSrcTheme_ == themeIndex && basketSrcPixelSize_ == pixelSize &&
+        !basketSrcPixels_.empty()) {
+        return true;
+    }
+    static const int kBasketFile[4] = {3, 0, 2, 1};
+    const int idx = rack::ClampInt(themeIndex, 0, 3);
+    std::wstring path = util::JoinPath(assetsDir_, L"basket.png");
+    if (basketTheme_[idx].valid()) {
+        path = util::JoinPath(assetsDir_,
+                              L"basket_" + std::to_wstring(kBasketFile[idx]) + L".png");
+    }
+    std::vector<BYTE> pixels;
+    if (FAILED(graphics_->images().LoadPixels(path, pixelSize, pixelSize, pixels)) ||
+        pixels.empty()) {
+        return false;
+    }
+    basketSrcPixels_ = std::move(pixels);
+    basketSrcW_ = pixelSize;
+    basketSrcH_ = pixelSize;
+    basketSrcTheme_ = themeIndex;
+    basketSrcPixelSize_ = pixelSize;
+    basketWarpAngle_ = 1e9f; /* 源换了，帧缓存作废 */
+    return true;
+}
+
+/* 把篮子按角度自己重采样成一张位图：软件光栅对「旋转位图」会整像素吸附，
+   自己算就没有吸附问题，钩子能稳稳钉在枢轴上。 */
+bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float angleDeg,
+                                float s, float ppd)
+{
+    if (!target || s <= 0.0f || ppd <= 0.0f) {
+        return false;
+    }
+    const float basketSize = 112.0f * s;
+    const UINT srcPx = static_cast<UINT>(std::lround(basketSize * ppd));
+    if (!EnsureBasketPixels(themeIndex, srcPx)) {
+        return false;
+    }
+    if (basketWarpBitmap_ && std::abs(basketWarpAngle_ - angleDeg) < 0.02f &&
+        std::abs(basketWarpPpd_ - ppd) < 0.01f) {
+        return true;
+    }
+
+    const float pad = 8.0f * s;
+    const float padTop = 18.0f * s; /* 挂钩在篮子上方 14s，也要留在画布里 */
+    const float canvasW = basketSize + pad * 2.0f;
+    const float canvasH = padTop - 14.0f * s + basketSize + pad;
+    const UINT w = static_cast<UINT>(std::lround(canvasW * ppd));
+    const UINT h = static_cast<UINT>(std::lround(canvasH * ppd));
+    if (w == 0 || h == 0) {
+        return false;
+    }
+    basketWarpPixels_.assign(static_cast<size_t>(w) * h * 4, 0);
+
+    const float pivotX = canvasW * 0.5f;
+    const float pivotY = padTop;
+    const float pivotLocalX = basketSize * 0.5f;
+    const float pivotLocalY = 14.0f * s;
+    const float scale = static_cast<float>(basketSrcW_) / basketSize;
+
+    for (UINT y = 0; y < h; ++y) {
+        for (UINT x = 0; x < w; ++x) {
+            const float dipX = (static_cast<float>(x) + 0.5f) / ppd;
+            const float dipY = (static_cast<float>(y) + 0.5f) / ppd;
+            float vx = dipX - pivotX;
+            float vy = dipY - pivotY;
+            RotateByD2D(vx, vy, -angleDeg);
+            const float sx = (vx + pivotLocalX) * scale - 0.5f;
+            const float sy = (vy + pivotLocalY) * scale - 0.5f;
+            const int x0 = static_cast<int>(std::floor(sx));
+            const int y0 = static_cast<int>(std::floor(sy));
+            const float fx = sx - static_cast<float>(x0);
+            const float fy = sy - static_cast<float>(y0);
+            auto sample = [&](int px, int py, int channel) -> float {
+                if (px < 0 || py < 0 || px >= static_cast<int>(basketSrcW_) ||
+                    py >= static_cast<int>(basketSrcH_)) {
+                    return 0.0f;
+                }
+                const size_t at =
+                    (static_cast<size_t>(py) * basketSrcW_ + static_cast<size_t>(px)) * 4 +
+                    static_cast<size_t>(channel);
+                return static_cast<float>(basketSrcPixels_[at]);
+            };
+            BYTE* dst = &basketWarpPixels_[(static_cast<size_t>(y) * w + x) * 4];
+            for (int c = 0; c < 4; ++c) {
+                const float v00 = sample(x0, y0, c);
+                const float v10 = sample(x0 + 1, y0, c);
+                const float v01 = sample(x0, y0 + 1, c);
+                const float v11 = sample(x0 + 1, y0 + 1, c);
+                const float v = (v00 * (1.0f - fx) + v10 * fx) * (1.0f - fy) +
+                                (v01 * (1.0f - fx) + v11 * fx) * fy;
+                dst[c] = static_cast<BYTE>(rack::Clamp(v + 0.5f, 0.0f, 255.0f));
+            }
+        }
+    }
+
+    if (!basketWarpBitmap_ || basketWarpW_ != w || basketWarpH_ != h) {
+        basketWarpBitmap_.Reset();
+        const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f);
+        if (FAILED(target->CreateBitmap(D2D1::SizeU(w, h), basketWarpPixels_.data(), w * 4,
+                                        props, basketWarpBitmap_.GetAddressOf())) ||
+            !basketWarpBitmap_) {
+            return false;
+        }
+        basketWarpW_ = w;
+        basketWarpH_ = h;
+    } else if (FAILED(basketWarpBitmap_->CopyFromMemory(nullptr, basketWarpPixels_.data(),
+                                                       w * 4))) {
+        return false;
+    }
+    basketWarpAngle_ = angleDeg;
+    basketWarpPpd_ = ppd;
+    return true;
+}
+
 void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, float s,
                                float expandAmount, float basketHover, float paper0,
                                int historyCount, int clipboardCount)
@@ -1738,20 +1903,42 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
                                    ? &basketTheme_[themeIndex]
                                    : &basket_;
     if (!historyDisabled_ && basket && basket->valid()) {
-        /* 弹簧值要保留符号：离开时它会越过 0 后回摆，
-           篮子才像自然停住。 */
         const float basketHoverAmount = basketHover;
         const float basketSize = 112.0f * s;
         const float themeDrop = themeIndex == 1 ? 2.0f * s : 0.0f;
-        const float top = ropeYAt(basketCenter) - 14.0f * s + themeDrop;
-        D2D1_RECT_F dest = D2D1::RectF(basketCenter - basketSize * 0.5f, top,
-                                       basketCenter + basketSize * 0.5f, top + basketSize);
-        const D2D1_POINT_2F hook = D2D1::Point2F(basketCenter, ropeYAt(basketCenter));
-        target->SetTransform(
-            D2D1::Matrix3x2F::Rotation(-2.0f * basketHoverAmount, hook));
-        target->DrawBitmap(basket->bitmap.Get(), dest, 1.0f,
-                           D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        target->SetTransform(D2D1::Matrix3x2F::Identity());
+        const float pivotY = ropeYAt(basketCenter);
+        const float angle = -2.0f * basketHoverAmount;
+        /* 有角度时用 CPU 重采样好的位图贴上去：软件光栅自己转位图会按整像素
+           吸附，钩子会一跳一跳；这样画永远是「无变换贴图」，钩子纹丝不动。 */
+        const float ppd = target->GetSize().width > 0.0f
+                              ? static_cast<float>(target->GetPixelSize().width) /
+                                    target->GetSize().width
+                              : 1.0f;
+        bool warped = false;
+        if (std::abs(angle) > 0.001f &&
+            UpdateBasketWarp(target, themeIndex, angle, s, ppd)) {
+            const float pad = 8.0f * s;
+            const float padTop = 18.0f * s;
+            const float canvasW = basketSize + pad * 2.0f;
+            const float canvasH = padTop - 14.0f * s + basketSize + pad;
+            const D2D1_RECT_F dest = D2D1::RectF(
+                basketCenter - canvasW * 0.5f, pivotY - padTop + themeDrop,
+                basketCenter + canvasW * 0.5f, pivotY - padTop + themeDrop + canvasH);
+            target->DrawBitmap(basketWarpBitmap_.Get(), dest, 1.0f,
+                               D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            warped = true;
+        }
+        if (!warped) {
+            const float top = pivotY - 14.0f * s + themeDrop;
+            const D2D1_RECT_F dest = D2D1::RectF(basketCenter - basketSize * 0.5f, top,
+                                                 basketCenter + basketSize * 0.5f,
+                                                 top + basketSize);
+            target->SetTransform(
+                D2D1::Matrix3x2F::Rotation(angle, D2D1::Point2F(basketCenter, pivotY)));
+            target->DrawBitmap(basket->bitmap.Get(), dest, 1.0f,
+                               D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            target->SetTransform(D2D1::Matrix3x2F::Identity());
+        }
         DrawCountBadge(target, basketCenter, badgeTop, historyCount, s);
     }
 

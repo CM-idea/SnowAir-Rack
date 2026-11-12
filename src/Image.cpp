@@ -116,3 +116,47 @@ HRESULT ImageLoader::Load(const std::wstring& path, float maxDimension,
     out.height = height;
     return S_OK;
 }
+
+HRESULT ImageLoader::LoadPixels(const std::wstring& path, UINT width, UINT height,
+                                std::vector<BYTE>& out)
+{
+    out.clear();
+    if (!wic_ || path.empty() || width == 0 || height == 0) {
+        return E_INVALIDARG;
+    }
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT hr = wic_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                 WICDecodeMetadataCacheOnDemand,
+                                                 decoder.GetAddressOf());
+    if (FAILED(hr)) {
+        return hr;
+    }
+    ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, frame.GetAddressOf());
+    if (FAILED(hr)) {
+        return hr;
+    }
+    ComPtr<IWICBitmapScaler> scaler;
+    hr = wic_->CreateBitmapScaler(scaler.GetAddressOf());
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = scaler->Initialize(frame.Get(), width, height, WICBitmapInterpolationModeFant);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    ComPtr<IWICFormatConverter> converter;
+    hr = wic_->CreateFormatConverter(converter.GetAddressOf());
+    if (FAILED(hr)) {
+        return hr;
+    }
+    hr = converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppPBGRA,
+                               WICBitmapDitherTypeNone, nullptr, 0.0,
+                               WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        return hr;
+    }
+    const UINT stride = width * 4;
+    out.resize(static_cast<size_t>(stride) * height);
+    return converter->CopyPixels(nullptr, stride, static_cast<UINT>(out.size()), out.data());
+}

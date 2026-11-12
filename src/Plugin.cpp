@@ -205,6 +205,11 @@ bool Plugin::Init(const SnowAirHost* host)
     /* 老数据没有内容指纹：把补算的结果写回去，下次启动就不用再算。 */
     SaveItems();
     PruneRackQuickCache();
+    {
+        // 旧版“长按用画图编辑”留下的临时副本，功能已移除，启动时清掉。
+        std::error_code cacheEc;
+        std::filesystem::remove_all(util::JoinPath(util::GetDataDir(), L"cache"), cacheEc);
+    }
 
     window_ = std::make_unique<RackWindow>();
     if (!window_->Init(this, graphics_.get())) {
@@ -1162,9 +1167,6 @@ void Plugin::RemoveItemData(int index)
     if (item.ownsFile) {
         util::DeleteFileIfExists(item.path);
     }
-    if (!item.editPath.empty() && !util::SamePath(item.editPath, item.path)) {
-        util::DeleteFileIfExists(item.editPath);
-    }
     const std::wstring noteKey = item.sourcePath.empty() ? item.path : item.sourcePath;
     notes_.Remove(noteKey);
     items_.erase(items_.begin() + index);
@@ -1324,14 +1326,92 @@ void Plugin::CloseMenu()
     if (host_ && host_->close_menu) host_->close_menu(host_->user);
 }
 
+namespace {
+
+/* 宿主的「历史记录」是设置窗口停在第 6 页（等价于 WinSetting::init(5)）：
+   和截图编辑窗一样是 "Ling" 类、带原生标题栏的窗口。宿主只开放了
+   open_history，没有关闭/查询接口，所以插件记住自己打开的那个窗口，
+   再点一次篮子时按标题栏的 X 关掉它（WM_CLOSE 与点 X 等价）。 */
+bool LooksLikeHostWindow(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd)) {
+        return false;
+    }
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, 64) == 0 || std::wstring(cls) != L"Ling") {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return false;
+    }
+    const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    return (style & WS_CAPTION) == WS_CAPTION;
+}
+
+std::wstring WindowTitleOf(HWND hwnd)
+{
+    wchar_t title[160]{};
+    GetWindowTextW(hwnd, title, 160);
+    return title;
+}
+
+/* 本进程里所有「带原生标题栏的 Ling 窗口」，按 z 序从上到下。 */
+void CollectHostWindows(std::vector<HWND>& out)
+{
+    out.clear();
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            auto* windows = reinterpret_cast<std::vector<HWND>*>(param);
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && LooksLikeHostWindow(hwnd)) {
+                windows->push_back(hwnd);
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&out));
+}
+
+}  // namespace
+
 void Plugin::OpenHistory()
 {
     /* 历史入口已停用：即使命中测试延迟，也不再打开。 */
     if (HistoryDisabled()) {
         return;
     }
-    if (host_ && host_->open_history) {
-        host_->open_history(host_->user);
+    /* 再点一次篮子收起：窗口还挂在屏幕上就关掉，和信封的开关键行为一致。
+       不要求它在前台——晾衣架是 WS_EX_NOACTIVATE，点它不会把轻雪抢到前台。
+       同时核对标题，句柄被系统回收给别的窗口时不会误关（比如截图编辑窗）。 */
+    if (historyWindow_ && LooksLikeHostWindow(historyWindow_) &&
+        IsWindowVisible(historyWindow_) && !IsIconic(historyWindow_) &&
+        (historyTitle_.empty() || WindowTitleOf(historyWindow_) == historyTitle_)) {
+        PostMessageW(historyWindow_, WM_CLOSE, 0, 0);
+        historyWindow_ = nullptr;
+        return;
+    }
+    if (!host_ || !host_->open_history) {
+        return;
+    }
+    std::vector<HWND> before;
+    CollectHostWindows(before);
+    host_->open_history(host_->user);
+    std::vector<HWND> after;
+    CollectHostWindows(after);
+    historyWindow_ = nullptr;
+    historyTitle_.clear();
+    /* 这次调用新建出来的窗口，一定就是历史记录。 */
+    for (HWND hwnd : after) {
+        if (std::find(before.begin(), before.end(), hwnd) == before.end()) {
+            historyWindow_ = hwnd;
+            historyTitle_ = WindowTitleOf(hwnd);
+            return;
+        }
+    }
+    /* 窗口本来就开着：宿主刚把它提到 z 序最上面，取最上面那个。 */
+    if (!after.empty()) {
+        historyWindow_ = after.front();
+        historyTitle_ = WindowTitleOf(historyWindow_);
     }
 }
 

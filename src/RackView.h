@@ -88,6 +88,9 @@ public:
               float expandAmount, float swaySeconds, float basketHover, float paper0,
               float cardHover, int cardHoverIndex, int hovered, int pressed,
               int historyCount, int clipboardCount);
+    /* 收起一段时间后把展开时才用到的素材位图放掉：常驻内存回落到接近刚启动的水平，
+       下次展开由 LoadAssets 重新加载。 */
+    void ReleaseCachedImages();
 
     /* 拖拽时跟随指针的卡片图：用和绳子上完全相同的画法渲染到一张 DIB，
        调用方负责 DeleteObject。 */
@@ -216,6 +219,24 @@ private:
     ComPtr<ID2D1PathGeometry> iconMusic_;
     ImageBitmap basket_;
     ImageBitmap basketTheme_[4];
+    /* 篮子旋转走 CPU 重采样：软件光栅画「旋转的位图」会按整像素吸附，
+       钩子看起来一跳一跳的。这里自己把篮子按角度转成一张小位图，
+       再用无变换的贴图贴上去，钩子就能稳稳钉在枢轴上。 */
+    bool EnsureBasketPixels(int themeIndex, UINT pixelSize);
+    bool UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float angleDeg, float s,
+                          float ppd);
+    std::wstring assetsDir_;
+    std::vector<BYTE> basketSrcPixels_;
+    UINT basketSrcW_ = 0;
+    UINT basketSrcH_ = 0;
+    int basketSrcTheme_ = -1;
+    UINT basketSrcPixelSize_ = 0;
+    ComPtr<ID2D1Bitmap> basketWarpBitmap_;
+    std::vector<BYTE> basketWarpPixels_;
+    UINT basketWarpW_ = 0;
+    UINT basketWarpH_ = 0;
+    float basketWarpAngle_ = 1e9f;
+    float basketWarpPpd_ = 0.0f;
     ImageBitmap envelope_;
     ImageBitmap envelopeFront_;
     ImageBitmap letter_;

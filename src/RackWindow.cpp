@@ -202,12 +202,9 @@ void RackWindow::Shutdown()
         KillTimer(hwnd(), kTimerPoll);
         KillTimer(hwnd(), kTimerAnim);
         KillTimer(hwnd(), kTimerClick);
-        KillTimer(hwnd(), kTimerLongPress);
-        KillTimer(hwnd(), kTimerEditWatch);
         KillTimer(hwnd(), kTimerEditStart);
         KillTimer(hwnd(), kTimerFakeCursor);
     }
-    editingWatchActive_ = false;
     SetTopBarWatch(false);
     menu_.Close();
     batchMenu_.Close();
@@ -433,6 +430,8 @@ void RackWindow::Expand(bool peek)
     }
     lastInside_ = now;
     revealStart_ = now;
+    lastExpandedMs_ = now;
+    idleMemoryReleased_ = false;
     swingUntil_ = now + 2200;
     expanding_ = true;
     if (!hiddenForFullscreen_) {
@@ -580,7 +579,7 @@ void RackWindow::CheckMissingFiles()
     const auto& items = plugin_->items();
     for (int i = 0; i < static_cast<int>(items.size()); ++i) {
         const Item& item = items[static_cast<size_t>(i)];
-        if (item.kind == 1 || item.editing) {
+        if (item.kind == 1) {
             continue; /* 便签/正在编辑的不看文件 */
         }
         std::vector<std::wstring> paths = item.paths;
@@ -1331,6 +1330,25 @@ void RackWindow::Tick()
         return;
     }
 
+    /* 收起满 20 s 就把「展开才用得到」的素材位图和 2x 表面放掉，并 trim 一次工作集：
+       常驻内存能回落到接近刚启动的水平；下次展开由 LoadAssets 重新加载（几十毫秒）。 */
+    if (!idleMemoryReleased_ && lastExpandedMs_ != 0 && expand_ <= 0.001f && !animating_ &&
+        !mouseDown_ && !dragStarted_ && !preview_.showing() &&
+        rack::NowMs() - lastExpandedMs_ > 20000) {
+        idleMemoryReleased_ = true;
+        view_.ReleaseCachedImages();
+        /* 卡片缩略图同理：下次展开由 BeforeDraw 重新加载。 */
+        if (plugin_) {
+            for (auto& item : plugin_->items()) {
+                item.thumb.Reset();
+                item.thumbAttempted = false;
+            }
+        }
+        InvalidateSurface();
+        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1),
+                                 static_cast<SIZE_T>(-1));
+    }
+
     const HMONITOR cursorMonitor = CursorMonitor();
     if (cursorMonitor && cursorMonitor != monitor_ && !mouseDown_ && !dragStarted_ &&
         expand_ < 0.01f && !preview_.showing()) {
@@ -1373,7 +1391,6 @@ void RackWindow::Tick()
 
     UpdateHover();
     UpdatePreview();
-    CheckEditing();
 
     if (normalizeSpacingPending_) {
         normalizeSpacingPending_ = false;
@@ -1626,58 +1643,6 @@ void RackWindow::UpdatePreview()
         }
     }
     if (visualChanged) {
-        Render();
-    }
-}
-
-void RackWindow::CheckEditing()
-{
-    if (!plugin_) {
-        return;
-    }
-    bool anyEditing = false;
-    bool changed = false;
-    const uint64_t now = rack::NowMs();
-
-    for (auto& item : plugin_->items()) {
-        if (!item.editing) {
-            continue;
-        }
-        anyEditing = true;
-        if (now - item.editStartedMs > 10ull * 60ull * 1000ull) {
-            item.editing = false;
-            item.editPath.clear();
-            continue;
-        }
-        const uint64_t mtime = util::FileWriteTime(item.editPath);
-        if (mtime == 0 || mtime == item.mtime) {
-            continue;
-        }
-        item.mtime = mtime;
-        item.path = item.editPath;
-        item.ownsFile = true;
-        item.thumb.Reset();
-        item.thumbAttempted = false;
-        item.preview.Reset();
-        item.previewAttempted = false;
-        UINT w = 0, h = 0;
-        if (SUCCEEDED(plugin_->graphics().images().GetSize(item.path, w, h)) && w > 0 && h > 0) {
-            item.aspect = static_cast<float>(w) / static_cast<float>(h);
-        }
-        item.editing = false;
-        item.editPath.clear();
-        needsLayout_ = true;
-        changed = true;
-        RackLog(L"RackWindow: edited image refreshed for item %d", item.id);
-    }
-
-    if (!anyEditing && editingWatchActive_) {
-        KillTimer(hwnd(), kTimerEditWatch);
-        editingWatchActive_ = false;
-    }
-    if (changed) {
-        DismissPreview();
-        Reposition();
         Render();
     }
 }
@@ -1983,39 +1948,6 @@ void RackWindow::OpenItem(int index)
     util::OpenInShell(path);
 }
 
-void RackWindow::EditItemInPaint(int index)
-{
-    if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
-        return;
-    }
-    Item& item = plugin_->items()[index];
-    if (item.editing) {
-        return;
-    }
-    DismissPreview();
-    const std::wstring cacheDir = util::JoinPath(util::GetDataDir(), L"cache");
-    util::EnsureDir(cacheDir);
-    const std::wstring editPath = util::JoinPath(
-        cacheDir, util::Format(L"edit-%s-%d.png", util::TimestampName().c_str(), item.id));
-    if (!util::CopyFileTo(item.path, editPath)) {
-        RackLog(L"RackWindow: failed to create edit copy for %s", item.path.c_str());
-        return;
-    }
-    item.editPath = editPath;
-    item.editing = true;
-    item.editStartedMs = rack::NowMs();
-    item.mtime = util::FileWriteTime(editPath);
-    if (!util::OpenInPaint(editPath)) {
-        item.editing = false;
-        item.editPath.clear();
-        return;
-    }
-    if (!editingWatchActive_) {
-        editingWatchActive_ = true;
-        SetTimer(hwnd(), kTimerEditWatch, 500, nullptr);
-    }
-}
-
 void RackWindow::SaveItemAs(int index)
 {
     if (!plugin_ || index < 0 || index >= static_cast<int>(plugin_->items().size())) {
@@ -2236,6 +2168,10 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
                           menuEntry.cardType == card::Type::Link ||
                           menuEntry.cardType == card::Type::Color;
     const bool accentable = card::HasAccent(menuEntry.cardType);
+    const bool canEditImage = plugin_->host() && plugin_->host()->api_version >= 6 &&
+                              plugin_->host()->open_image_editor;
+    const bool imageItem = (menuEntry.cardType == card::Type::Image ||
+                            menuEntry.cardType == card::Type::Svg) && canEditImage;
 
     if (plugin_->host() && plugin_->host()->show_menu) {
         SnowAirMenuItem batch[4]{};
@@ -2248,7 +2184,7 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
         batch[3].label = L"全部取下";
         batch[3].id = kMenuBatchAll;
 
-        SnowAirMenuItem main[12]{};
+        SnowAirMenuItem main[14]{};
         int n = 0;
         auto add = [&](const wchar_t* label, int id, int flags = 0) {
             main[n].label = label;
@@ -2257,8 +2193,9 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
             ++n;
         };
         add(L"打开", kMenuOpen);
-        if (textLike || accentable) add(L"编辑", kMenuEdit);
-        add(L"另存为…", kMenuSaveAs);
+        if (imageItem) add(L"图片编辑", kMenuImageEdit);
+        else if (textLike || accentable) add(L"编辑", kMenuEdit);
+        add(imageItem ? L"图片另存" : L"另存为…", kMenuSaveAs);
         if (!noteItem) add(L"打开位置", kMenuShowInFolder);
         add(L"", 0, SNOWAIR_MENU_SEPARATOR);
         add(L"取下内容", kMenuRemove);
@@ -2296,8 +2233,9 @@ void RackWindow::ShowItemMenu(int index, POINT screen)
     };
 
     action(L"打开", kMenuOpen);
-    if (textLike || accentable) action(L"编辑", kMenuEdit);
-    action(L"另存为…", kMenuSaveAs);
+    if (imageItem) action(L"图片编辑", kMenuImageEdit);
+    else if (textLike || accentable) action(L"编辑", kMenuEdit);
+    action(imageItem ? L"图片另存" : L"另存为…", kMenuSaveAs);
     if (!noteItem) action(L"打开位置", kMenuShowInFolder);
     separator();
     action(L"取下内容", kMenuRemove);
@@ -2450,6 +2388,14 @@ void RackWindow::HandleMenuCommand(int index, int command)
                           menuItem.cardType == card::Type::Text ||
                           menuItem.cardType == card::Type::Link ||
                           menuItem.cardType == card::Type::Color;
+    if (command == kMenuImageEdit) {
+        if (!menuItem.path.empty() && plugin_->host() &&
+            plugin_->host()->api_version >= 6 &&
+            plugin_->host()->open_image_editor) {
+            plugin_->host()->open_image_editor(plugin_->host()->user, menuItem.path.c_str());
+        }
+        return;
+    }
     if (command == kMenuOpen) {
         if (menuItem.cardType == card::Type::Link) {
             OpenCardLink(index);
@@ -2494,8 +2440,6 @@ void RackWindow::HandleMenuCommand(int index, int command)
         }
     } else if (command == kMenuCopy) {
         CopyItem(index);
-    } else if (command == kMenuEditPaint) {
-        EditItemInPaint(index);
     } else if (command == kMenuNote) {
         QueueEditNote(index);
     } else if (command >= kMenuColorBase && command <= kMenuColorBase + 2) {
@@ -2697,25 +2641,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         case kTimerFakeCursor:
             dragdrop::SetDragCursor();
             return 0;
-        case kTimerLongPress: {
-            KillTimer(hwnd(), kTimerLongPress);
-            if (mouseDown_ && !dragStarted_ && plugin_) {
-                longPressFired_ = true;
-                mouseDown_ = false;
-                ReleaseCapture();
-                const int index = plugin_->IndexById(pressItemId_);
-                pressed_ = -1;
-                pressedPart_ = RackPart::None;
-                if (index >= 0) {
-                    EditItemInPaint(index);
-                }
-                Render();
-            }
-            return 0;
-        }
-        case kTimerEditWatch:
-            CheckEditing();
-            return 0;
         case kTimerEditStart: {
             KillTimer(hwnd(), kTimerEditStart);
             const int index = pendingEditIndex_;
@@ -2879,7 +2804,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             pressColorPart_ = hit.colorPart;
             mouseDown_ = true;
             dragStarted_ = false;
-            longPressFired_ = false;
             pressPoint_ = point;
             cardDragStartOffset_ = plugin_->items()[hit.index].rackOffsetX;
             cardDragging_ = false;
@@ -2887,7 +2811,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             pendingAdjustId_ = -1;
             offsetAnims_.clear();
             SetCapture(hwnd());
-            SetTimer(hwnd(), kTimerLongPress, 560, nullptr);
             Render();
         } else if (hit.part == RackPart::Clip) {
             if (hit.index < 0 || hit.index >= static_cast<int>(plugin_->items().size())) {
@@ -2928,7 +2851,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         const bool cardPress = pressedPart_ == RackPart::Card;
         if (cardPress && horizontalDominant) {
             cardDragging_ = true;
-            KillTimer(hwnd(), kTimerLongPress);
         }
         if (cardDragging_) {
             if (Item* item = plugin_->ItemById(pressItemId_)) {
@@ -3026,7 +2948,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                 }
             }
         }
-        KillTimer(hwnd(), kTimerLongPress);
         const int index = plugin_->IndexById(pressItemId_);
         mouseDown_ = false;
         dragStarted_ = true;
@@ -3165,7 +3086,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         }
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         mouseDown_ = false;
-        KillTimer(hwnd(), kTimerLongPress);
         ReleaseCapture();
         if (pressedPart_ == RackPart::Clip) {
             const int dx = std::abs(point.x - pressPoint_.x);
@@ -3237,10 +3157,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             Render();
             return 0;
         }
-        const bool wasLong = longPressFired_;
-        longPressFired_ = false;
-
-        if (!wasLong && plugin_) {
+        if (plugin_) {
             const int dx = std::abs(point.x - pressPoint_.x);
             const int dy = std::abs(point.y - pressPoint_.y);
             if (dx <= 6 * scale_ && dy <= 6 * scale_) {
@@ -3343,7 +3260,6 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             pressItemId_ = -1;
             pressed_ = -1;
             pressedPart_ = RackPart::None;
-            KillTimer(hwnd(), kTimerLongPress);
         }
         return 0;
 

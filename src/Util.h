@@ -30,7 +30,6 @@ bool SamePath(const std::wstring& a, const std::wstring& b);
 
 bool OpenInShell(const std::wstring& path);
 bool ShowInExplorer(const std::wstring& path);
-bool OpenInPaint(const std::wstring& path);
 
 std::string WideToUtf8(const std::wstring& text);
 std::wstring Utf8ToWide(const std::string& text);

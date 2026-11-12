@@ -61,8 +61,6 @@ private:
         kTimerPoll = 1,
         kTimerAnim,
         kTimerClick,
-        kTimerLongPress,
-        kTimerEditWatch,
         kTimerEditStart,
     kTimerCopyToast,
     kTimerFakeCursor,
@@ -71,9 +69,9 @@ private:
     enum MenuId {
         kMenuCopy = 1,
         kMenuOpen,
+        kMenuImageEdit,
         kMenuEdit,
         kMenuEditColor,
-        kMenuEditPaint,
         kMenuSaveAs,
         kMenuShowInFolder,
         kMenuNote,
@@ -101,7 +99,6 @@ private:
     void UpdateAccessoryHover(const RackHit& hit);
     void UpdateClickThrough();
     void SetClickThrough(bool enabled);
-    void CheckEditing();
     /* 卡片/便签条的精确命中形状（含旋转与悬停放大），extra 是外扩像素。 */
     bool PointInCardShape(const CardBox& box, float x, float y, float extra) const;
     bool PointInNoteShape(const CardBox& box, float x, float y, float extra) const;
@@ -129,7 +126,6 @@ private:
     bool ScrollColorCard(int index, int delta);
     /* 右键「编辑颜色」：改这张卡的头部强调色（便签是整张纸的主色）。 */
     void PickCardColor(int index);
-    void EditItemInPaint(int index);
     void SaveItemAs(int index);
     void RemoveItem(int index, bool toBasket = true);
     void EditNote(int index);
@@ -188,6 +184,9 @@ private:
 
     uint64_t lastInside_ = 0;
     uint64_t hoverLineSince_ = 0;
+    /* 收起后闲置一段时间就把素材位图/2x 表面放掉，常驻内存随之回落。 */
+    uint64_t lastExpandedMs_ = 0;
+    bool idleMemoryReleased_ = false;
     bool lineHover_ = false;
     /* 刚在顶栏点过一下：指针离开顶边之前不再自动展开。 */
     bool topBarSuppressed_ = false;
@@ -232,7 +231,6 @@ private:
     void FinishCardDrag(int id);
     void NormalizeLoadedSpacing();
     bool normalizeSpacingPending_ = false;
-    bool longPressFired_ = false;
     POINT pressPoint_{};
 
     int clickItemId_ = -1;
@@ -256,7 +254,6 @@ private:
 
     bool hiddenForFullscreen_ = false;
     bool needsLayout_ = false;
-    bool editingWatchActive_ = false;
     bool historyDisabled_ = false;
     /* 每次展开只查一次文件是否还在；不做定时轮询。 */
     bool missingChecked_ = false;

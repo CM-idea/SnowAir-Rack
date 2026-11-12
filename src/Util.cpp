@@ -298,45 +298,6 @@ bool ShowInExplorer(const std::wstring& path)
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
-bool OpenInPaint(const std::wstring& path)
-{
-    const std::wstring args = L"\"" + path + L"\"";
-
-    /*
-     * Windows 11 的「画图」是商店应用，挂在执行别名后面；直接写
-     * "mspaint.exe" 交给 ShellExecute 不一定找得到。所以先试别名和常见
-     * 安装位置，最后再退回 .png 的 "edit" 动词。
-     */
-    std::vector<std::wstring> candidates;
-    PWSTR localAppData = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) &&
-        localAppData) {
-        candidates.push_back(JoinPath(localAppData, L"Microsoft\\WindowsApps\\mspaint.exe"));
-        CoTaskMemFree(localAppData);
-    }
-    wchar_t windowsDir[MAX_PATH]{};
-    if (GetWindowsDirectoryW(windowsDir, MAX_PATH) > 0) {
-        candidates.push_back(JoinPath(windowsDir, L"System32\\mspaint.exe"));
-        candidates.push_back(JoinPath(windowsDir, L"SysWOW64\\mspaint.exe"));
-    }
-    candidates.push_back(L"mspaint.exe");
-
-    for (const auto& candidate : candidates) {
-        if (candidate != L"mspaint.exe" && !FileExists(candidate)) {
-            continue;
-        }
-        HINSTANCE result = ShellExecuteW(nullptr, L"open", candidate.c_str(), args.c_str(),
-                                         nullptr, SW_SHOWNORMAL);
-        if (reinterpret_cast<INT_PTR>(result) > 32) {
-            return true;
-        }
-    }
-
-    HINSTANCE result = ShellExecuteW(nullptr, L"edit", path.c_str(), nullptr, nullptr,
-                                     SW_SHOWNORMAL);
-    return reinterpret_cast<INT_PTR>(result) > 32;
-}
-
 std::string WideToUtf8(const std::wstring& text)
 {
     if (text.empty()) {
