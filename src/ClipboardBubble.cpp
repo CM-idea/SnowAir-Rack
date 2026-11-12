@@ -1813,12 +1813,19 @@ void ClipboardBubble::Paint(ID2D1RenderTarget* target)
         ComPtr<ID2D1SolidColorBrush> fill;
         ComPtr<ID2D1SolidColorBrush> edge;
         ComPtr<ID2D1SolidColorBrush> ink;
-        if (FAILED(target->CreateSolidColorBrush(
-                theme_.dark ? D2D1::ColorF(0.149f, 0.149f, 0.149f)
-                            : D2D1::ColorF(1.0f, 1.0f, 1.0f),
-                fill.GetAddressOf())) ||
-            FAILED(target->CreateSolidColorBrush(theme_.border, edge.GetAddressOf())) ||
-            FAILED(target->CreateSolidColorBrush(theme_.fg, ink.GetAddressOf()))) {
+        // 提示与背景反色：深色界面用浅色气泡，浅色界面用深色气泡。
+        const D2D1_COLOR_F fillColor = theme_.dark
+            ? D2D1::ColorF(0.98f, 0.98f, 0.98f)
+            : D2D1::ColorF(0.149f, 0.149f, 0.149f);
+        const D2D1_COLOR_F inkColor = theme_.dark
+            ? D2D1::ColorF(0.09f, 0.09f, 0.09f)
+            : D2D1::ColorF(0.98f, 0.98f, 0.98f);
+        const D2D1_COLOR_F edgeColor = theme_.dark
+            ? D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.12f)
+            : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f);
+        if (FAILED(target->CreateSolidColorBrush(fillColor, fill.GetAddressOf())) ||
+            FAILED(target->CreateSolidColorBrush(edgeColor, edge.GetAddressOf())) ||
+            FAILED(target->CreateSolidColorBrush(inkColor, ink.GetAddressOf()))) {
             return;
         }
 
@@ -3418,15 +3425,35 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
                             Close();
                         }
                         break;
-                    default:
-                        if (host_ && host_->entry_delete) host_->entry_delete(host_->user, entry.hostIndex);
+                    default: {
+                        /* 删掉一行后不要跳回列表顶部：本来滚到中间找东西，一跳回去就得重滚。
+                           记住被删那行的位置，删完按它调整滚动量，视线落在原处。 */
+                        const float removedTop =
+                            row < static_cast<int>(rowTops_.size())
+                                ? rowTops_[static_cast<size_t>(row)]
+                                : scrollY_;
+                        const float removedHeight =
+                            row < static_cast<int>(rowHeights_.size())
+                                ? rowHeights_[static_cast<size_t>(row)] + kCardGap * scale_
+                                : 0.0f;
+                        const float keepScroll = scrollY_;
+                        if (host_ && host_->entry_delete) {
+                            host_->entry_delete(host_->user, entry.hostIndex);
+                        }
                         LoadEntries();
                         RefreshCategories();
-                        Reload(true);
+                        Reload(false);
+                        /* 删的是视口上方的行：内容整体上移，滚动量跟着减掉这一行；
+                           删视口里的行则保持滚动量，下面的卡片顺次上移一格。 */
+                        if (removedTop + removedHeight <= keepScroll + 0.5f) {
+                            scrollY_ = rack::Clamp(keepScroll - removedHeight, 0.0f,
+                                                   std::max(0.0f, rowsHeight_ - ListViewportHeight()));
+                        }
                         /* 删除后轻雪的剪切板计数已经变了，但晾衣架是另一个窗口，
                            不会自己重绘；不通知的话信封角标会一直显示旧数字。 */
                         if (onEntriesChanged_) onEntriesChanged_();
                         break;
+                    }
                     }
                 }
                 return 0;
@@ -3654,10 +3681,13 @@ LRESULT ClipboardBubble::HandleMessage(UINT message, WPARAM wParam, LPARAM lPara
         } else if (deleteConfirm_ >= 0 || categoryEditorOpen_ || noteEditorOpen_) {
             hand = HitModalButton(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0;
         } else if (!settingsOpen_) {
-            hand = HitPlus(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0 ||
-                   HitGear(static_cast<float>(pt.x), static_cast<float>(pt.y)) ||
-                   HitChip(static_cast<float>(pt.x), static_cast<float>(pt.y)) >= 0 ||
-                   HitRow(static_cast<float>(pt.x), static_cast<float>(pt.y)) >= 0;
+            /* 只有真正能点的东西才出手型光标：卡片本体点了没反应，
+               整卡变手型会让人以为卡片是可点按钮。 */
+            const float mx = static_cast<float>(pt.x);
+            const float my = static_cast<float>(pt.y);
+            const int row = HitRow(mx, my);
+            hand = HitPlus(mx, my) != 0 || HitGear(mx, my) || HitChip(mx, my) >= 0 ||
+                   (row >= 0 && (HitAction(mx, my, row) >= 0 || HitTagChip(mx, my, row) >= 0));
         } else {
             hand = HitPlus(static_cast<float>(pt.x), static_cast<float>(pt.y)) != 0 ||
                    HitGear(static_cast<float>(pt.x), static_cast<float>(pt.y)) ||
