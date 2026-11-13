@@ -1414,19 +1414,22 @@ bool RackWindow::CursorOverLine() const
     }
     ScreenToClient(hwnd(), &point);
     const float s = scale_;
-    if (expand_ < 0.3f) {
-        /* 热区跟菜单栏条一致，而不是绳子本身；在 Windows 上就是屏幕顶边那一条。 */
-        RECT client{};
-        GetClientRect(hwnd(), &client);
-        const float hot = 10.0f * s;
-        return point.y >= 0 && point.y <= hot &&
-               point.x >= 0 && point.x <= client.right;
-    }
     const RackLayout& layout = view_.layout();
+    /* 热区横向只到绳子两端（含 6px 余量），和展开后的判定保持一致。
+       原来收起时按整屏宽度算，屏幕左上/右上角也算热区：在角落展开后
+       又因为不在绳子范围内被判成「离开」，收起来再弹，来回抖。 */
+    const float lineLeft = layout.lineStart - 6.0f * s;
+    const float lineRight = layout.lineEnd + 6.0f * s;
+    if (point.x < lineLeft || point.x > lineRight) {
+        return false;
+    }
+    if (expand_ < 0.3f) {
+        /* 收起时热区是一条贴着屏幕顶边、和菜单栏同高的窄条。 */
+        const float hot = 10.0f * s;
+        return point.y >= 0 && point.y <= hot;
+    }
     const float lineHitBottom = layout.lineY + layout.sag + 8.0f * s;
-    return point.y >= 0 && point.y <= lineHitBottom &&
-           point.x >= layout.lineStart - 6.0f * s &&
-           point.x <= layout.lineEnd + 6.0f * s;
+    return point.y >= 0 && point.y <= lineHitBottom;
 }
 
 bool RackWindow::CursorOverContent() const
