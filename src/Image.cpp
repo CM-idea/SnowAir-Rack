@@ -106,8 +106,28 @@ HRESULT ImageLoader::Load(const std::wstring& path, float maxDimension,
         return hr;
     }
 
-    hr = target->CreateBitmapFromWicBitmap(converter.Get(), nullptr,
-                                           out.bitmap.GetAddressOf());
+    /* 先解成像素、再用 CreateBitmap 自建位图。
+     *
+     * 不能直接 CreateBitmapFromWicBitmap：用文件名打开的 WIC 源会被 D2D 位图一直
+     * 持有（实测：解码器释放后，只要位图还在，文件句柄就还开着），于是「预览过 / 挂在
+     * 晾衣架上」的那张 PNG 一直被占用 —— 资源管理器删不掉、SnowAir 删历史也失败。
+     * 转成像素后 D2D 不再持有任何 WIC 对象，文件句柄在 Load() 返回时就关掉了。 */
+    const UINT stride = width * 4;
+    std::vector<BYTE> pixels(static_cast<size_t>(stride) * height);
+    hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(pixels.size()),
+                               pixels.data());
+    if (FAILED(hr)) {
+        out.Reset();
+        return hr;
+    }
+
+    D2D1_BITMAP_PROPERTIES props{};
+    props.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                         D2D1_ALPHA_MODE_PREMULTIPLIED);
+    props.dpiX = 96.0f;
+    props.dpiY = 96.0f;
+    hr = target->CreateBitmap(D2D1::SizeU(width, height), pixels.data(), stride, &props,
+                              out.bitmap.GetAddressOf());
     if (FAILED(hr)) {
         out.Reset();
         return hr;

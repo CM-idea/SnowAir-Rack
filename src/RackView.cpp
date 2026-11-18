@@ -2878,21 +2878,7 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                 }
                 target->FillEllipse(D2D1::Ellipse(c, radius, radius), circle.Get());
             };
-            glass(closeCenter, hotClose, true);
-            ink->SetColor(hotClose ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f)
-                                   : D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, 0.85f));
-            if (iconClose_) {
-                DrawIcon(target, iconClose_.Get(), closeCenter, 6.0f * s, ink.Get());
-            } else {
-                const float arm = 3.7f * s;
-                target->DrawLine(D2D1::Point2F(closeCenter.x - arm, closeCenter.y - arm),
-                                 D2D1::Point2F(closeCenter.x + arm, closeCenter.y + arm),
-                                 ink.Get(), 1.4f * s);
-                target->DrawLine(D2D1::Point2F(closeCenter.x + arm, closeCenter.y - arm),
-                                 D2D1::Point2F(closeCenter.x - arm, closeCenter.y + arm),
-                                 ink.Get(), 1.4f * s);
-            }
-
+            // 先画锁定、后画关闭：卡片特别窄时两个圆片会重叠，关闭必须压在上面
             glass(lockCenter, hotLock, false);
             ink->SetColor(D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, hotLock ? 1.0f : 0.85f));
             if (iconLock_ && iconUnlock_) {
@@ -2922,6 +2908,21 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                         D2D1::Point2F(lockCenter.x + shackle, lockCenter.y - 0.5f * s),
                         ink.Get(), 1.2f * s);
                 }
+            }
+
+            glass(closeCenter, hotClose, true);
+            ink->SetColor(hotClose ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f)
+                                   : D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, 0.85f));
+            if (iconClose_) {
+                DrawIcon(target, iconClose_.Get(), closeCenter, 6.0f * s, ink.Get());
+            } else {
+                const float arm = 3.7f * s;
+                target->DrawLine(D2D1::Point2F(closeCenter.x - arm, closeCenter.y - arm),
+                                 D2D1::Point2F(closeCenter.x + arm, closeCenter.y + arm),
+                                 ink.Get(), 1.4f * s);
+                target->DrawLine(D2D1::Point2F(closeCenter.x + arm, closeCenter.y - arm),
+                                 D2D1::Point2F(closeCenter.x - arm, closeCenter.y + arm),
+                                 ink.Get(), 1.4f * s);
             }
         }
     }
@@ -3136,19 +3137,20 @@ RackHit RackView::HitTest(float x, float y, float scale) const
             D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
         const D2D1_POINT_2F local = RotateAround(D2D1::Point2F(x, y), pivot, -box.angle);
         if (i == lastHovered_) {
-            const D2D1_RECT_F lockRect = D2D1::RectF(
-                box.card.left + 6.0f * s, box.card.top + 6.0f * s,
-                box.card.left + 26.0f * s, box.card.top + 26.0f * s);
-            if (rack::PointIn(lockRect, local.x, local.y)) {
-                hit.part = RackPart::Lock;
-                hit.index = i;
-                return hit;
-            }
+            // 关闭在锁定上方（窄卡片时两个圆片会重叠），命中也要先判关闭
             const D2D1_RECT_F closeRect = D2D1::RectF(
                 box.card.right - 26.0f * s, box.card.top + 6.0f * s,
                 box.card.right - 6.0f * s, box.card.top + 26.0f * s);
             if (rack::PointIn(closeRect, local.x, local.y)) {
                 hit.part = RackPart::Close;
+                hit.index = i;
+                return hit;
+            }
+            const D2D1_RECT_F lockRect = D2D1::RectF(
+                box.card.left + 6.0f * s, box.card.top + 6.0f * s,
+                box.card.left + 26.0f * s, box.card.top + 26.0f * s);
+            if (rack::PointIn(lockRect, local.x, local.y)) {
+                hit.part = RackPart::Lock;
                 hit.index = i;
                 return hit;
             }
