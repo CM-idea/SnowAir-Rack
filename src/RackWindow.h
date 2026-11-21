@@ -35,6 +35,8 @@ public:
     void SetTopBarWatch(bool enabled);
     bool IsTopBarPoint(POINT screen) const;
     int CardIndexAtScreen(POINT screen) const;
+    /* 屏幕点是否落在信封按钮上：面板外点关闭要排除这块，让点信封只走开关链路。 */
+    bool IsEnvelopeScreenPoint(POINT screen) const;
     static LRESULT CALLBACK TopBarHookProc(int code, WPARAM wParam, LPARAM lParam);
     static RackWindow* topBarOwner_;
     bool rightCardDown_ = false;
@@ -110,6 +112,10 @@ private:
 
     RackHit HitAtCursor() const;
     int HitIndexAtCursor(RackPart* outPart = nullptr) const;
+    /* 信封是开关按钮。鼠标连点太快时，第二次按下在 Windows 里不是
+       WM_LBUTTONDOWN 而是 WM_LBUTTONDBLCLK，但它是同一个物理动作；
+       两种消息都从这里走，保证一次按下只切换一次。 */
+    void ToggleClipboardFromEnvelope();
     bool CursorOverLine() const;
     bool CursorOverContent() const;
     bool PointOverPreview(const POINT& screen) const;

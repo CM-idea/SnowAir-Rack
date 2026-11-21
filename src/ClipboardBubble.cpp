@@ -56,6 +56,9 @@ constexpr UINT_PTR kCaretTimer = 0x51;
 constexpr int kTagBuffer = 8192;
 /* 搜索用的完整正文上限（字符）；卡片显示仍用宿主给的 240 字 label。 */
 constexpr int kSearchTextCap = 16384;
+/* 多文件路径 / 条目 id 的取回缓冲区。 */
+constexpr int kEntryPathsCap = 16384;
+constexpr int kEntryIdCap = 128;
 
 const wchar_t* const kFixedChips[] = {L"全部", L"截图", L"文本", L"录屏", L"图片", L"文件"};
 constexpr int kFixedChipCount = 6;
@@ -205,7 +208,12 @@ LRESULT CALLBACK ClipboardBubble::MouseHookProc(int code, WPARAM wParam, LPARAM 
         RECT rc{};
         GetWindowRect(hookOwner_->hwnd(), &rc);
         if (mouse && !PtInRect(&rc, mouse->pt)) {
-            PostMessageW(hookOwner_->hwnd(), WM_APP + 1, 0, 0);
+            /* 点的是开关按钮（信封）：交给按钮自己的开关逻辑，外点关闭不介入。 */
+            if (hookOwner_->ignoreOutside_ && hookOwner_->ignoreOutside_(mouse->pt)) {
+                return CallNextHookEx(nullptr, code, wParam, lParam);
+            }
+            PostMessageW(hookOwner_->hwnd(), WM_APP + 1,
+                         0, 0);
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -340,6 +348,11 @@ void ClipboardBubble::LoadEntries()
     if (count <= 0) return;
     entries_.reserve(static_cast<size_t>(count));
     std::set<std::wstring> seen;
+    /* 缓冲区在循环外复用：逐条新建 32 KB 的 wchar 数组在记录多时纯属浪费。 */
+    const EntryPathsFn pathsFn = HostEntryPaths();
+    std::vector<wchar_t> paths(kEntryPathsCap, L'\0');
+    std::vector<wchar_t> idBuffer(kEntryIdCap, L'\0');
+    std::vector<wchar_t> textBuffer(kSearchTextCap, L'\0');
     for (int i = 0; i < count; ++i) {
         SnowAirEntry raw{};
         if (!host_->entry_get(host_->user, i, &raw)) continue;
@@ -347,8 +360,8 @@ void ClipboardBubble::LoadEntries()
         entry.hostIndex = i;
         entry.label = raw.label;
         entry.path = raw.path;
-        if (auto pathsFn = HostEntryPaths()) {
-            std::vector<wchar_t> paths(16384, L'\0');
+        if (pathsFn) {
+            paths[0] = L'\0';
             const int length = pathsFn(host_->user, i, paths.data(),
                                        static_cast<int>(paths.size()));
             if (length > 0) entry.paths = SplitLines(paths.data());
@@ -366,14 +379,14 @@ void ClipboardBubble::LoadEntries()
         /* 卡片上的 label 只有前 240 个字符（宿主截断过），搜索要能命中正文后半段，
            所以文本条目额外把 id 和完整正文取回来。 */
         if (host_->entry_id) {
-            std::vector<wchar_t> idBuffer(128, L'\0');
+            idBuffer[0] = L'\0';
             if (host_->entry_id(host_->user, i, idBuffer.data(),
                                 static_cast<int>(idBuffer.size())) > 0) {
                 entry.id = idBuffer.data();
             }
         }
         if (entry.kind == SNOWAIR_ENTRY_TEXT && !entry.id.empty() && host_->entry_text) {
-            std::vector<wchar_t> textBuffer(kSearchTextCap, L'\0');
+            textBuffer[0] = L'\0';
             const int length = host_->entry_text(host_->user, entry.id.c_str(),
                                                  textBuffer.data(),
                                                  static_cast<int>(textBuffer.size()));

@@ -16,6 +16,7 @@
 
 # Local test harness (not published)
 /tests/
+/build.ps1
 
 # Local runtime assets (not published)
 /assets/

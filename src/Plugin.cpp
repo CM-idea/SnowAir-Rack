@@ -222,9 +222,12 @@ bool Plugin::Init(const SnowAirHost* host)
         clipboard_.reset();
     } else {
         clipboard_->SetOnClosed([this]() {
-            clipboardClosedTick_ = rack::NowMs();
             /* 面板开着时宿主也可能改过计数：收起时补一次重绘，角标不会停在旧数字。 */
             if (window_) window_->RenderNow();
+        });
+        clipboard_->SetOutsideClickIgnorer([this](POINT pt) {
+            /* 点信封不触发外点关闭：开关完全由 OpenClipboard 单链路负责。 */
+            return window_ && window_->IsEnvelopeScreenPoint(pt);
         });
         clipboard_->SetOnEntriesChanged([this]() {
             /* 面板里删了剪切板记录：立刻重画晾衣架，让信封角标上的数字同步减一。 */
@@ -1420,17 +1423,12 @@ void Plugin::OpenClipboard(int screenX, int screenY)
     if (!clipboard_) {
         return;
     }
-    // 点信封是开关：再点一次收起面板。外面点击的钩子可能已经先把它关掉了，
-    // 所以紧跟在关闭之后的那次信封点击要忽略。
+    // 点信封是开关。外点关闭钩子已经排除了信封区域，所以这里只有一条链路：
+    // 开着就关，关着就开，不存在同一次点击被两条链路重复处理的竞态。
     if (clipboard_->isOpen()) {
         clipboard_->Close();
         return;
     }
-    if (clipboardClosedTick_ != 0 && rack::NowMs() - clipboardClosedTick_ < 300) {
-        clipboardClosedTick_ = 0;
-        return;
-    }
-    clipboardClosedTick_ = 0;
     SyncHostTheme();
     const HMONITOR monitor =
         MonitorFromPoint(POINT{screenX, screenY}, MONITOR_DEFAULTTONEAREST);

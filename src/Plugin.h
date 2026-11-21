@@ -114,7 +114,7 @@ private:
     std::unique_ptr<RackWindow> window_;
     std::unique_ptr<ClipboardBubble> clipboard_;
     std::unique_ptr<PinWindow> pinWindow_;
-    uint64_t clipboardClosedTick_ = 0;
+
     /* 上一次从篮子打开的历史记录窗口（宿主的设置窗口）；篮子再点一次时关掉它。 */
     HWND historyWindow_ = nullptr;
     std::wstring historyTitle_;

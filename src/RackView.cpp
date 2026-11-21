@@ -28,6 +28,13 @@ constexpr float kNoteHeight = 24.0f;
 constexpr float kFrame = 4.0f;
 constexpr float kOuterPad = 24.0f;
 constexpr float kAccessoryWidth = 260.0f;
+/* 篮子按 112 DIP 的方形贴图摆放，挂钩轴在顶边下方 14 DIP。
+   木棉主题的篮子素材里，篮子本体比其它主题小一圈，按同一尺寸贴上去时
+   篮底会比信封底高出一截。这里给该主题一个围绕挂钩的额外缩放，把篮子
+   放大一点，篮底就和信封底落在同一条线上了。 */
+constexpr float kBasketSize = 112.0f;
+constexpr float kBasketHookDrop = 14.0f;
+constexpr float kBasketScale[4] = {1.0f, 1.0f, 1.05f, 1.0f};
 
 /* 轻雪渲染的 SVG 预览缓存是 <id>.svg3.png；这张图已经裁到墨迹边缘，
    卡片里再铺满就会贴边，所以按它识别、单独留一圈白。 */
@@ -1785,7 +1792,10 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
     if (!target || s <= 0.0f || ppd <= 0.0f) {
         return false;
     }
-    const float basketSize = 112.0f * s;
+    const int theme = rack::ClampInt(themeIndex, 0, 3);
+    const float basketS = kBasketScale[theme] * s;
+    const float basketSize = kBasketSize * basketS;
+    const float hookDrop = kBasketHookDrop * basketS;
     const UINT srcPx = static_cast<UINT>(std::lround(basketSize * ppd));
     if (!EnsureBasketPixels(themeIndex, srcPx)) {
         return false;
@@ -1796,9 +1806,9 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
     }
 
     const float pad = 8.0f * s;
-    const float padTop = 18.0f * s; /* 挂钩在篮子上方 14s，也要留在画布里 */
+    const float padTop = 18.0f * s;
     const float canvasW = basketSize + pad * 2.0f;
-    const float canvasH = padTop - 14.0f * s + basketSize + pad;
+    const float canvasH = padTop - hookDrop + basketSize + pad;
     const UINT w = static_cast<UINT>(std::lround(canvasW * ppd));
     const UINT h = static_cast<UINT>(std::lround(canvasH * ppd));
     if (w == 0 || h == 0) {
@@ -1809,7 +1819,7 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
     const float pivotX = canvasW * 0.5f;
     const float pivotY = padTop;
     const float pivotLocalX = basketSize * 0.5f;
-    const float pivotLocalY = 14.0f * s;
+    const float pivotLocalY = hookDrop;
     const float scale = static_cast<float>(basketSrcW_) / basketSize;
 
     for (UINT y = 0; y < h; ++y) {
@@ -1904,7 +1914,8 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
                                    : &basket_;
     if (!historyDisabled_ && basket && basket->valid()) {
         const float basketHoverAmount = basketHover;
-        const float basketSize = 112.0f * s;
+        const float basketSize = kBasketSize * s * kBasketScale[themeIndex];
+        const float hookDrop = kBasketHookDrop * s * kBasketScale[themeIndex];
         const float themeDrop = themeIndex == 1 ? 2.0f * s : 0.0f;
         const float pivotY = ropeYAt(basketCenter);
         const float angle = -2.0f * basketHoverAmount;
@@ -1920,7 +1931,7 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
             const float pad = 8.0f * s;
             const float padTop = 18.0f * s;
             const float canvasW = basketSize + pad * 2.0f;
-            const float canvasH = padTop - 14.0f * s + basketSize + pad;
+            const float canvasH = padTop - hookDrop + basketSize + pad;
             const D2D1_RECT_F dest = D2D1::RectF(
                 basketCenter - canvasW * 0.5f, pivotY - padTop + themeDrop,
                 basketCenter + canvasW * 0.5f, pivotY - padTop + themeDrop + canvasH);
@@ -1929,7 +1940,7 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
             warped = true;
         }
         if (!warped) {
-            const float top = pivotY - 14.0f * s + themeDrop;
+            const float top = pivotY - hookDrop + themeDrop;
             const D2D1_RECT_F dest = D2D1::RectF(basketCenter - basketSize * 0.5f, top,
                                                  basketCenter + basketSize * 0.5f,
                                                  top + basketSize);
@@ -2018,26 +2029,75 @@ void RackView::DrawCountBadge(ID2D1RenderTarget* target, float centerX, float to
     }
     const float width = std::max(28.0f * s, textWidth + 10.0f * s);
     const float height = 18.0f * s;
-    D2D1_RECT_F rect =
-        D2D1::RectF(centerX - width * 0.5f, top, centerX + width * 0.5f, top + height);
+    /* 跟 SnowAir 截图工具栏同一套做法：坐标先取整到整设备像素，胶囊和 1px 内描边
+       画进 2× 离屏位图，再用三次插值贴回。直接把发丝描边画在大画布上时，
+       圆头弧线的覆盖率沿切线时高时低，看着就是锯齿。 */
+    const float grid = (s > 0.0f) ? s : 1.0f;
+    const float left = std::round((centerX - width * 0.5f) * grid) / grid;
+    const float alignedTop = std::round(top * grid) / grid;
+    const float alignedWidth = std::round(width * grid) / grid;
+    const float alignedHeight = std::round(height * grid) / grid;
+
+    FLOAT targetDpiX = 96.0f;
+    FLOAT targetDpiY = 96.0f;
+    target->GetDpi(&targetDpiX, &targetDpiY);
+    const float pxPerDip = (targetDpiX > 0.0f) ? targetDpiX / 96.0f : 1.0f;
+    const UINT pixelWidth = static_cast<UINT>(
+        std::max(1.0f, std::round(alignedWidth * pxPerDip * 2.0f)));
+    const UINT pixelHeight = static_cast<UINT>(
+        std::max(1.0f, std::round(alignedHeight * pxPerDip * 2.0f)));
+
+    const D2D1_SIZE_F softSize = D2D1::SizeF(alignedWidth, alignedHeight);
+    const D2D1_SIZE_U softPixels = D2D1::SizeU(pixelWidth, pixelHeight);
+    ComPtr<ID2D1BitmapRenderTarget> soft;
+    if (FAILED(target->CreateCompatibleRenderTarget(
+            &softSize, &softPixels, nullptr,
+            D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, soft.GetAddressOf()))) {
+        return;
+    }
+    soft->SetDpi(96.0f * static_cast<float>(pixelWidth) / alignedWidth,
+                 96.0f * static_cast<float>(pixelHeight) / alignedHeight);
+    soft->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    soft->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+
+    const D2D1_RECT_F local = D2D1::RectF(0.0f, 0.0f, alignedWidth, alignedHeight);
+    const float radius = alignedHeight * 0.5f;
+    const float strokeWidth = 1.0f;
+    const D2D1_RECT_F borderRect =
+        D2D1::RectF(strokeWidth * 0.5f, strokeWidth * 0.5f,
+                    alignedWidth - strokeWidth * 0.5f,
+                    alignedHeight - strokeWidth * 0.5f);
+    const float borderRadius = std::max(0.0f, radius - strokeWidth * 0.5f);
 
     ComPtr<ID2D1SolidColorBrush> fill;
     ComPtr<ID2D1SolidColorBrush> border;
     ComPtr<ID2D1SolidColorBrush> text;
-    if (FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.12f, 0.15f, 0.82f),
-                                             fill.GetAddressOf())) ||
-        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.16f),
-                                             border.GetAddressOf())) ||
-        FAILED(target->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.97f, 0.99f),
-                                             text.GetAddressOf()))) {
+    if (FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.12f, 0.15f, 0.82f),
+                                           fill.GetAddressOf())) ||
+        FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.20f),
+                                           border.GetAddressOf())) ||
+        FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.97f, 0.99f),
+                                           text.GetAddressOf()))) {
         return;
     }
-    target->FillRoundedRectangle(D2D1::RoundedRect(rect, 9.0f * s, 9.0f * s), fill.Get());
-    target->DrawRoundedRectangle(D2D1::RoundedRect(rect, 9.0f * s, 9.0f * s), border.Get(),
-                                 0.8f * s);
-
-    target->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), rect,
-                     text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    soft->BeginDraw();
+    soft->Clear(D2D1::ColorF(0.f, 0.f));
+    soft->FillRoundedRectangle(D2D1::RoundedRect(local, radius, radius), fill.Get());
+    soft->DrawRoundedRectangle(D2D1::RoundedRect(borderRect, borderRadius, borderRadius),
+                               border.Get(), strokeWidth);
+    soft->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), local,
+                   text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    if (FAILED(soft->EndDraw())) {
+        return;
+    }
+    ComPtr<ID2D1Bitmap> badgeBitmap;
+    if (FAILED(soft->GetBitmap(badgeBitmap.GetAddressOf())) || !badgeBitmap) {
+        return;
+    }
+    target->DrawBitmap(badgeBitmap.Get(),
+                       D2D1::RectF(left, alignedTop, left + alignedWidth,
+                                   alignedTop + alignedHeight),
+                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 }
 
 void RackView::ShowColorFlash(int itemId, int colorIndex, int part, uint64_t untilMs)

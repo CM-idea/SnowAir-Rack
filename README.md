@@ -21,16 +21,6 @@
 - 轻雪「停用历史记录」打开时，篮子（历史入口）隐藏，信封右移到最右侧
 - 便签卡片：正文存在轻雪的剪切板历史里（标签「便签」），双击编辑、右键打开/另存为 TXT；从绳上取下卡片不会删记录，轻雪剪切板历史里仍是一条带「便签」标签的普通文本
 
-## 构建（开发）
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
-```
-
-产物 `dist\rack.dll` 复制到 `%AppData%\SnowAir\plugin\rack\` 后重启轻雪。
-
-发版用 `build.ps1 -Package`，生成固定名的 `dist\SnowAir-Rack.zip`，上传到 Release 即可；插件库和手动安装都只认这个固定名。
-
 ## 依赖
 
 SnowAir 插件 ABI 4，接口见 [`include/SnowAirPlugin.h`](include/SnowAirPlugin.h)，与 [SnowAir 仓库](https://github.com/CM-idea/SnowAir) 保持同步。

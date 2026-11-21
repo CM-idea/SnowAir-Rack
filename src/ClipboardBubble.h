@@ -22,6 +22,12 @@ public:
     bool Init(Graphics* graphics, const SnowAirHost* host);
     void Open(int screenX, int screenY, float scale, const Theme& theme);
     void Close();
+    /* 外点关闭前询问：这个屏幕点是否属于「触发开关的按钮」。
+       是的话不关闭，让按钮自己的开关逻辑单链路处理，避免同一次点击
+       同时走「外点关闭」和「按钮开关」两条链路造成竞态。 */
+    void SetOutsideClickIgnorer(std::function<bool(POINT)> fn) {
+        ignoreOutside_ = std::move(fn);
+    }
     void ApplyTheme(const Theme& theme);
     bool showing() const { return visible() && !entries_.empty(); }
     /* 屏幕点是否落在面板窗口上：晾衣架只在这块区域里把鼠标让给面板。 */
@@ -221,6 +227,7 @@ private:
 
     /* ---- 状态 ---- */
     std::function<void()> onClosed_;
+    std::function<bool(POINT)> ignoreOutside_;
     std::function<void()> onEntriesChanged_;
     std::function<void(const std::wstring&)> onHangText_;
     std::function<void(const std::wstring&)> onHangImage_;

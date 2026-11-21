@@ -519,6 +519,28 @@ int RackWindow::CardIndexAtScreen(POINT screen) const
     return -1;
 }
 
+bool RackWindow::IsEnvelopeScreenPoint(POINT screen) const
+{
+    if (!hwnd()) return false;
+    POINT client = screen;
+    ScreenToClient(hwnd(), &client);
+    const RackHit hit = view_.HitTest(static_cast<float>(client.x),
+                                      static_cast<float>(client.y), scale_);
+    return hit.part == RackPart::Envelope;
+}
+
+void RackWindow::ToggleClipboardFromEnvelope()
+{
+    if (!plugin_ || !hwnd()) return;
+    /* 面板的锚点跟着信封走：信封在换槽位的动画里会滑动，所以每次都用
+       当前布局重新算，而不是缓存下来的坐标。 */
+    const D2D1_POINT_2F anchor = view_.EnvelopeBadgeCenter();
+    POINT screen{static_cast<LONG>(std::lround(anchor.x)),
+                 static_cast<LONG>(std::lround(anchor.y))};
+    ClientToScreen(hwnd(), &screen);
+    plugin_->OpenClipboard(screen.x, screen.y);
+}
+
 bool RackWindow::PointInCardShape(const CardBox& box, float x, float y, float extra) const
 {
     const D2D1_POINT_2F pivot =
@@ -2788,11 +2810,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         if (hit.part == RackPart::Envelope) {
-            const D2D1_POINT_2F anchor = view_.EnvelopeBadgeCenter();
-            POINT screen{static_cast<LONG>(std::lround(anchor.x)),
-                         static_cast<LONG>(std::lround(anchor.y))};
-            ClientToScreen(hwnd(), &screen);
-            plugin_->OpenClipboard(screen.x, screen.y);
+            ToggleClipboardFromEnvelope();
             return 0;
         }
         if (hit.part == RackPart::Card || hit.part == RackPart::Note ||
@@ -3199,6 +3217,13 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const RackHit hit = view_.HitTest(static_cast<float>(point.x),
                                           static_cast<float>(point.y), scale_);
+        /* 快速连点信封时，第二次按下是 WM_LBUTTONDBLCLK，不是
+           WM_LBUTTONDOWN。它仍然是用户对开关按钮的一次完整按下，
+           必须和单击走同一条切换链路；否则这一下会被系统吞掉。 */
+        if (hit.part == RackPart::Envelope) {
+            ToggleClipboardFromEnvelope();
+            return 0;
+        }
         if (hit.index >= 0 && hit.index < static_cast<int>(plugin_->items().size())) {
             if (hit.part == RackPart::CardLink) {
                 OpenCardLink(hit.index);
