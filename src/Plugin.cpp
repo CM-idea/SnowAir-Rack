@@ -20,8 +20,10 @@ const wchar_t* kLabelAutoHide = L"自动收起延迟";
 const wchar_t* kDescAutoHide = L"鼠标离开后等待多久收起（毫秒）";
 const wchar_t* kLabelAutoRetract = L"自动收回";
 const wchar_t* kDescAutoRetract = L"关闭后晾衣架常驻显示，不再自动收起";
-const wchar_t* kLabelMaxItems = L"最多挂载数量";
-const wchar_t* kDescMaxItems = L"超出后最早的一张会自动落下";
+const wchar_t* kLabelMaxMode = L"卡片数量";
+const wchar_t* kDescMaxMode =
+    L"跟随屏幕：按当前显示器能放下的张数保留；不限制：全部保留，放不下的叠在两端";
+const wchar_t* kMaxModeLabels[] = {L"跟随屏幕", L"不限制"};
 
 /* 便签在轻雪剪切板里的标签，同时也用它把便签和普通文本区分开。 */
 constexpr wchar_t kNoteTag[] = L"便签";
@@ -161,13 +163,14 @@ bool Plugin::Init(const SnowAirHost* host)
     config_.Load(host_, host_->user);
     theme_.Load(host_, host_->user);
     itemStore_.Load(items_);
+    NormalizeRackOrder(items_);
     /* 便签正文在轻雪：读完卡片引用后同步正文、迁移旧数据、移除已删除的记录。 */
     SyncNotes();
     nextId_ = 1;
     for (const auto& item : items_) {
         nextId_ = std::max(nextId_, item.id + 1);
     }
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         items_.erase(items_.begin());
     }
     /* 启动时把历史遗留的重复卡片收一收：同样的内容只留最早那张。 */
@@ -205,6 +208,8 @@ bool Plugin::Init(const SnowAirHost* host)
     /* 老数据没有内容指纹：把补算的结果写回去，下次启动就不用再算。 */
     SaveItems();
     PruneRackQuickCache();
+    /* 缩略图缓存跟着 SnowAir 的缓存目录走：清掉没有任何卡片引用的旧图。 */
+    PruneThumbCache();
     {
         // 旧版“长按用画图编辑”留下的临时副本，功能已移除，启动时清掉。
         std::error_code cacheEc;
@@ -346,12 +351,15 @@ void Plugin::OnCapture(const wchar_t* path)
         return;
     }
 
-    items_.push_back(std::move(item));
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    /* 新卡插到吸附组末尾：自定义卡排在组后面，push_back 会把它排到自定义卡之后，
+       布局会按内容坐标 0 把它放在绳子最左端。 */
+    const int addedId = item.id;
+    items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         RemoveItemData(0);
     }
     if (window_) {
-        window_->OnItemsChanged(true);
+        window_->OnItemsChanged(true, addedId);
     }
     SaveItems();
     RackLog(L"Capture added: %s (items=%zu)", full.c_str(), items_.size());
@@ -403,14 +411,15 @@ void Plugin::OnHangImage(const std::wstring& path, const std::wstring& svgId)
         return;
     }
 
-    items_.push_back(std::move(item));
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    const int addedId = item.id;
+    items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         RemoveItemData(0);
     }
     if (window_) {
         /* OnItemsChanged 会启动出场动画并顺带展开绳子。之前先展开的话，新卡片会
            有一帧出现在终点、再被拽回光标位置，看起来像闪了一下。 */
-        window_->OnItemsChanged(true);
+        window_->OnItemsChanged(true, addedId);
     }
     SaveItems();
 }
@@ -469,6 +478,14 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         item.sourcePath = item.path;
         item.mtime = util::FileWriteTime(item.path);
         item.contentHash = util::FileContentHash(item.path);
+        /* 轻雪如果给了独立的缩略图（历史页缓存），卡片就用它；原图仍留给预览/复制。 */
+        if (!thumb.empty()) {
+            const std::wstring thumbFull = util::FullPath(thumb);
+            if (!thumbFull.empty() && util::FileExists(thumbFull) &&
+                !util::SamePath(thumbFull, item.path)) {
+                item.thumbPath = thumbFull;
+            }
+        }
 
         UINT width = 0, height = 0;
         if (graphics_ && SUCCEEDED(graphics_->images().GetSize(item.path, width, height)) &&
@@ -521,12 +538,13 @@ void Plugin::OnHangEntry(int kind, const std::wstring& label, const std::wstring
         return;
     }
 
-    items_.push_back(std::move(item));
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    const int addedId = item.id;
+    items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         RemoveItemData(0);
     }
     if (window_) {
-        window_->OnItemsChanged(true);
+        window_->OnItemsChanged(true, addedId);
     }
     SaveItems();
 }
@@ -649,11 +667,11 @@ void Plugin::DebugHangText(const std::wstring& text, bool note)
 {
     if (!initialized_ || text.empty()) return;
     const card::Type type = note ? card::Type::Note : card::TextType(text);
+    /* AddNoteItem 里已经会通知 OnItemsChanged（带正确的入场下标），这里不要再来一次。 */
     AddNoteItem(text, std::wstring(), type,
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch())
                     .count());
-    if (window_) window_->OnItemsChanged(true);
 }
 
 void Plugin::DebugHangFile(const std::wstring& path)
@@ -673,8 +691,9 @@ void Plugin::DebugHangFile(const std::wstring& path)
     item.aspect = 1.0f;
     item.mtime = util::FileWriteTime(item.path);
     item.contentHash = util::FileContentHash(item.path);
-    items_.push_back(std::move(item));
-    if (window_) window_->OnItemsChanged(true);
+    const int addedId = item.id;
+    items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+    if (window_) window_->OnItemsChanged(true, addedId);
     SaveItems();
 }
 
@@ -725,13 +744,14 @@ void Plugin::AddNoteItem(const std::wstring& text, const std::wstring& noteId, c
         return;
     }
 
-    items_.push_back(std::move(item));
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    const int addedId = item.id;
+    items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         /* 超出上限：卡片落下，但轻雪里的记录保留 */
         RemoveItemData(0);
     }
     if (window_) {
-        window_->OnItemsChanged(true);
+        window_->OnItemsChanged(true, addedId);
     }
     SaveItems();
     RackLog(L"便签上绳 (items=%zu)", items_.size());
@@ -1007,11 +1027,12 @@ bool Plugin::QuickHang(int kind, const std::wstring& text,
             NudgeExistingItem(duplicate);
             return true;
         }
-        items_.push_back(std::move(item));
-        while (static_cast<int>(items_.size()) > config_.maxItems) {
+        const int addedId = item.id;
+        items_.insert(items_.begin() + GroupEndIndex(), std::move(item));
+        while (static_cast<int>(items_.size()) > MaxTotal()) {
             RemoveItemData(0);
         }
-        if (window_) window_->OnItemsChanged(true);
+        if (window_) window_->OnItemsChanged(true, addedId);
         SaveItems();
         return true;
     }
@@ -1029,9 +1050,6 @@ void Plugin::OnSettingChanged(const wchar_t* key)
                 _wcsicmp(key, L"rack.theme") == 0);
     if (themeChanged || !key) {
         theme_.Load(host_, host_->user);
-    }
-    if (key && _wcsicmp(key, config_keys::kMaxItems) == 0) {
-        TrimItems();
     }
     if (window_ && key && _wcsicmp(key, L"hoverPreview") == 0) {
         window_->DismissPreview();
@@ -1094,13 +1112,15 @@ bool Plugin::SettingsGet(int index, SnowAirSettingDesc* out) const
         desc.max_value = 5000;
         break;
     case 3:
-        desc.key = config_keys::kMaxItems;
-        desc.label = kLabelMaxItems;
-        desc.desc = kDescMaxItems;
-        desc.type = SA_SET_INT;
-        desc.default_bool = 8;
-        desc.min_value = 1;
-        desc.max_value = 30;
+        desc.key = config_keys::kMaxMode;
+        desc.label = kLabelMaxMode;
+        desc.desc = kDescMaxMode;
+        desc.type = SA_SET_CHOICE;
+        desc.default_bool = 0; /* 默认跟随屏幕 */
+        desc.min_value = 0;
+        desc.max_value = 1;
+        desc.choice_labels = kMaxModeLabels;
+        desc.choice_count = 2;
         break;
     case 4:
         desc.key = config_keys::kAutoRetract;
@@ -1120,43 +1140,134 @@ bool Plugin::SettingsGet(int index, SnowAirSettingDesc* out) const
 
 void Plugin::PruneRackQuickCache()
 {
-    wchar_t appData[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) == 0) {
-        return;
-    }
-    std::filesystem::path dir{appData};
-    dir /= L"SnowAir";
-    dir /= L"RackQuick";
-    std::error_code ec;
-    if (!std::filesystem::is_directory(dir, ec)) {
-        return;
-    }
-
     std::vector<std::wstring> keep;
+    std::vector<std::filesystem::path> dirs;
+    auto addDir = [&](const std::filesystem::path& p) {
+        for (const auto& d : dirs) {
+            if (util::SamePath(d.wstring(), p.wstring())) return;
+        }
+        dirs.push_back(p);
+    };
+
+    // 快速上绳的临时图由宿主放在 Cache\Misc\RackQuick（旧版在 AppData\SnowAir\RackQuick）。
+    // 目录从卡片路径反推，兼容新旧位置，并跟着主程序的自定义缓存目录走。
     for (Item& item : items_) {
         if (!item.path.empty() &&
             _wcsicmp(std::filesystem::path(item.path).parent_path().filename().c_str(),
                      L"RackQuick") == 0) {
             item.ownsFile = true;
             keep.push_back(item.path);
+            addDir(std::filesystem::path(item.path).parent_path());
         }
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (ec || !entry.is_regular_file(ec)) continue;
-        const std::wstring path = entry.path().wstring();
-        if (_wcsicmp(entry.path().extension().c_str(), L".png") != 0) continue;
-        if (entry.path().filename().wstring().rfind(L"quick-", 0) != 0) continue;
-        bool referenced = false;
-        for (const auto& kept : keep) {
-            if (util::SamePath(kept, path)) {
-                referenced = true;
-                break;
+    const std::wstring cacheRoot = util::SnowAirCacheRoot();
+    if (!cacheRoot.empty()) {
+        addDir(std::filesystem::path(cacheRoot) / L"Misc" / L"RackQuick");
+    }
+    wchar_t localAppData[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) != 0) {
+        std::filesystem::path d{localAppData};
+        d /= L"SnowAir";
+        d /= L"Cache";
+        d /= L"Misc";
+        d /= L"RackQuick";
+        addDir(d);
+    }
+    wchar_t appData[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) != 0) {
+        std::filesystem::path d{appData};
+        d /= L"SnowAir";
+        d /= L"RackQuick";
+        addDir(d);
+    }
+
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) continue;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec || !entry.is_regular_file(ec)) continue;
+            const std::wstring path = entry.path().wstring();
+            if (_wcsicmp(entry.path().extension().c_str(), L".png") != 0) continue;
+            if (entry.path().filename().wstring().rfind(L"quick-", 0) != 0) continue;
+            bool referenced = false;
+            for (const auto& kept : keep) {
+                if (util::SamePath(kept, path)) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (!referenced) {
+                std::error_code removeEc;
+                std::filesystem::remove(entry.path(), removeEc);
             }
         }
-        if (!referenced) {
+    }
+}
+
+void Plugin::PruneThumbCache()
+{
+    /* 缩略图缓存里只该留下当前卡片引用的文件：
+       卡片换了内容、被移除、超出容量被丢时，旧 PNG 都没人再读了。 */
+    std::vector<std::wstring> keep;
+    keep.reserve(items_.size());
+    for (const auto& item : items_) {
+        if (item.kind == 1 || item.kind == 3) {
+            continue;   /* 便签 / 文件卡片没有图片 */
+        }
+        if (item.kind == 2 && item.thumbPath.empty()) {
+            continue;   /* 录屏没有封面 */
+        }
+        if (item.path.empty() && item.thumbPath.empty()) {
+            continue;
+        }
+        keep.push_back(ThumbCacheKey(item) + L".png");
+    }
+
+    std::vector<std::wstring> dirs{util::RackThumbDir()};
+    const std::wstring legacy = util::JoinPath(util::GetDataDir(), L"thumbs");
+    if (!util::SamePath(legacy, dirs.front())) {
+        dirs.push_back(legacy);
+    }
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(dir, ec)) {
+            continue;
+        }
+        int removed = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec || !entry.is_regular_file(ec)) {
+                continue;
+            }
+            if (_wcsicmp(entry.path().extension().c_str(), L".png") != 0) {
+                continue;
+            }
+            const std::wstring name = entry.path().filename().wstring();
+            bool referenced = false;
+            for (const auto& kept : keep) {
+                if (_wcsicmp(kept.c_str(), name.c_str()) == 0) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if (referenced) {
+                continue;
+            }
             std::error_code removeEc;
             std::filesystem::remove(entry.path(), removeEc);
+            if (!removeEc) {
+                ++removed;
+            }
+        }
+        if (removed > 0) {
+            RackLog(L"缩略图缓存清理：%s 移除 %d 个孤儿文件", dir.c_str(), removed);
+        }
+        if (!util::SamePath(dir, dirs.front())) {
+            std::error_code emptyEc;
+            if (std::filesystem::is_empty(dir, emptyEc)) {
+                std::error_code removeEc;
+                std::filesystem::remove(dir, removeEc);
+            }
         }
     }
 }
@@ -1244,10 +1355,22 @@ void Plugin::SetItemNote(int index, const std::wstring& text, int color)
     SaveItems();
 }
 
+void Plugin::SetMaxTotal(int maxTotal)
+{
+    if (maxTotal < 0) {
+        maxTotal = 0;
+    }
+    if (maxTotal == maxTotal_) {
+        return;
+    }
+    maxTotal_ = maxTotal;
+    TrimItems();
+}
+
 void Plugin::TrimItems()
 {
     bool changed = false;
-    while (static_cast<int>(items_.size()) > config_.maxItems) {
+    while (static_cast<int>(items_.size()) > MaxTotal()) {
         if (window_) {
             window_->DismissPreview();
         }
@@ -1260,6 +1383,15 @@ void Plugin::TrimItems()
     if (changed) {
         SaveItems();
     }
+}
+
+int Plugin::GroupEndIndex() const
+{
+    int index = 0;
+    while (index < static_cast<int>(items_.size()) && !items_[static_cast<size_t>(index)].custom) {
+        ++index;
+    }
+    return index;
 }
 
 int Plugin::IndexById(int id) const
@@ -1502,6 +1634,9 @@ void Plugin::SaveNotes()
 
 void Plugin::SaveItems()
 {
+    /* 吸附组永远排在前面，自定义卡排在后面：Layout 用前缀计数。 */
+    std::stable_partition(items_.begin(), items_.end(),
+                          [](const Item& item) { return !item.custom; });
     itemStore_.Save(items_);
 }
 

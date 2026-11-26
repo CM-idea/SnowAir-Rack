@@ -103,7 +103,7 @@ HGLOBAL MakePngHandle(const std::vector<BYTE>& bytes)
 
 HGLOBAL MakeDibHandle(const DecodedImage& image)
 {
-    // 传统 CF_DIB：Adobe 拖拽只认这一份，因此必须是 32bpp 并保留 alpha。
+    // 传统 CF_DIB：部分目标软件拖拽只认这一份，因此必须是 32bpp 并保留 alpha。
     // 之前这里把 alpha 强制写成 0xFF，正是拖进去变白底的根因。
     const size_t headerSize = sizeof(BITMAPINFOHEADER);
     const size_t stride = static_cast<size_t>(image.width) * 4;
@@ -144,7 +144,7 @@ HGLOBAL MakeDibHandle(const DecodedImage& image)
 
 HGLOBAL MakeDibV5Handle(const DecodedImage& image)
 {
-    // CF_DIBV5：32bpp + alpha 掩码。设计软件（Adobe）优先取这份，透明通道才能保留。
+    // CF_DIBV5：32bpp + alpha 掩码。支持 DIBV5 的设计软件优先取这份，透明通道才能保留。
     const size_t headerSize = sizeof(BITMAPV5HEADER);
     const size_t stride = static_cast<size_t>(image.width) * 4;
     const size_t total = headerSize + stride * image.height;
@@ -277,8 +277,8 @@ bool CopyImage(const std::wstring& path)
     if (EmptyClipboard()) {
         bool any = false;
         if (decoded) {
-            // 只给 DIBV5：Adobe 粘贴会走带 alpha 的这份；再给 CF_DIB 会被它优先取走，
-            // 32bpp BI_RGB 的 alpha 一丢就成白底。Figma / 其他软件仍可从 DIBV5 或 PNG 取图。
+            // 只给 DIBV5：支持 DIBV5 的软件粘贴会走带 alpha 的这份；再给 CF_DIB 可能被优先取走，
+            // 32bpp BI_RGB 的 alpha 一丢就成白底。其他软件仍可从 DIBV5 或 PNG 取图。
             any |= SetHandleData(CF_DIBV5, MakeDibV5Handle(image));
         }
         if (!png.empty()) {

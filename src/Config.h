@@ -8,6 +8,8 @@ inline constexpr wchar_t kHoverDelay[] = L"rack.hover_delay_ms";
 inline constexpr wchar_t kAutoHide[] = L"rack.auto_hide_ms";
 inline constexpr wchar_t kAutoRetract[] = L"rack.auto_retract";
 inline constexpr wchar_t kDisplayMode[] = L"rack.display_mode";
+/* 0 = 跟随屏幕，1 = 不限制。旧版 rack.max_items 仅保留键名，不再读取。 */
+inline constexpr wchar_t kMaxMode[] = L"rack.max_mode";
 inline constexpr wchar_t kMaxItems[] = L"rack.max_items";
 inline constexpr wchar_t kAutoCapture[] = L"rack.auto_capture";
 inline constexpr wchar_t kSize[] = L"rack.size";
@@ -25,7 +27,8 @@ struct RackConfig {
     /* 兼容旧字段：只有悬停模式才自动收回。 */
     bool autoRetract = true;
     int displayMode = kDisplayHover;
-    int maxItems = 8;
+    /* 0 = 跟随屏幕（按可见数量保留），1 = 不限制。 */
+    int maxMode = 0;
     bool autoCapture = true;
     int size = 1;   // 0 small, 1 medium, 2 large
 

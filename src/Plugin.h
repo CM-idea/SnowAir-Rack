@@ -9,6 +9,8 @@
 #include "NoteStore.h"
 #include "Theme.h"
 
+#include <climits>
+
 class RackWindow;
 class PinWindow;
 
@@ -60,6 +62,8 @@ public:
 
     void RemoveItemAt(int index);
     void SetItemNote(int index, const std::wstring& text, int color);
+    /* 0 表示不限制；窗口按当前显示器算好可见数量后调这里。 */
+    void SetMaxTotal(int maxTotal);
     void TrimItems();
     int IndexById(int id) const;
     Item* ItemById(int id);
@@ -90,8 +94,15 @@ private:
     Plugin& operator=(const Plugin&) = delete;
 
     void RemoveItemData(int index);
+    /* 0 = 不限制。所有“超出就丢最旧”的路径都走这里。 */
+    int MaxTotal() const { return maxTotal_ > 0 ? maxTotal_ : INT_MAX; }
+    /* 吸附组末尾下标（第一张自定义卡的位置）：新卡必须插在这里，
+       不能 push_back，否则会排到自定义卡后面按内容坐标 0 落到绳子最左边。 */
+    int GroupEndIndex() const;
     /* 清掉 RackQuick 下已经不在任何卡片里的旧缓存图（永久删除）。 */
     void PruneRackQuickCache();
+    /* 清掉缩略图缓存里已经没有任何卡片引用的孤儿 PNG。 */
+    void PruneThumbCache();
 
     /*
      * 便签数据在轻雪：这里只是读写它剪切板里的文本记录。
@@ -131,4 +142,5 @@ private:
     bool oleInitialized_ = false;
     int nextId_ = 1;
     bool manualHang_ = false;
+    int maxTotal_ = 0;
 };

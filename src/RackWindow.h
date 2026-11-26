@@ -16,7 +16,8 @@ public:
     bool Init(Plugin* plugin, Graphics* graphics);
     void Shutdown();
 
-    void OnItemsChanged(bool added);
+    /* addedId：新增卡片的 id（自定义卡排在组后面，不能再用 items.back()）。 */
+    void OnItemsChanged(bool added, int addedId = -1);
     void OnConfigChanged();
     void OnThemeChanged();
     void RenderNow();
@@ -24,23 +25,35 @@ public:
     void Expand(bool peek);
     void ToggleVisibility();
     void Collapse();
-    /* 使某张卡片轻微晃动，用于提示「已经挂在这儿了」。 */
+    /* 浣挎煇寮犲崱鐗囪交寰檭鍔紝鐢ㄤ簬鎻愮ず銆屽凡缁忔寕鍦ㄨ繖鍎夸簡銆嶃€?*/
     void ShakeCard(int index);
-    /* 从左往右检查最小间距，挨太近就用缓动推开。 */
+    /* 浠庡乏寰€鍙虫鏌ユ渶灏忛棿璺濓紝鎸ㄥお杩戝氨鐢ㄧ紦鍔ㄦ帹寮€銆?*/
     void NormalizeSpacing(float ms);
-    /* 拖拽期间让绳子对鼠标透明：OLE 每次移动都要做命中测试，
-       一块全宽分层窗口挡在指针下面会明显拖慢拖拽。 */
+    /* 拖到两张卡中间松手：吸附组按落点左右分开、向外让开（缓动到目标偏移）。 */
+    void PushGroupAside(int skipId, int splitIndex, float obstacleLeft, float obstacleRight);
+    /* 还在缓动里的偏移按目标值算：判断自定义卡会不会压住邻居时用。 */
+    float PendingGroupOffset(int id, float fallback) const;
+    /* 绳子上一张自定义卡都没有时，把吸附组为让位产生的偏移收回槽位。 */
+    void RelaxGroupOffsetsIfNoCustoms();
+    /* 取消挂起的偏移缓动前先置于终点，避免卡片停在中间位置。 */
+    void SettleOffsetAnims();
+    /* 自定义卡和别的卡重叠时，自动并回吸附组的最近槽位。
+       ignoreId：本轮跳过刚放下的卡片（它要停在新位置）。 */
+    void ResolveCustomOverlaps(int ignoreId = -1);
+    /* 鎷栨嫿鏈熼棿璁╃怀瀛愬榧犳爣閫忔槑锛歄LE 姣忔绉诲姩閮借鍋氬懡涓祴璇曪紝
+       涓€鍧楀叏瀹藉垎灞傜獥鍙ｆ尅鍦ㄦ寚閽堜笅闈細鏄庢樉鎷栨參鎷栨嫿銆?*/
     void SetDragTransparent(bool on);
-    /* 展开期间监听屏幕顶边点击和卡片右键。 */
+    /* 灞曞紑鏈熼棿鐩戝惉灞忓箷椤惰竟鐐瑰嚮鍜屽崱鐗囧彸閿€?*/
     void SetTopBarWatch(bool enabled);
     bool IsTopBarPoint(POINT screen) const;
     int CardIndexAtScreen(POINT screen) const;
-    /* 屏幕点是否落在信封按钮上：面板外点关闭要排除这块，让点信封只走开关链路。 */
+    /* 灞忓箷鐐规槸鍚﹁惤鍦ㄤ俊灏佹寜閽笂锛氶潰鏉垮鐐瑰叧闂鎺掗櫎杩欏潡锛岃鐐逛俊灏佸彧璧板紑鍏抽摼璺€?*/
     bool IsEnvelopeScreenPoint(POINT screen) const;
     static LRESULT CALLBACK TopBarHookProc(int code, WPARAM wParam, LPARAM lParam);
     static RackWindow* topBarOwner_;
     bool rightCardDown_ = false;
     uint64_t rightCardDownAt_ = 0;
+    bool startupResolveDone_ = false;
     HHOOK topBarHook_ = nullptr;
     bool expanded() const { return expand_ > 0.5f; }
 
@@ -92,7 +105,7 @@ private:
     void Tick();
     void Animate();
     void EnsureVisible();
-    /* 读轻雪的「停用历史记录」，变了就重新布局并重绘。 */
+    /* 璇昏交闆殑銆屽仠鐢ㄥ巻鍙茶褰曘€嶏紝鍙樹簡灏遍噸鏂板竷灞€骞堕噸缁樸€?*/
     void RefreshHistoryDisabled();
     void PositionForMonitor(HMONITOR monitor);
     void StartAnimation(float target);
@@ -100,21 +113,25 @@ private:
     void UpdatePreview();
     void UpdateAccessoryHover(const RackHit& hit);
     void UpdateClickThrough();
+    /* 鎸夊綋鍓嶆樉绀哄櫒瀹归噺锛屾妸銆岄殢灞忓箷鑰屽畾銆嶇殑涓婇檺鍚屾缁欐彃浠躲€?*/
+    void UpdateMaxTotal();
+    /* 榧犳爣绉诲姩鏃跺嵆鏃舵洿鏂?hover锛堣妭娴侊級锛屼笉鍐嶇瓑 50ms 杞銆?*/
+    void UpdateHoverFromMouse();
     void SetClickThrough(bool enabled);
-    /* 卡片/便签条的精确命中形状（含旋转与悬停放大），extra 是外扩像素。 */
+    /* 鍗＄墖/渚跨鏉＄殑绮剧‘鍛戒腑褰㈢姸锛堝惈鏃嬭浆涓庢偓鍋滄斁澶э級锛宔xtra 鏄鎵╁儚绱犮€?*/
     bool PointInCardShape(const CardBox& box, float x, float y, float extra) const;
     bool PointInNoteShape(const CardBox& box, float x, float y, float extra) const;
-    /* 指针下这个像素是否真的画了东西。分层窗口只看 alpha，
-       低级鼠标钩子用它把空白区域让给下面的程序。 */
+    /* 鎸囬拡涓嬭繖涓儚绱犳槸鍚︾湡鐨勭敾浜嗕笢瑗裤€傚垎灞傜獥鍙ｅ彧鐪?alpha锛?
+       浣庣骇榧犳爣閽╁瓙鐢ㄥ畠鎶婄┖鐧藉尯鍩熻缁欎笅闈㈢殑绋嬪簭銆?*/
     bool PointHittable(POINT screen) const;
-    /* 图片/文件被删除后，把绳子上的卡片自动取下。 */
+    /* 鍥剧墖/鏂囦欢琚垹闄ゅ悗锛屾妸缁冲瓙涓婄殑鍗＄墖鑷姩鍙栦笅銆?*/
     void CheckMissingFiles();
 
     RackHit HitAtCursor() const;
     int HitIndexAtCursor(RackPart* outPart = nullptr) const;
-    /* 信封是开关按钮。鼠标连点太快时，第二次按下在 Windows 里不是
-       WM_LBUTTONDOWN 而是 WM_LBUTTONDBLCLK，但它是同一个物理动作；
-       两种消息都从这里走，保证一次按下只切换一次。 */
+    /* 淇″皝鏄紑鍏虫寜閽€傞紶鏍囪繛鐐瑰お蹇椂锛岀浜屾鎸変笅鍦?Windows 閲屼笉鏄?
+       WM_LBUTTONDOWN 鑰屾槸 WM_LBUTTONDBLCLK锛屼絾瀹冩槸鍚屼竴涓墿鐞嗗姩浣滐紱
+       涓ょ娑堟伅閮戒粠杩欓噷璧帮紝淇濊瘉涓€娆℃寜涓嬪彧鍒囨崲涓€娆°€?*/
     void ToggleClipboardFromEnvelope();
     bool CursorOverLine() const;
     bool CursorOverContent() const;
@@ -124,13 +141,13 @@ private:
     void HidePreviewNow();
     void CopyItem(int index);
     void OpenItem(int index);
-    /* 链接正文单击：打开默认浏览器（双击不重复开）。 */
+    /* 閾炬帴姝ｆ枃鍗曞嚮锛氭墦寮€榛樿娴忚鍣紙鍙屽嚮涓嶉噸澶嶅紑锛夈€?*/
     void OpenCardLink(int index);
-    /* 颜色卡单个色块/hex/rgb：只复制这个颜色。part 0=色块 1=hex 2=rgb。 */
+    /* 棰滆壊鍗″崟涓壊鍧?hex/rgb锛氬彧澶嶅埗杩欎釜棰滆壊銆俻art 0=鑹插潡 1=hex 2=rgb銆?*/
     void CopyCardColor(int index, int colorIndex, int part);
-    /* 颜色卡滚轮：返回 true 表示这次滚轮已被色卡吃掉。 */
+    /* 棰滆壊鍗℃粴杞細杩斿洖 true 琛ㄧず杩欐婊氳疆宸茶鑹插崱鍚冩帀銆?*/
     bool ScrollColorCard(int index, int delta);
-    /* 右键「编辑颜色」：改这张卡的头部强调色（便签是整张纸的主色）。 */
+    /* 鍙抽敭銆岀紪杈戦鑹层€嶏細鏀硅繖寮犲崱鐨勫ご閮ㄥ己璋冭壊锛堜究绛炬槸鏁村紶绾哥殑涓昏壊锛夈€?*/
     void PickCardColor(int index);
     void SaveItemAs(int index);
     void RemoveItem(int index, bool toBasket = true);
@@ -167,7 +184,8 @@ private:
     uint64_t animStart_ = 0;
     uint64_t revealStart_ = 0;
     uint64_t swingUntil_ = 0;
-    /* 单张卡片晃动的时间线，和整体摆动分开。 */
+    uint64_t normalizeAt_ = 0;
+    /* 鍗曞紶鍗＄墖鏅冨姩鐨勬椂闂寸嚎锛屽拰鏁翠綋鎽嗗姩鍒嗗紑銆?*/
     uint64_t shakeUntil_ = 0;
     float basketHover_ = 0.0f;
     float basketHoverTarget_ = 0.0f;
@@ -190,11 +208,11 @@ private:
 
     uint64_t lastInside_ = 0;
     uint64_t hoverLineSince_ = 0;
-    /* 收起后闲置一段时间就把素材位图/2x 表面放掉，常驻内存随之回落。 */
+    /* 鏀惰捣鍚庨棽缃竴娈垫椂闂村氨鎶婄礌鏉愪綅鍥?2x 琛ㄩ潰鏀炬帀锛屽父椹诲唴瀛橀殢涔嬪洖钀姐€?*/
     uint64_t lastExpandedMs_ = 0;
     bool idleMemoryReleased_ = false;
     bool lineHover_ = false;
-    /* 刚在顶栏点过一下：指针离开顶边之前不再自动展开。 */
+    /* 鍒氬湪椤舵爮鐐硅繃涓€涓嬶細鎸囬拡绂诲紑椤惰竟涔嬪墠涓嶅啀鑷姩灞曞紑銆?*/
     bool topBarSuppressed_ = false;
 
     int hovered_ = -1;
@@ -209,7 +227,9 @@ private:
     bool mouseDown_ = false;
     bool dragStarted_ = false;
     bool cardDragging_ = false;
+    /* 按下时的偏移/屏幕左缘：只挪一点点松手要回原位（保留之前的自定义偏移）。 */
     float cardDragStartOffset_ = 0.0f;
+    float cardDragStartLeft_ = 0.0f;
     uint64_t lastCardDragPaint_ = 0;
     bool hideWhenRemovalsDone_ = false;
     bool hotkeyPinned_ = false;
@@ -225,7 +245,7 @@ private:
     uint64_t pendingAdjustAt_ = 0;
     uint64_t menuCloseGraceUntil_ = 0;
     bool menuActionPending_ = false;
-    /* 点夹子贴图：等卡片下落动画走一半，再触发原生贴图。 */
+    /* 鐐瑰す瀛愯创鍥撅細绛夊崱鐗囦笅钀藉姩鐢昏蛋涓€鍗婏紝鍐嶈Е鍙戝師鐢熻创鍥俱€?*/
     enum class PendingPin { None, Image, Text, Files };
     PendingPin pendingPinKind_ = PendingPin::None;
     std::wstring pendingPinPath_;
@@ -235,8 +255,8 @@ private:
     uint64_t pendingPinAt_ = 0;
 
     void FinishCardDrag(int id);
-    void NormalizeLoadedSpacing();
-    bool normalizeSpacingPending_ = false;
+    /* 拖动中实时重排：被拖的卡越过谁的槽位中线就插到那边，
+       其他卡片只改槽位目标、靠弹簧自然让位。 */
     POINT pressPoint_{};
 
     int clickItemId_ = -1;
@@ -251,24 +271,28 @@ private:
     float cardScaleTarget_ = 1.0f;
     uint64_t cardScaleAnimStart_ = 0;
     bool cardScaleAnimating_ = false;
-    /* 便签编辑器开着时绳子保持展开，不自动收回。 */
+    /* 渚跨缂栬緫鍣ㄥ紑鐫€鏃剁怀瀛愪繚鎸佸睍寮€锛屼笉鑷姩鏀跺洖銆?*/
     bool editingNote_ = false;
 
     int previewIndex_ = -1;
     uint64_t previewHideAt_ = 0;
     RECT previewAnchor_{};
+    uint64_t lastHoverPollMs_ = 0;
+    bool updatingMaxTotal_ = false;
 
     bool hiddenForFullscreen_ = false;
     bool needsLayout_ = false;
     bool historyDisabled_ = false;
-    /* 每次展开只查一次文件是否还在；不做定时轮询。 */
+    /* 姣忔灞曞紑鍙煡涓€娆℃枃浠舵槸鍚﹁繕鍦紱涓嶅仛瀹氭椂杞銆?*/
     bool missingChecked_ = false;
-    /* 显示方式：0 悬停展开、1 快捷键切换、2 常驻显示。 */
+    /* 鏄剧ず鏂瑰紡锛? 鎮仠灞曞紑銆? 蹇嵎閿垏鎹€? 甯搁┗鏄剧ず銆?*/
     int lastDisplayMode_ = 0;
-    /* 快捷键模式下手动隐藏：隐藏后不再被悬停/配置轮询自动拉起。 */
+    /* 蹇嵎閿ā寮忎笅鎵嬪姩闅愯棌锛氶殣钘忓悗涓嶅啀琚偓鍋?閰嶇疆杞鑷姩鎷夎捣銆?*/
     bool manuallyHidden_ = false;
     bool shownBeforeFullscreen_ = false;
-    /* 预览期间（设置页的「晾衣架外观」）收起会被宿主 pin 住；
-       等预览结束再补一次收起。 */
+    /* 棰勮鏈熼棿锛堣缃〉鐨勩€屾櫨琛ｆ灦澶栬銆嶏級鏀惰捣浼氳瀹夸富 pin 浣忥紱
+       绛夐瑙堢粨鏉熷啀琛ヤ竴娆℃敹璧枫€?*/
     bool collapseAfterPreview_ = false;
+    /* 璁剧疆椤垫妸鏅捐。鏋舵媺鍑烘潵杩囷細棰勮缁撴潫鍚庯紝蹇嵎閿?甯搁┗妯″紡涓嬭鏀跺洖銆?*/
+    bool settingsPreviewShown_ = false;
 };

@@ -5,9 +5,9 @@
 #include <cwctype>
 #include <filesystem>
 #include <map>
-
+#include <unordered_map>
+#include <unordered_set>
 namespace {
-
 constexpr float kLineY = 14.0f;
 constexpr float kCardTop = 42.0f;
 /* 卡片规格：照片最大 136x104，卡片宽 150，卡片间距 24。 */
@@ -27,7 +27,11 @@ constexpr float kWindowHeight = 520.0f;
 constexpr float kNoteHeight = 24.0f;
 constexpr float kFrame = 4.0f;
 constexpr float kOuterPad = 24.0f;
-constexpr float kAccessoryWidth = 260.0f;
+/* 叠卡：左右各最多 3 张，都垫在可见行首/尾卡下面，只露出一点边和夹子。
+   相邻两张按「夹子宽 + 一点点缝」错开，夹子之间刚好有可见的间距。 */
+constexpr int kStackLayers = 3;
+constexpr float kStackClipGap = 3.0f;
+constexpr float kNominalCardWidth = 150.0f;
 /* 篮子按 112 DIP 的方形贴图摆放，挂钩轴在顶边下方 14 DIP。
    木棉主题的篮子素材里，篮子本体比其它主题小一圈，按同一尺寸贴上去时
    篮底会比信封底高出一截。这里给该主题一个围绕挂钩的额外缩放，把篮子
@@ -35,7 +39,6 @@ constexpr float kAccessoryWidth = 260.0f;
 constexpr float kBasketSize = 112.0f;
 constexpr float kBasketHookDrop = 14.0f;
 constexpr float kBasketScale[4] = {1.0f, 1.0f, 1.05f, 1.0f};
-
 /* 轻雪渲染的 SVG 预览缓存是 <id>.svg3.png；这张图已经裁到墨迹边缘，
    卡片里再铺满就会贴边，所以按它识别、单独留一圈白。 */
 bool IsSvgPreviewPath(const std::wstring& path)
@@ -51,7 +54,6 @@ bool IsSvgPreviewPath(const std::wstring& path)
 constexpr float kArrivalSeconds = 0.65f;
 /* 卡片位置的目标变了之后，先停这么久再开始靠拢。 */
 constexpr uint64_t kCloseHoldMs = 140;
-
 /* 弹簧积分器：位置和目标之间的阻尼弹簧，卡片靠拢/让位动画使用它。
    参数和参考实现一致（response 大一点更慢，damping 越小越弹）。 */
 void SlideSpring(float& position, float& velocity, float target, float dt, float response,
@@ -80,7 +82,6 @@ void SlideSpring(float& position, float& velocity, float target, float dt, float
         velocity = 0.0f;
     }
 }
-
 /* 文件卡片标题里带着「等 N 个」：取出来显示成「N 个文件」，取不到按单个处理。 */
 int FileCountFromLabel(const std::wstring& label)
 {
@@ -99,7 +100,6 @@ int FileCountFromLabel(const std::wstring& label)
     }
     return found && value > 0 ? value : 1;
 }
-
 std::wstring ReadRegistryString(HKEY root, const std::wstring& key, const wchar_t* value)
 {
     HKEY handle = nullptr;
@@ -121,7 +121,6 @@ std::wstring ReadRegistryString(HKEY root, const std::wstring& key, const wchar_
     }
     return text;
 }
-
 /* 可执行文件的「文件说明」（版本信息里的 FileDescription），没有就退回文件名。 */
 std::wstring ExeDisplayName(const std::wstring& exePath)
 {
@@ -163,8 +162,7 @@ std::wstring ExeDisplayName(const std::wstring& exePath)
     }
     return description;
 }
-
-/* 从「.docx」的默认打开命令里取出程序名：WPS Office / Word / 记事本…… */
+/* 从「.docx」的默认打开命令里取出程序名。 */
 std::wstring FileDescriptionOfAssociation(const std::wstring& extension)
 {
     std::wstring progId = ReadRegistryString(
@@ -201,8 +199,7 @@ std::wstring FileDescriptionOfAssociation(const std::wstring& extension)
     }
     return ExeDisplayName(exePath);
 }
-
-/* 扩展名默认交给哪个程序打开：.docx → WPS / Word，用来在文件夹图标右边标注类型。 */
+/* 扩展名默认交给哪个程序打开，用来在文件夹图标右边标注类型。 */
 std::wstring AppNameForExtension(const std::wstring& extension)
 {
     if (extension.empty()) {
@@ -213,8 +210,7 @@ std::wstring AppNameForExtension(const std::wstring& extension)
     if (cached != cache.end()) {
         return cached->second;
     }
-
-    /* 先问系统默认程序；WPS 这类走启动器的关联常常查不到，再退回注册表里的
+    /* 先问系统默认程序；通过启动器注册的关联有时查不到，再退回注册表里的
        打开命令，最后用可执行文件名。 */
     std::wstring name;
     wchar_t buffer[512]{};
@@ -227,11 +223,11 @@ std::wstring AppNameForExtension(const std::wstring& extension)
     if (name.empty()) {
         name = FileDescriptionOfAssociation(extension);
     }
-    /* 「WPS Office」这类产品后缀去掉，只留名字。 */
-    const std::wstring office = L" Office";
-    if (name.size() > office.size() &&
-        name.compare(name.size() - office.size(), office.size(), office) == 0) {
-        name.erase(name.size() - office.size());
+    /* 去掉常见的产品后缀，只留程序名。 */
+    const std::wstring suffix = L" Office";
+    if (name.size() > suffix.size() &&
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        name.erase(name.size() - suffix.size());
     }
     if (name.empty()) {
         name = extension;
@@ -245,7 +241,6 @@ std::wstring AppNameForExtension(const std::wstring& extension)
     cache[extension] = name;
     return name;
 }
-
 D2D1_POINT_2F RotateAround(D2D1_POINT_2F point, D2D1_POINT_2F center, float degrees)
 {
     const float radians = degrees * 3.1415926535f / 180.0f;
@@ -255,7 +250,6 @@ D2D1_POINT_2F RotateAround(D2D1_POINT_2F point, D2D1_POINT_2F center, float degr
     const float dy = point.y - center.y;
     return D2D1::Point2F(center.x + dx * c - dy * s, center.y + dx * s + dy * c);
 }
-
 float CardEntryOffset(const Item& item)
 {
     const uint64_t now = rack::NowMs();
@@ -275,7 +269,6 @@ float CardEntryOffset(const Item& item)
     return -46.0f * std::exp(-decay * age) *
            (std::cos(damped * age) + (decay / damped) * std::sin(damped * age));
 }
-
 bool IsNewCard(const Item& item)
 {
     switch (item.cardType) {
@@ -289,7 +282,6 @@ bool IsNewCard(const Item& item)
     default: return false;
     }
 }
-
 D2D1_COLOR_F AccentFor(const Item& item)
 {
     const uint32_t rgb = item.accentSet ? item.accent : card::DefaultAccent(item.cardType);
@@ -297,27 +289,23 @@ D2D1_COLOR_F AccentFor(const Item& item)
                         static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
                         static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
 }
-
 D2D1_COLOR_F RgbColor(uint32_t rgb)
 {
     return D2D1::ColorF(static_cast<float>((rgb >> 16) & 0xFF) / 255.0f,
                         static_cast<float>((rgb >> 8) & 0xFF) / 255.0f,
                         static_cast<float>(rgb & 0xFF) / 255.0f, 1.0f);
 }
-
 D2D1_COLOR_F MixColor(const D2D1_COLOR_F& a, const D2D1_COLOR_F& b, float t)
 {
     return D2D1::ColorF(rack::Lerp(a.r, b.r, t), rack::Lerp(a.g, b.g, t),
                         rack::Lerp(a.b, b.b, t), 1.0f);
 }
-
 bool AccentUsesDarkInk(const D2D1_COLOR_F& accent)
 {
     const float luminance = 0.299f * accent.r + 0.587f * accent.g + 0.114f * accent.b;
     /* 只有接近白/特别浅的头部才用深字；普通彩色头部保持白字。 */
     return luminance > 0.85f;
 }
-
 int ColorCountFor(const Item& item)
 {
     std::vector<card::Rgba> colors;
@@ -326,7 +314,6 @@ int ColorCountFor(const Item& item)
     }
     return 1;
 }
-
 int CardCountFor(const Item& item)
 {
     if (item.cardType == card::Type::Color) {
@@ -341,14 +328,12 @@ int CardCountFor(const Item& item)
     }
     return 1;
 }
-
 /* 便签比普通方卡略大一点，避免一排卡片过于规整。 */
 float FlatCardSide(const Item& item, float cs)
 {
     const float factor = item.cardType == card::Type::Note ? 1.08f : 1.0f;
     return kFlatCardSize * cs * factor;
 }
-
 /*
  * 新式卡的内部几何：头部 / 正文 / 链接命中区 / 颜色行。
  * rect 用实际绘制矩形（含按下位移），色卡滚动量按 150 基准缩放。
@@ -363,7 +348,6 @@ void BuildCardMetrics(const Item& item, const D2D1_RECT_F& rect, CardBox& out)
     out.linkText = rack::Inset(out.body, 11.0f * u, 8.0f * u);
     out.colorRows.clear();
     if (item.cardType != card::Type::Color) return;
-
     std::vector<card::Rgba> colors;
     if (!card::ParseColors(item.note, colors)) return;
     const float pad = 11.0f * u;
@@ -393,7 +377,6 @@ void BuildCardMetrics(const Item& item, const D2D1_RECT_F& rect, CardBox& out)
         out.colorRows.push_back(row);
     }
 }
-
 void ShiftCard(CardBox& box, float dy)
 {
     box.card.top += dy;
@@ -421,9 +404,35 @@ void ShiftCard(CardBox& box, float dy)
         box.note.bottom += dy;
     }
 }
-
+void ShiftCardXY(CardBox& box, float dx, float dy)
+{
+    box.card.left += dx; box.card.right += dx;
+    box.card.top += dy; box.card.bottom += dy;
+    box.image.left += dx; box.image.right += dx;
+    box.image.top += dy; box.image.bottom += dy;
+    box.header.left += dx; box.header.right += dx;
+    box.header.top += dy; box.header.bottom += dy;
+    box.body.left += dx; box.body.right += dx;
+    box.body.top += dy; box.body.bottom += dy;
+    box.linkText.left += dx; box.linkText.right += dx;
+    box.linkText.top += dy; box.linkText.bottom += dy;
+    for (auto& row : box.colorRows) {
+        row.row.left += dx; row.row.right += dx;
+        row.row.top += dy; row.row.bottom += dy;
+        row.swatch.left += dx; row.swatch.right += dx;
+        row.swatch.top += dy; row.swatch.bottom += dy;
+        row.hex.left += dx; row.hex.right += dx;
+        row.hex.top += dy; row.hex.bottom += dy;
+        row.rgb.left += dx; row.rgb.right += dx;
+        row.rgb.top += dy; row.rgb.bottom += dy;
+    }
+    if (box.hasNote) {
+        box.note.left += dx; box.note.right += dx;
+        box.note.top += dy; box.note.bottom += dy;
+    }
+    box.pinTop += dy;
+}
 } /* namespace */
-
 bool RackView::Init(Graphics* graphics)
 {
     graphics_ = graphics;
@@ -435,7 +444,6 @@ bool RackView::Init(Graphics* graphics)
            toastFormat_ != nullptr && cardTitleFormat_ != nullptr &&
            cardBodyFormat_ != nullptr;
 }
-
 void RackView::LoadAssets(ID2D1RenderTarget* target)
 {
     if (assetsAttempted_ || !graphics_ || !target) {
@@ -471,7 +479,6 @@ void RackView::LoadAssets(ID2D1RenderTarget* target)
     }
     LoadIconFont();
 }
-
 void RackView::ReleaseCachedImages()
 {
     basket_.Reset();
@@ -497,7 +504,6 @@ void RackView::ReleaseCachedImages()
     /* 允许下次展开重新走一遍 LoadAssets。 */
     assetsAttempted_ = false;
 }
-
 void RackView::LoadIconFont()
 {
     if (iconFace_ || !graphics_ || !graphics_->dwrite() || !graphics_->d2d()) {
@@ -528,7 +534,6 @@ void RackView::LoadIconFont()
     BuildIconGlyph(0xE686, iconVideo_);  /* shipin */
     BuildIconGlyph(0xE67F, iconMusic_);  /* yinle */
 }
-
 void RackView::BuildIconGlyph(uint32_t codepoint, ComPtr<ID2D1PathGeometry>& out)
 {
     if (!iconFace_ || !graphics_ || !graphics_->d2d()) {
@@ -556,7 +561,6 @@ void RackView::BuildIconGlyph(uint32_t codepoint, ComPtr<ID2D1PathGeometry>& out
         out = geometry;
     }
 }
-
 void RackView::DrawIcon(ID2D1RenderTarget* target, ID2D1PathGeometry* glyph,
                         D2D1_POINT_2F center, float size, ID2D1Brush* brush)
 {
@@ -581,7 +585,6 @@ void RackView::DrawIcon(ID2D1RenderTarget* target, ID2D1PathGeometry* glyph,
     target->FillGeometry(glyph, brush);
     target->SetTransform(saved);
 }
-
 void RackView::EnsureFormats(float scale)
 {
     if (!graphics_ || !graphics_->dwrite()) {
@@ -595,7 +598,6 @@ void RackView::EnsureFormats(float scale)
         std::abs(formatCardScale_ - cardScale_) < 0.001f) {
         return;
     }
-
     auto makeFormat = [&](float size, DWRITE_FONT_WEIGHT weight =
                                            DWRITE_FONT_WEIGHT_NORMAL)
         -> ComPtr<IDWriteTextFormat> {
@@ -615,7 +617,6 @@ void RackView::EnsureFormats(float scale)
         }
         return format;
     };
-
     noteFormat_ = makeFormat(10.0f * scale);
     placeholderFormat_ = makeFormat(9.0f * scale);
     badgeFormat_ = makeFormat(10.0f * scale);
@@ -635,7 +636,6 @@ void RackView::EnsureFormats(float scale)
         toastFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         toastFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
-
     /* 新式非图片卡：标题/元信息按卡片档位给固定字号，其余文字按同一档位
        微调。这里 scale 是「Windows 缩放 × 卡片档位」，ui 只是 Windows 缩放。 */
     const float ui = cardScale_ > 0.5f ? scale / cardScale_ : scale;
@@ -692,7 +692,6 @@ void RackView::EnsureFormats(float scale)
     formatScale_ = scale;
     formatCardScale_ = cardScale_;
 }
-
 void RackView::Shutdown()
 {
     noteFormat_.Reset();
@@ -725,7 +724,6 @@ void RackView::Shutdown()
     cards_.clear();
     graphics_ = nullptr;
 }
-
 RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, float scale,
                             float expandAmount, float cardScale)
 {
@@ -741,144 +739,227 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     result.lineY = kLineY * s;
     result.expanded = expandAmount > 0.5f;
     layout_ = result;
-
     cards_.clear();
+    leftStackBoxes_.clear();
+    rightStackBoxes_.clear();
+    leftStackIndices_.clear();
+    rightStackIndices_.clear();
+    leftStackCount_ = 0;
+    rightStackCount_ = 0;
     basketRect_ = {};
     envelopeRect_ = {};
-
-    const float photoWidth =
-        std::max(120.0f * s, result.width - (2.0f * kOuterPad + kAccessoryWidth) * s);
-    const float maxContent = photoWidth;
+    /* 固定卡宽、固定间距：数量再多也不缩小，超出可见行的卡片进入两端叠组。 */
+    const float gap = kGap * cs;
+    const float nominal = kNominalCardWidth * cs;
+    /* 叠组错位量 = 夹子宽 + 3px：3 张叠起来时夹子刚好排开、卡面基本重合。 */
+    const float clipWidth = 8.0f * s * cardScale_;
+    const float stackStep = clipWidth + kStackClipGap * s;
+    const float stackBand = stackStep * kStackLayers;
+    const int total = static_cast<int>(items.size());
+    int count = 0;
+    while (count < total && !items[static_cast<size_t>(count)].custom) {
+        ++count;
+    }
+    result.groupCount = count;
     std::vector<float> widths(items.size(), 0.0f);
     std::vector<float> heights(items.size(), 0.0f);
-
-    auto measure = [&]() {
-        float total = 0.0f;
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (IsNewCard(items[i])) {
-                widths[i] = FlatCardSide(items[i], cs);
-                heights[i] = widths[i];
-                total += widths[i];
-                continue;
-            }
-            const float aspect = (items[i].aspect > 0.01f) ? items[i].aspect : 1.4f;
+    std::vector<float> contentX(items.size(), 0.0f);
+    float contentWidth = 0.0f;
+    for (int i = 0; i < total; ++i) {
+        if (IsNewCard(items[static_cast<size_t>(i)])) {
+            widths[static_cast<size_t>(i)] = FlatCardSide(items[static_cast<size_t>(i)], cs);
+            heights[static_cast<size_t>(i)] = widths[static_cast<size_t>(i)];
+        } else {
+            const float aspect = (items[static_cast<size_t>(i)].aspect > 0.01f)
+                                     ? items[static_cast<size_t>(i)].aspect
+                                     : 1.4f;
             float photoW = kPhotoMaxWidth * cs;
             float photoH = photoW / aspect;
             if (photoH > kPhotoMaxHeight * cs) {
                 photoH = kPhotoMaxHeight * cs;
                 photoW = photoH * aspect;
             }
-            widths[i] = photoW + 2.0f * kFrame * cs;
-            heights[i] = photoH + 2.0f * kFrame * cs;
-            total += widths[i];
+            widths[static_cast<size_t>(i)] = photoW + 2.0f * kFrame * cs;
+            heights[static_cast<size_t>(i)] = photoH + 2.0f * kFrame * cs;
         }
-        total += kGap * cs * static_cast<float>(items.size() - 1);
-        return total;
-    };
-
-    float total = measure();
-    if (total > maxContent) {
-        const float factor = rack::Clamp(maxContent / total, 0.45f, 1.0f);
-        for (size_t i = 0; i < items.size(); ++i) {
-            widths[i] *= factor;
-            heights[i] *= factor;
-        }
-        total = 0.0f;
-        for (float width : widths) {
-            total += width;
-        }
-        total += kGap * cs * static_cast<float>(items.size() - 1);
     }
-
-    float gap = kGap * cs;
-    if (total > maxContent && items.size() > 1) {
-        gap = std::max(10.0f * s, (maxContent - total) / static_cast<float>(items.size() - 1) +
-                                     gap);
-        total = 0.0f;
-        for (float width : widths) {
-            total += width;
-        }
-        total += gap * static_cast<float>(items.size() - 1);
+    for (int i = 0; i < count; ++i) {
+        contentX[static_cast<size_t>(i)] = contentWidth;
+        contentWidth += widths[static_cast<size_t>(i)] + (i + 1 < count ? gap : 0.0f);
     }
-
-    const float lineY = kLineY * s;
-    const float sag = (16.0f + std::min<float>(6.0f, static_cast<float>(items.size())) * 1.2f) * s;
-    const float lineSpan = std::max(1.0f, result.width - 2.0f * kOuterPad * s);
-    result.lineY = lineY;
-    result.sag = sag;
+    result.contentWidth = contentWidth;
+    /* 容量按这批卡片的平均实际宽度算，避免 16:9 截图被固定 150 的保守值少算一张。 */
+    float sumWidths = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        sumWidths += widths[static_cast<size_t>(i)];
+    }
+    const float capacityWidth = count > 0 ? sumWidths / static_cast<float>(count) : nominal;
+    /* 左叠离屏幕左边距固定；右叠离信封左边距固定。
+       右叠组出现时要把「正面那一张 + 两条错开的边」完整放在信封左边，
+       可见行让出和一张卡相当的宽度；没有右叠组时可见行一直用到信封前面，
+       右侧不留空带。滚动/容量始终按不预留的宽度算，来回滚动不会整排跳动。 */
+    const float leftAnchor = kOuterPad * s;
+    const float accessoryRightEdge = result.width - kOuterPad * s;
+    const float stackEnvelopeCenter =
+        accessoryRightEdge - (historyDisabled_ ? 78.0f : 196.0f) * s;
+    const float stackEnvelopeLeft = stackEnvelopeCenter - 35.0f * s;
+    const float rightAnchor = stackEnvelopeLeft - kOuterPad * s;
+    const float rightBand = capacityWidth + 2.0f * stackStep + 8.0f * s;
+    float rowLeft = leftAnchor + stackBand;
+    float rowRight = rightAnchor;
+    if (rowRight - rowLeft < nominal) {
+        /* 极窄屏兜底：叠组照样贴边，只是可见行更窄。 */
+        rowLeft = leftAnchor;
+        rowRight = rightAnchor;
+    }
+    const float rowWidth = std::max(nominal, rowRight - rowLeft);
+    result.rowLeft = rowLeft;
+    result.rowRight = rowRight;
+    result.accessoryLeft = stackEnvelopeLeft;
+    int capacity = 1;
+    if (capacityWidth + gap > 0.0f) {
+        capacity = static_cast<int>(std::floor((rowWidth + gap) / (capacityWidth + gap)));
+    }
+    capacity = std::max(1, capacity);
+    result.capacity = capacity;
+    result.sag = (16.0f + std::min(6, count) * 1.2f) * s;
     result.lineStart = kOuterPad * s;
     result.lineEnd = result.width - kOuterPad * s;
-
+    const float lineSpan = std::max(1.0f, result.lineEnd - result.lineStart);
     float maxCardHeight = 0.0f;
     for (float height : heights) {
         maxCardHeight = std::max(maxCardHeight, height);
     }
-    /* 收起时卡片停在窗口上方，展开时滑进视野。 */
+    /* 收起时卡片跟着绳子一起往上收，而不是留在原地被裁掉。 */
     const float slide =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) * -(maxCardHeight + 30.0f * s);
-    float x = kOuterPad * s + (photoWidth - total) * 0.5f;
-
-    /* 显示位置用弹簧跟随目标：目标由布局按索引算出，移除/插入卡片后，
-       其它卡片的目标位置整体平移，由弹簧平滑过渡到新位置。 */
+    const float contentBase =
+        (contentWidth < rowWidth) ? rowLeft + (rowWidth - contentWidth) * 0.5f : rowLeft;
+    maxScrollX_ = std::max(0.0f, contentWidth - rowWidth);
+    if (followEnd_) {
+        scrollTargetX_ = maxScrollX_;
+    }
+    scrollTargetX_ = rack::Clamp(scrollTargetX_, 0.0f, maxScrollX_);
+    followEnd_ = scrollTargetX_ >= maxScrollX_ - 0.5f;
     const uint64_t nowMs = rack::NowMs();
     float dt = 0.0f;
     if (lastLayoutMs_ != 0 && nowMs > lastLayoutMs_) {
         dt = std::min(0.05f, static_cast<float>(nowMs - lastLayoutMs_) / 1000.0f);
     }
     lastLayoutMs_ = nowMs;
-    sliding_ = false;
-    auto slotFor = [&](int id) -> SlotSpring& {
-        for (auto& slot : slots_) {
-            if (slot.id == id) {
-                return slot;
+    /* 居中基准变化时不能先让整排跳一下：基准直接到位，同时把每个槽位的
+       当前位置反向补偿同样的量（视觉不动），之后槽位弹簧再一次性把卡片
+       送到最终位置——始终只有一次平滑移动，不会先右后左。 */
+    if (!basePrimed_) {
+        baseShown_ = contentBase;
+        baseVel_ = 0.0f;
+        basePrimed_ = true;
+    } else {
+        const float delta = contentBase - baseShown_;
+        if (std::abs(delta) > 0.01f) {
+            baseShown_ = contentBase;
+            for (auto& slot : slots_) {
+                slot.pos -= delta;
             }
+            /* 自定义卡的 customX 和吸附组共用同一个居中基准，这里不动它们：
+               加/删卡导致整排重新居中时，自定义卡跟着内容一起移，
+               相对位置才不会变；拖拽落点由 FinishCardDrag 按新基准换算。 */
+        }
+    }
+    result.contentBase = baseShown_;
+    if (!scrollPrimed_) {
+        scrollX_ = scrollTargetX_;
+        scrollVelocity_ = 0.0f;
+        scrollPrimed_ = true;
+    } else {
+        SlideSpring(scrollX_, scrollVelocity_, scrollTargetX_, dt, 0.55f, 0.78f);
+    }
+    scrollSliding_ = std::abs(scrollX_ - scrollTargetX_) > 0.15f ||
+                     std::abs(scrollVelocity_) > 0.8f;
+    sliding_ = false;
+    const bool skipHold = skipHoldOnce_;
+    skipHoldOnce_ = false;
+    std::unordered_map<int, size_t> slotIndex;
+    slotIndex.reserve(slots_.size() + items.size());
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        slotIndex[slots_[i].id] = i;
+    }
+    auto slotFor = [&](int id) -> SlotSpring& {
+        auto found = slotIndex.find(id);
+        if (found != slotIndex.end()) {
+            return slots_[found->second];
         }
         SlotSpring fresh;
         fresh.id = id;
         slots_.push_back(fresh);
+        slotIndex[id] = slots_.size() - 1;
         return slots_.back();
     };
-
     cards_.reserve(items.size());
+    /* 槽位矩形（不含用户拖出来的 rackOffsetX）：可见行/叠组的判定只看槽位，
+       拖拽中的卡片不会被临时判成叠卡而消失。 */
+    std::vector<D2D1_RECT_F> slotRects(items.size(), D2D1::RectF());
     for (size_t i = 0; i < items.size(); ++i) {
         CardBox box;
         const float w = widths[i];
-        const float offset = items[i].rackOffsetX;
         SlotSpring& slot = slotFor(items[i].id);
+        const bool customCard = items[i].custom;
+        float left = 0.0f;
+        float slotLeft = 0.0f;
+        if (customCard) {
+            /* 自定义卡不占槽位：位置由自身内容坐标决定。 */
+            left = baseShown_ + items[i].customX - scrollX_;
+            slotLeft = left;
+        } else {
+        const float targetX = contentX[i];
         if (!slot.primed) {
-            slot.pos = x;
-            slot.target = x;
+            slot.pos = targetX;
+            slot.target = targetX;
             slot.velocity = 0.0f;
             slot.primed = true;
         } else {
-            /* 目标位置变了（有卡片被移除/新增）先原地停顿，
-               再交给弹簧平滑过渡：短暂停顿后靠拢。 */
-            if (std::abs(slot.target - x) > 0.5f) {
-                slot.target = x;
-                slot.holdUntil = skipHoldOnce_ ? 0 : nowMs + kCloseHoldMs;
+            if (std::abs(slot.target - targetX) > 0.5f) {
+                slot.target = targetX;
+                slot.holdUntil = skipHold ? 0 : nowMs + kCloseHoldMs;
             }
             if (nowMs >= slot.holdUntil && dt > 0.0f) {
-                SlideSpring(slot.pos, slot.velocity, x, dt, 0.55f, 0.78f);
+                /* 拖动让位时邻居要跟手：缩短弹簧响应，松手后再回到慢一点的默认值。 */
+                const bool rearranging = freeDrag_ >= 0;
+                SlideSpring(slot.pos, slot.velocity, targetX, dt,
+                            rearranging ? 0.26f : 0.55f, rearranging ? 0.88f : 0.78f);
             }
-            if (std::abs(slot.pos - x) > 0.15f || std::abs(slot.velocity) > 0.8f) {
+            if (std::abs(slot.pos - targetX) > 0.15f || std::abs(slot.velocity) > 0.8f) {
                 sliding_ = true;
             }
         }
-        const float left = slot.pos + offset;
+        /* 滚轮滚动时卡片顺着运动方向轻轻摆一下（摆角目标 = -滚动速度）。
+           滚动停下后目标回 0，弹簧会自然回摆；每张卡的弹簧相位一样但底角不同，
+           看起来就是一排卡被绳子带着晃，而不是整体平移。 */
+        const float swingTarget = rack::Clamp(-scrollVelocity_ / 200.0f, -2.5f, 2.5f);
+        if (!slot.swingPrimed) {
+            slot.swingPos = 0.0f;
+            slot.swingVel = 0.0f;
+            slot.swingPrimed = true;
+        } else if (dt > 0.0f && freeDrag_ < 0) {
+            SlideSpring(slot.swingPos, slot.swingVel, swingTarget, dt, 0.7f, 0.28f);
+        }
+        if (std::abs(slot.swingPos) > 0.02f || std::abs(slot.swingVel) > 0.05f) {
+            sliding_ = true;
+        }
+        /* 整条内容共享一个 scrollX_：卡片相对绳子的位置不变，间距也不变。
+           用户横向拖过的卡片再加一个 rackOffsetX：松手后停在拖到的位置，
+           下一个 Layout 仍然按这个偏移画（拖拽时卡片跟着鼠标走）。 */
+        slotLeft = baseShown_ + slot.pos - scrollX_;
+        left = slotLeft + items[i].rackOffsetX;
+        }
         box.id = items[i].id;
-        /* 绳子是下垂的弧线：卡片上沿跟着它所在位置的实际绳高走，
-           这样每个夹子压住卡片上沿的深度始终一样，不会中间夹得深、
-           两边悬空。 */
         const float cx = left + w * 0.5f;
-        const float t = rack::Clamp((cx - result.lineStart) / std::max(1.0f, lineSpan), 0.0f,
-                                    1.0f);
-        const float pinTop = lineY + 4.0f * sag * t * (1.0f - t);
-        /* 夹身从 pinTop 向下压约 16*clipScale；卡片上沿放在
-           pinTop + 12*clipScale，夹子稳定咬住约 4*clipScale。
-           夹子和悬挂深度都跟卡片大中小一起缩放。 */
+        const float t = rack::Clamp((cx - result.lineStart) / lineSpan, 0.0f, 1.0f);
+        const float pinTop = result.lineY + 4.0f * result.sag * t * (1.0f - t);
         const float clipScale = s * cardScale_;
         const float cardY = pinTop + 12.0f * clipScale - 3.0f * s + slide;
         box.card = D2D1::RectF(left, cardY, left + w, cardY + heights[i]);
+        slotRects[i] = D2D1::RectF(slotLeft, cardY, slotLeft + w, cardY + heights[i]);
         box.image = rack::Inset(box.card, kFrame * cs, kFrame * cs);
         box.cardType = items[i].cardType;
         if (IsNewCard(items[i])) {
@@ -887,32 +968,191 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
         const bool hasNote = !items[i].note.empty() && !items[i].path.empty();
         box.hasNote = hasNote;
         if (hasNote) {
-            box.note = D2D1::RectF(box.card.left + 4.0f * s,
-                                   box.card.bottom + 4.0f * s,
+            box.note = D2D1::RectF(box.card.left + 4.0f * s, box.card.bottom + 4.0f * s,
                                    box.card.right - 4.0f * s,
                                    box.card.bottom + 4.0f * s + kNoteHeight * s);
         }
         box.pinTop = pinTop;
         const int variant = (items[i].id * 37) % 8;
-        /* 和图片卡一致：每张卡按 id 得到一个固定的小角度，避免一排太规整。 */
-        box.angle = static_cast<float>(variant - 4) * 0.6f;
+        box.angle = static_cast<float>(variant - 4) * 0.6f + slot.swingPos;
         cards_.push_back(box);
-        x += w + gap;
     }
-
     /* 已经不在绳子上的卡片，弹簧状态也跟着清掉。 */
+    std::unordered_set<int> aliveIds;
+    aliveIds.reserve(items.size());
+    for (const auto& item : items) {
+        aliveIds.insert(item.id);
+    }
     for (auto it = slots_.begin(); it != slots_.end();) {
-        const bool alive =
-            std::any_of(items.begin(), items.end(), [&](const Item& item) { return item.id == it->id; });
-        if (alive) {
+        if (aliveIds.count(it->id) != 0) {
             ++it;
         } else {
             it = slots_.erase(it);
         }
     }
+    /* 可见行只放完整卡：左边缘压进左叠带就并进左叠，右边缘压进右叠带就并进右叠。
+       先按“右侧不预留”的宽度判一遍：所有卡都放得下就没有右叠组，可见行一直用到
+       信封前面，不留空带；确实有更新的卡放不下，再让出右叠组的宽度并重新判一次。 */
+    const float leftCut = rowLeft - stackStep;
+    int firstVisible = -1;
+    int lastVisible = -1;
+    auto classifyVisible = [&](float rightCut) {
+        firstVisible = -1;
+        lastVisible = -1;
+        for (int i = 0; i < count; ++i) {
+            const D2D1_RECT_F& slotRect = slotRects[static_cast<size_t>(i)];
+            if (slotRect.left <= leftCut + 0.01f) continue;
+            if (slotRect.right >= rightCut - 0.01f) continue;
+            if (firstVisible < 0) firstVisible = i;
+            lastVisible = i;
+        }
+    };
+    classifyVisible(rightAnchor + stackStep);
+    if (lastVisible >= 0 && lastVisible + 1 < count &&
+        rowRight - rightBand > rowLeft + nominal * 0.5f) {
+        rowRight = rightAnchor - rightBand;
+        result.rowRight = rowRight;
+        classifyVisible(rowRight + stackStep);
+    }
+    if (firstVisible < 0) {
+        /* 极端情况下至少保留离视口最近的一张，避免整条消失。 */
+        const float middle = (rowLeft + rowRight) * 0.5f;
+        int nearest = 0;
+        float best = 1.0e30f;
+        for (int i = 0; i < count; ++i) {
+            const D2D1_RECT_F& slotRect = slotRects[static_cast<size_t>(i)];
+            const float d = std::abs((slotRect.left + slotRect.right) * 0.5f - middle);
+            if (d < best) {
+                best = d;
+                nearest = i;
+            }
+        }
+        firstVisible = nearest;
+        lastVisible = nearest;
+    }
+    result.visibleFirst = firstVisible;
+    result.visibleCount = std::max(0, lastVisible - firstVisible + 1);
+    scrollFirst_ = firstVisible;
+    leftStackCount_ = firstVisible;
+    rightStackCount_ = std::max(0, count - lastVisible - 1);
+    result.leftStackCount = leftStackCount_;
+    result.rightStackCount = rightStackCount_;
 
-    float top = lineY - 2.0f * s;
-    float bottom = lineY + sag + 136.0f * s;
+    /* 叠组是固定占位，不跟着可见行滑动：
+       左叠从屏幕左边距起、右叠到信封左边距止，每张只错开一个「夹子宽 + 3px」，
+       卡面几乎完全重叠，夹子之间刚好留出一点缝。
+       d=0 是最外面（最旧）的一张，d 增大的方向依次压上更新的卡。 */
+    const int leftShown = std::min(kStackLayers, leftStackCount_);
+    const int rightShown = std::min(kStackLayers, rightStackCount_);
+    const float clipScale = s * cardScale_;
+    std::vector<float> leftSlot(static_cast<size_t>(leftShown), 0.0f);
+    std::vector<int> leftSlotIndex(static_cast<size_t>(leftShown), -1);
+    float prevClip = -1.0e9f;
+    for (int d = 0; d < leftShown; ++d) {
+        const int index = firstVisible - leftShown + d;
+        const CardBox& src = cards_[static_cast<size_t>(index)];
+        const float width = src.card.right - src.card.left;
+        float left = leftAnchor + static_cast<float>(d) * stackStep;
+        float clip = left + width * 0.5f;
+        if (clip - prevClip < stackStep) {
+            left += stackStep - (clip - prevClip);
+            clip = left + width * 0.5f;
+        }
+        prevClip = clip;
+        leftSlot[static_cast<size_t>(d)] = left;
+        leftSlotIndex[static_cast<size_t>(d)] = index;
+    }
+    /* 右叠组和左叠组同一个朝向：第 1 张在最右边，之后每张往左错开一个夹子宽、
+       垫在前一张下面，所以露出来的边都朝左。第 1 张的右缘固定贴着信封左边不动。
+       和左边相反：右叠组永远露“最新进来的三张”（1、2、3），滚轮往左滚时
+       里面更旧的卡先回绳子（6、5、4…），轮到这三张时按 3、2、1 出去；
+       第 4 张及以后全部压在 3 后面不画，只由数字胶囊计数。 */
+    std::vector<float> rightSlot(static_cast<size_t>(rightShown), 0.0f);
+    std::vector<int> rightSlotIndex(static_cast<size_t>(rightShown), -1);
+    const float rightStart = rowRight + 8.0f * s;
+    float rightPrevLeft = rightAnchor;
+    for (int d = 0; d < rightShown; ++d) {
+        const int index = count - 1 - d;
+        if (index < 0 || index <= lastVisible) continue;
+        const CardBox& src = cards_[static_cast<size_t>(index)];
+        const float width = src.card.right - src.card.left;
+        /* 每张的左缘至少比前一张再往左一个夹子宽（保证露边），
+           同时右缘不越过正面那张的右缘（不会从右边冒出来）。 */
+        float left = rightAnchor - width;
+        if (d > 0) {
+            left = std::min(rightPrevLeft - stackStep, left);
+        }
+        rightPrevLeft = left;
+        rightSlot[static_cast<size_t>(d)] = left;
+        rightSlotIndex[static_cast<size_t>(d)] = index;
+    }
+
+    /* 叠组内部换位也用弹簧：新卡并入时，旧卡只往边上挪一个夹子位。 */
+    auto pileSpringPos = [&](int index, float target) {
+        SlotSpring& slot = slotFor(items[static_cast<size_t>(index)].id);
+        if (!slot.pilePrimed) {
+            slot.pilePos = cards_[static_cast<size_t>(index)].card.left;
+            slot.pileVelocity = 0.0f;
+            slot.pilePrimed = true;
+        }
+        if (dt > 0.0f) {
+            SlideSpring(slot.pilePos, slot.pileVelocity, target, dt, 0.22f, 0.9f);
+        }
+        if (std::abs(slot.pilePos - target) > 0.15f ||
+            std::abs(slot.pileVelocity) > 0.5f) {
+            sliding_ = true;
+        }
+        return slot.pilePos;
+    };
+    /* 叠卡按自己的夹子位置重新挂到绳子上，而不是沿用可见行的高度。 */
+    auto makeStackBox = [&](int index, float left) {
+        CardBox box = cards_[static_cast<size_t>(index)];
+        const float width = box.card.right - box.card.left;
+        const float clipX = left + width * 0.5f;
+        const float t = rack::Clamp((clipX - result.lineStart) / lineSpan, 0.0f, 1.0f);
+        const float pinTop = result.lineY + 4.0f * result.sag * t * (1.0f - t);
+        const float cardY = pinTop + 12.0f * clipScale - 3.0f * s + slide;
+        ShiftCardXY(box, left - box.card.left, cardY - box.card.top);
+        box.pinTop = pinTop;
+        return box;
+    };
+    std::unordered_set<int> pileIds;
+    for (int d = 0; d < leftShown; ++d) {
+        const int index = leftSlotIndex[static_cast<size_t>(d)];
+        if (index < 0 || index >= count) continue;
+        const float left = pileSpringPos(index, leftSlot[static_cast<size_t>(d)]);
+        leftStackBoxes_.push_back(makeStackBox(index, left));
+        leftStackIndices_.push_back(index);
+        pileIds.insert(items[static_cast<size_t>(index)].id);
+    }
+    for (int d = 0; d < rightShown; ++d) {
+        const int index = rightSlotIndex[static_cast<size_t>(d)];
+        if (index < 0 || index >= count) continue;
+        const float left = pileSpringPos(index, rightSlot[static_cast<size_t>(d)]);
+        rightStackBoxes_.push_back(makeStackBox(index, left));
+        rightStackIndices_.push_back(index);
+        pileIds.insert(items[static_cast<size_t>(index)].id);
+    }
+    for (auto& slot : slots_) {
+        if (pileIds.count(slot.id) == 0) {
+            slot.pilePrimed = false;
+            slot.pileVelocity = 0.0f;
+        }
+    }
+    result.leftStackCenter = (leftAnchor + rowLeft) * 0.5f;
+    /* 胶囊压在叠出来的边上：右叠组的边在正面那张的左边，
+       取正面那张左缘和最里面那张左缘的中线，正好落在露出的几条边上。 */
+    result.rightStackCenter = rightStart + stackStep;
+    if (!rightStackBoxes_.empty()) {
+        const float frontLeft = rightStackBoxes_.front().card.left;
+        float deepestLeft = frontLeft;
+        for (const auto& box : rightStackBoxes_) {
+            deepestLeft = std::min(deepestLeft, box.card.left);
+        }
+        result.rightStackCenter = (frontLeft + deepestLeft) * 0.5f;
+    }
+    float top = result.lineY - 2.0f * s;
+    float bottom = result.lineY + result.sag + 136.0f * s;
     float left = 0.0f;
     float right = 0.0f;
     if (!cards_.empty()) {
@@ -930,21 +1170,22 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
             right = std::max(right, box.note.right);
         }
     }
+    for (const auto& box : leftStackBoxes_) {
+        bottom = std::max(bottom, box.card.bottom);
+    }
+    for (const auto& box : rightStackBoxes_) {
+        bottom = std::max(bottom, box.card.bottom);
+    }
     (void)left;
     (void)right;
-    bottom = std::max(bottom, lineY + sag + 136.0f * s);
-    // 收起状态只保留顶部的热区。保留一个不可见的高窗口，
-    // 会把桌面上的点击拦截。
-    result.height = expandAmount < 0.3f
-                        ? 60.0f * s
-                        : std::max(240.0f * s, bottom + 28.0f * s);
+    bottom = std::max(bottom, result.lineY + result.sag + 136.0f * s);
+    result.height =
+        expandAmount < 0.3f ? 60.0f * s : std::max(240.0f * s, bottom + 28.0f * s);
     layout_.height = result.height;
-    result.content = D2D1::RectF(0.0f, lineY - 2.0f * s, result.width, bottom + 8.0f * s);
-
+    result.content =
+        D2D1::RectF(0.0f, result.lineY - 2.0f * s, result.width, bottom + 8.0f * s);
     const float accessoriesRight = result.width - kOuterPad * s;
     const float basketCenter = accessoriesRight - 78.0f * s;
-    /* 篮子隐藏时信封右移到篮子的槽位；换槽位和卡片一样交给弹簧追，
-       不是瞬间跳变。 */
     const float envelopeTarget =
         accessoriesRight - (historyDisabled_ ? 78.0f : 196.0f) * s;
     if (!envelopeXPrimed_) {
@@ -960,7 +1201,7 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     const float accessoryLineSpan = std::max(1.0f, result.lineEnd - result.lineStart);
     auto ropeYAt = [&](float x) {
         const float t = rack::Clamp((x - result.lineStart) / accessoryLineSpan, 0.0f, 1.0f);
-        return lineY + 4.0f * sag * t * (1.0f - t);
+        return result.lineY + 4.0f * result.sag * t * (1.0f - t);
     };
     if (historyDisabled_) {
         basketRect_ = {};
@@ -978,64 +1219,136 @@ RackLayout RackView::Layout(const std::vector<Item>& items, float maxWidth, floa
     layout_ = result;
     return result;
 }
+void RackView::ScrollByPixels(float delta)
+{
+    if (delta == 0.0f) {
+        return;
+    }
+    scrollTargetX_ = rack::Clamp(scrollTargetX_ + delta, 0.0f, maxScrollX_);
+    followEnd_ = scrollTargetX_ >= maxScrollX_ - 0.5f;
+    scrollPrimed_ = true;
+    scrollHoldUntilMs_ = rack::NowMs() + 320;
+}
+bool RackView::ScrollSettled() const
+{
+    return !scrollSliding_ && !sliding_ && !envelopeSliding_;
+}
+bool RackView::AtScrollEnd() const
+{
+    return scrollTargetX_ >= maxScrollX_ - 0.5f;
+}
+bool RackView::IsScrolling() const
+{
+    return rack::NowMs() < scrollHoldUntilMs_ || scrollSliding_ ||
+           std::abs(scrollX_ - scrollTargetX_) > 0.5f ||
+           std::abs(scrollVelocity_) > 2.0f;
+}
+const CardBox* RackView::StackTop(bool left) const
+{
+    /* 每一层都能单独悬停/拖拽，不再有“整堆只操作顶层”的入口。 */
+    (void)left;
+    return nullptr;
+}
+bool RackView::IsStackIndex(int index) const
+{
+    return StackBoxForIndex(index) != nullptr;
+}
+const CardBox* RackView::StackBoxForIndex(int index) const
+{
+    for (size_t i = 0; i < leftStackIndices_.size() && i < leftStackBoxes_.size(); ++i) {
+        if (leftStackIndices_[i] == index) {
+            return &leftStackBoxes_[i];
+        }
+    }
+    for (size_t i = 0; i < rightStackIndices_.size() && i < rightStackBoxes_.size(); ++i) {
+        if (rightStackIndices_[i] == index) {
+            return &rightStackBoxes_[i];
+        }
+    }
+    return nullptr;
+}
+bool RackView::RackAreaContains(float x, float y) const
+{
+    if (y < 0.0f || y > layout_.content.bottom) {
+        return false;
+    }
+    const float s = scale_;
+    const float lineBottom = layout_.lineY + layout_.sag + 8.0f * s;
+    if (y <= lineBottom && x >= layout_.lineStart - 6.0f * s &&
+        x <= layout_.lineEnd + 6.0f * s) {
+        return true;
+    }
+    const int first = layout_.visibleFirst;
+    const int last = first + layout_.visibleCount;
+    for (int i = first; i < last && i < static_cast<int>(cards_.size()); ++i) {
+        if (rack::PointIn(cards_[static_cast<size_t>(i)].card, x, y)) {
+            return true;
+        }
+    }
+    for (int i = layout_.groupCount; i < static_cast<int>(cards_.size()); ++i) {
+        if (rack::PointIn(cards_[static_cast<size_t>(i)].card, x, y)) {
+            return true;
+        }
+    }
+    for (const auto& box : leftStackBoxes_) {
+        if (rack::PointIn(box.card, x, y)) {
+            return true;
+        }
+    }
+    for (const auto& box : rightStackBoxes_) {
+        if (rack::PointIn(box.card, x, y)) {
+            return true;
+        }
+    }
+    return false;
+}
+float RackView::ContentWidthForItems(const std::vector<Item>& items) const
+{
+    const float cs = scale_ * cardScale_;
+    const float gap = kGap * cs;
+    float width = 0.0f;
+    for (size_t i = 0; i < items.size(); ++i) {
+        width += CardWidth(items[i]) + (i + 1 < items.size() ? gap : 0.0f);
+    }
+    return width;
+}
+
+float RackView::CardWidth(const Item& item) const
+{
+    const float cs = scale_ * cardScale_;
+    if (IsNewCard(item)) {
+        return FlatCardSide(item, cs);
+    }
+    const float aspect = (item.aspect > 0.01f) ? item.aspect : 1.4f;
+    float photoW = kPhotoMaxWidth * cs;
+    float photoH = photoW / aspect;
+    if (photoH > kPhotoMaxHeight * cs) {
+        photoH = kPhotoMaxHeight * cs;
+        photoW = photoH * aspect;
+    }
+    return photoW + 2.0f * kFrame * cs;
+}
+
+float RackView::ProjectedContentBase(float contentWidth) const
+{
+    const float rowWidth = layout_.rowRight - layout_.rowLeft;
+    return (contentWidth < rowWidth)
+               ? layout_.rowLeft + (rowWidth - contentWidth) * 0.5f
+               : layout_.rowLeft;
+}
 
 std::vector<float> RackView::TargetLefts(const std::vector<Item>& items) const
 {
     std::vector<float> lefts(items.size(), 0.0f);
-    if (items.empty()) {
-        return lefts;
-    }
-    const float s = scale_;
     const float cs = scale_ * cardScale_;
-    const float width = std::max(320.0f * s, layout_.width);
-    const float photoWidth =
-        std::max(120.0f * s, width - (2.0f * kOuterPad + kAccessoryWidth) * s);
-    const float maxContent = photoWidth;
-    std::vector<float> widths(items.size(), 0.0f);
-    auto measure = [&]() {
-        float total = 0.0f;
-        for (size_t i = 0; i < items.size(); ++i) {
-            if (IsNewCard(items[i])) {
-                widths[i] = FlatCardSide(items[i], cs);
-                total += widths[i];
-                continue;
-            }
-            const float aspect = (items[i].aspect > 0.01f) ? items[i].aspect : 1.4f;
-            float photoW = kPhotoMaxWidth * cs;
-            float photoH = photoW / aspect;
-            if (photoH > kPhotoMaxHeight * cs) {
-                photoH = kPhotoMaxHeight * cs;
-                photoW = photoH * aspect;
-            }
-            widths[i] = photoW + 2.0f * kFrame * cs;
-            total += widths[i];
-        }
-        total += kGap * cs * static_cast<float>(items.size() - 1);
-        return total;
-    };
-    float total = measure();
-    if (total > maxContent) {
-        const float factor = rack::Clamp(maxContent / total, 0.45f, 1.0f);
-        for (float& w : widths) {
-            w *= factor;
-        }
-        total = 0.0f;
-        for (float w : widths) total += w;
-        total += kGap * cs * static_cast<float>(items.size() - 1);
-    }
-    float gap = kGap * cs;
-    if (total > maxContent && items.size() > 1) {
-        gap = std::max(10.0f * s,
-                       (maxContent - total) / static_cast<float>(items.size() - 1) + gap);
-    }
-    float x = kOuterPad * s + (photoWidth - total) * 0.5f;
+    const float gap = kGap * cs;
+    float x = 0.0f;
     for (size_t i = 0; i < items.size(); ++i) {
         lefts[i] = x;
-        x += widths[i] + gap;
+        x += CardWidth(items[i]) + gap;
     }
     return lefts;
 }
-
 void RackView::SnapSlotsTo(const std::vector<Item>& items,
                            const std::vector<float>& lefts)
 {
@@ -1063,7 +1376,19 @@ void RackView::SnapSlotsTo(const std::vector<Item>& items,
         found->primed = true;
     }
 }
-
+void RackView::SnapSlotForId(int id, float contentLeft)
+{
+    for (auto& slot : slots_) {
+        if (slot.id == id) {
+            slot.pos = contentLeft;
+            slot.target = contentLeft;
+            slot.velocity = 0.0f;
+            slot.holdUntil = 0;
+            slot.primed = true;
+            return;
+        }
+    }
+}
 void RackView::DrawShadow(ID2D1RenderTarget* target, const D2D1_RECT_F& rect, float radius,
                           float dy, float spread, float alpha)
 {
@@ -1075,7 +1400,6 @@ void RackView::DrawShadow(ID2D1RenderTarget* target, const D2D1_RECT_F& rect, fl
     stops[1].color = D2D1::ColorF(0.f, 0.f, 0.f, alpha * 0.42f);
     stops[2].position = 1.0f;
     stops[2].color = D2D1::ColorF(0.f, 0.f, 0.f, 0.0f);
-
     ComPtr<ID2D1GradientStopCollection> collection;
     ComPtr<ID2D1RadialGradientBrush> brush;
     const float centerX = (rect.left + rect.right) * 0.5f;
@@ -1091,11 +1415,9 @@ void RackView::DrawShadow(ID2D1RenderTarget* target, const D2D1_RECT_F& rect, fl
             collection.Get(), brush.GetAddressOf()))) {
         return;
     }
-
     target->FillEllipse(
         D2D1::Ellipse(D2D1::Point2F(centerX, centerY), radiusX, radiusY), brush.Get());
 }
-
 void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
                     const Theme& theme, float expandAmount, float swaySeconds,
                     float basketHover, float paper0, float cardHover, int cardHoverIndex,
@@ -1104,38 +1426,26 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
     if (!target || !graphics_) {
         return;
     }
+    (void)cardHoverIndex;
     const float s = scale_;
     const RackLayout& layout = layout_;
     const bool expanded = expandAmount > 0.01f;
+    /* 滚轮滚动过程中，叠层不实时提到最前：否则层的位置和 z 序一起变，会错位。 */
+    if (hovered >= 0 && IsStackIndex(hovered) && IsScrolling()) {
+        hovered = -1;
+    }
     lastHovered_ = hovered;
-
-    /* 卡片开始绘制之前，先移除已完成出场动画的索引。原来在 DrawArrival 里清索引，
-       会让新卡片整整一帧不画：drawGroup 因为「仍在入场动画」跳过它，DrawArrival
-       又因为「已经落位」跳过它，结果图片/便签刚落到绳上时闪一帧。 */
     if (arrivalIndex_ >= 0 && (arrivalIndex_ >= static_cast<int>(cards_.size()) ||
                                !HasArrival())) {
         arrivalIndex_ = -1;
     }
-
-    /* 不再给 layout.content 铺 1/255 的「命中底」。
-       分层窗口的鼠标命中只看 alpha：铺了底之后整块内容区都算窗口，
-       卡片之间/绳子下方的空白会把点击全部拦下来，下面的程序点不到。
-       可交互区域由 RackWindow::AfterDraw 只给绳子、卡片本体和配件补 alpha。 */
-
     lineRetract_ =
         (1.0f - rack::Clamp(expandAmount, 0.0f, 1.0f)) *
         -(layout.lineY + layout.sag + 24.0f * s);
-
     if (!expanded) {
         return;
     }
-
     DrawLine(target, theme, s, expandAmount);
-    DrawAccessories(target, theme, s, expandAmount, basketHover, paper0, historyCount,
-                    clipboardCount);
-
-    /* 摆动用一次轻的角冲量做激励：周期约 0.95 s、阻尼比很低，
-       比直接衰减的正弦更慢更软。 */
     auto swayFor = [&](const Item& item) {
         float base = 0.0f;
         if (swaySeconds > 0.0f) {
@@ -1151,7 +1461,6 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         if (item.shakeStartMs != 0 && item.shakeAmp > 0.0f) {
             const float age = static_cast<float>(rack::NowMs() - item.shakeStartMs) / 1000.0f;
             if (age >= 0.0f && age < 1.2f) {
-                // 晃动：前 0.30 s 缓出到新角度，之后用弹簧（刚度 38、阻尼 2.4）回落到 0。
                 if (age < 0.30f) {
                     base += item.shakeAmp * rack::EaseOutCubic(age / 0.30f);
                 } else {
@@ -1169,19 +1478,18 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
         }
         return base;
     };
-
-    /* 图片卡的外阴影不再绘制：阴影是半透明像素，分层窗口的命中测试
-       只看 alpha，18px 的阴影会把卡片之间的空隙也占成可点击区域，
-       右键点缝隙时下面的程序收不到。卡片本体仍保留描边和圆角。 */
-
-    auto drawGroup = [&](size_t i, bool isHovered) {
-        if (static_cast<int>(i) == arrivalIndex_) return;
-        const float sway = swayFor(items[i]);
-        CardBox box = cards_[i];
-        ShiftCard(box, CardEntryOffset(items[i]));
-
+    auto drawBox = [&](int index, const CardBox& base, bool isHovered, bool isStack,
+                       bool stackFront) {
+        if (index < 0 || index >= static_cast<int>(items.size()) || index == arrivalIndex_) {
+            return;
+        }
+        const float sway = swayFor(items[static_cast<size_t>(index)]);
+        CardBox box = base;
+        if (!isStack) {
+            ShiftCard(box, CardEntryOffset(items[static_cast<size_t>(index)]));
+        }
         ComPtr<ID2D1Layer> fadeLayer;
-        const bool fade = static_cast<int>(i) == dragging_;
+        const bool fade = index == dragging_;
         if (fade) {
             if (SUCCEEDED(target->CreateLayer(fadeLayer.GetAddressOf()))) {
                 target->PushLayer(
@@ -1193,51 +1501,117 @@ void RackView::Draw(ID2D1RenderTarget* target, const std::vector<Item>& items,
                 fadeLayer.Reset();
             }
         }
-        const float hoverAmount =
-            static_cast<int>(i) == cardHoverIndex ? cardHover : 0.0f;
-        /* 编辑中的便签：卡片本体交给编辑器动画，绳子上只留夹子。 */
-        const bool editing = static_cast<int>(i) == editingCard_;
+        const float hoverAmount = isHovered ? (isStack ? 1.0f : cardHover) : 0.0f;
+        const bool editing = !isStack && index == editingCard_;
         if (!editing) {
             const bool hotLock = hoverPart_ == static_cast<int>(RackPart::Lock) &&
-                                 hoverPartIndex_ == static_cast<int>(i);
+                                 hoverPartIndex_ == index;
             const bool hotClose = hoverPart_ == static_cast<int>(RackPart::Close) &&
-                                  hoverPartIndex_ == static_cast<int>(i);
+                                  hoverPartIndex_ == index;
             const bool hotLink = hoverPart_ == static_cast<int>(RackPart::CardLink) &&
-                                 hoverPartIndex_ == static_cast<int>(i);
+                                 hoverPartIndex_ == index;
             const bool hotColor = hoverPart_ == static_cast<int>(RackPart::CardColor) &&
-                                  hoverPartIndex_ == static_cast<int>(i);
-            DrawCard(target, items[i], box, s, sway, hoverAmount, isHovered,
-                     static_cast<int>(i) == pressed, hotLock, hotClose, hotLink, hotColor);
+                                  hoverPartIndex_ == index;
+            DrawCard(target, items[static_cast<size_t>(index)], box, s, sway, hoverAmount,
+                     isHovered, index == pressed, hotLock, hotClose, hotLink, hotColor);
         }
-        DrawPin(target, box, theme, s);
-        if (box.hasNote && !editing) {
-            DrawNote(target, items[i], box, theme, s, sway);
+        /* 便签条和卡面一起淡出（属于卡片内容）。 */
+        if (!isStack) {
+            if (box.hasNote && !editing) {
+                DrawNote(target, items[static_cast<size_t>(index)], box, theme, s, sway);
+            }
+        } else if (stackFront && box.hasNote) {
+            DrawNote(target, items[static_cast<size_t>(index)], box, theme, s, 0.0f);
         }
         if (fadeLayer) {
             target->PopLayer();
         }
+        /* 夹子不跟着淡：拖出去时夹子还留在绳子上，卡片变半透明。 */
+        DrawPin(target, box, theme, s);
     };
-
-    /* 先画没被悬停的卡片，最后画悬停的那张，让它压在邻居上面；
-       夹子在卡片之后画，才像是真的夹住了照片上沿。 */
-    for (size_t i = 0; i < cards_.size() && i < items.size(); ++i) {
-        if (static_cast<int>(i) == hovered) {
-            continue;
-        }
-        drawGroup(i, false);
+    /* 左叠组垫在可见行下面：从最外面一张开始画，越靠里越新、压在上面。
+       行首正常卡再盖住叠组靠里的大半张，只露出错开的边和夹子。 */
+    for (int depth = 0; depth < static_cast<int>(leftStackBoxes_.size()); ++depth) {
+        const int itemIndex = leftStackIndices_[static_cast<size_t>(depth)];
+        if (itemIndex == hovered || itemIndex == freeDrag_) continue;
+        const bool front = depth + 1 == static_cast<int>(leftStackBoxes_.size());
+        drawBox(itemIndex, leftStackBoxes_[static_cast<size_t>(depth)], false, true, front);
     }
-    if (hovered >= 0 && hovered < static_cast<int>(cards_.size()) &&
+    const int first = layout.visibleFirst;
+    const int last = first + layout.visibleCount;
+    for (int i = first; i < last && i < static_cast<int>(items.size()); ++i) {
+        if (i == hovered || i == freeDrag_) continue;
+        drawBox(i, cards_[static_cast<size_t>(i)], false, false, false);
+    }
+    /* 右叠组反过来画在可见行上面：最里面（第 3 张）先画，第 1 张最后画，
+       于是正面那张压在最上面，其余几张只从它左边露出一条边。
+       尾卡被叠组压住一点是正常的“叠上去”，不再把可见行往后缩。 */
+    for (int depth = static_cast<int>(rightStackBoxes_.size()) - 1; depth >= 0; --depth) {
+        const int itemIndex = rightStackIndices_[static_cast<size_t>(depth)];
+        if (itemIndex == hovered || itemIndex == freeDrag_) continue;
+        const bool front = depth == 0;
+        drawBox(itemIndex, rightStackBoxes_[static_cast<size_t>(depth)], false, true, front);
+    }
+    /* 自定义位置的卡：用户自己摆的位置，画在可见行和两端叠组上面
+       （右叠组默认在可见行上面，再压住自定义卡的话，把卡拖到右叠组附近就看不见了）。 */
+    for (int i = layout.groupCount; i < static_cast<int>(items.size()); ++i) {
+        if (i == hovered || i == freeDrag_) continue;
+        drawBox(i, cards_[static_cast<size_t>(i)], false, false, false);
+    }
+    if (hovered >= first && hovered < last && hovered >= 0 &&
         hovered < static_cast<int>(items.size())) {
-        drawGroup(static_cast<size_t>(hovered), true);
+        drawBox(hovered, cards_[static_cast<size_t>(hovered)], true, false, false);
+    } else if (hovered >= layout.groupCount && hovered < static_cast<int>(items.size())) {
+        drawBox(hovered, cards_[static_cast<size_t>(hovered)], true, false, false);
     }
-
+    /* 悬停在某个叠层上时，把这一张临时提到最前面，方便看清和拖拽。 */
+    for (int depth = 0; depth < static_cast<int>(leftStackBoxes_.size()); ++depth) {
+        if (leftStackIndices_[static_cast<size_t>(depth)] == hovered) {
+            drawBox(hovered, leftStackBoxes_[static_cast<size_t>(depth)], true, true,
+                    depth + 1 == static_cast<int>(leftStackBoxes_.size()));
+            break;
+        }
+    }
+    for (int depth = 0; depth < static_cast<int>(rightStackBoxes_.size()); ++depth) {
+        if (rightStackIndices_[static_cast<size_t>(depth)] == hovered) {
+            drawBox(hovered, rightStackBoxes_[static_cast<size_t>(depth)], true, true,
+                    depth == 0);
+            break;
+        }
+    }
+    /* 信封/篮子压在卡片上面：拟物架子上它们本来就在卡片前面，
+       这样右边的半张卡或叠卡组只会被配件挡住，不会“跌到信封上”。 */
     DrawRemoved(target, s);
+    DrawAccessories(target, theme, s, expandAmount, basketHover, paper0, historyCount,
+                    clipboardCount);
+
+    /* 数字胶囊和信封的角标一个放法：压在叠组正下方、横向正对叠组中间。 */
+    auto drawStackBadge = [&](const std::vector<CardBox>& boxes, int count) {
+        if (count <= 0 || boxes.empty()) {
+            return;
+        }
+        float boxLeft = boxes.front().card.left;
+        float boxRight = boxes.front().card.right;
+        float boxBottom = boxes.front().card.bottom;
+        for (const auto& box : boxes) {
+            boxLeft = std::min(boxLeft, box.card.left);
+            boxRight = std::max(boxRight, box.card.right);
+            boxBottom = std::max(boxBottom, box.card.bottom);
+        }
+        DrawCountBadge(target, (boxLeft + boxRight) * 0.5f, boxBottom + 6.0f * s, count, s);
+    };
+    drawStackBadge(leftStackBoxes_, leftStackCount_);
+    drawStackBadge(rightStackBoxes_, rightStackCount_);
     if (arrivalIndex_ >= 0 && arrivalIndex_ < static_cast<int>(items.size())) {
         DrawArrival(target, items[static_cast<size_t>(arrivalIndex_)], s);
     }
     DrawCopyToast(target, s);
+    /* 横向拖动中的卡片最后绘制，临时位于最上层：拖动中不被叠组、悬停卡、
+       数字胶囊、信封或篮子遮挡。松手后（清除 freeDrag_）再按落点回到对应层。 */
+    if (freeDrag_ >= 0 && freeDrag_ < static_cast<int>(cards_.size())) {
+        drawBox(freeDrag_, cards_[static_cast<size_t>(freeDrag_)], false, false, false);
+    }
 }
-
 /* 信封当前画在哪儿：弹簧已开始运动则使用弹簧位置，否则按开关算目标。 */
 float RackView::EnvelopeCenterX() const
 {
@@ -1246,7 +1620,6 @@ float RackView::EnvelopeCenterX() const
     }
     return layout_.width - kOuterPad * scale_ - (historyDisabled_ ? 78.0f : 196.0f) * scale_;
 }
-
 D2D1_POINT_2F RackView::EnvelopeBadgeCenter() const
 {
     const float s = scale_;
@@ -1265,7 +1638,6 @@ D2D1_POINT_2F RackView::EnvelopeBadgeCenter() const
     }
     return D2D1::Point2F(envelopeCenter, badgeTop + 18.0f * s);
 }
-
 void RackView::BeginArrival(int index)
 {
     if (index < 0) return;
@@ -1276,7 +1648,6 @@ void RackView::BeginArrival(int index)
     arrivalH_ = 0.0f;
     arrivalStartSet_ = false;
 }
-
 void RackView::SetArrivalStart(float x, float y, float w, float h)
 {
     arrivalStart_ = D2D1::Point2F(x, y);
@@ -1284,13 +1655,11 @@ void RackView::SetArrivalStart(float x, float y, float w, float h)
     arrivalH_ = h;
     arrivalStartSet_ = true;
 }
-
 bool RackView::HasArrival() const
 {
     return arrivalIndex_ >= 0 &&
            static_cast<float>(rack::NowMs() - arrivalStartMs_) / 1000.0f < kArrivalSeconds;
 }
-
 float RackView::AnimationHeight() const
 {
     const float s = scale_;
@@ -1313,7 +1682,6 @@ float RackView::AnimationHeight() const
     }
     return bottom;
 }
-
 void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
 {
     if (arrivalIndex_ < 0 || arrivalIndex_ >= static_cast<int>(cards_.size())) {
@@ -1350,13 +1718,16 @@ void RackView::DrawArrival(ID2D1RenderTarget* target, const Item& item, float s)
     const float spin = targetBox.angle * t;
     DrawCard(target, item, box, s, spin, 0.0f, false, false);
 }
-
 bool RackView::ColorContentContains(int index, float x, float y) const
 {
     if (index < 0 || index >= static_cast<int>(cards_.size())) {
         return false;
     }
-    const CardBox& box = cards_[static_cast<size_t>(index)];
+    const CardBox* display = DisplayCard(index);
+    if (!display) {
+        return false;
+    }
+    const CardBox& box = *display;
     if (!box.flat || box.cardType != card::Type::Color) {
         return false;
     }
@@ -1366,16 +1737,19 @@ bool RackView::ColorContentContains(int index, float x, float y) const
                                           box.card.right - ring, box.card.bottom - ring);
     return rack::PointIn(white, x, y);
 }
-
 void RackView::PrepareCardRelease(int index)
 {
     if (index < 0 || index >= static_cast<int>(cards_.size())) {
         return;
     }
-    const CardBox& box = cards_[static_cast<size_t>(index)];
+    const CardBox* display = DisplayCard(index);
+    if (!display) {
+        return;
+    }
+    const CardBox& box = *display;
     for (auto& slot : slots_) {
         if (slot.id == box.id) {
-            slot.pos = box.card.left;
+            slot.pos = box.card.left - layout_.contentBase + scrollX_;
             slot.velocity = 0.0f;
             break;
         }
@@ -1383,7 +1757,6 @@ void RackView::PrepareCardRelease(int index)
     /* 重排松手后的第一帧不要 140ms 停顿，直接从落点弹到新槽位。 */
     skipHoldOnce_ = true;
 }
-
 void RackView::SetHistoryDisabled(bool disabled)
 {
     if (historyDisabled_ == disabled) {
@@ -1394,7 +1767,6 @@ void RackView::SetHistoryDisabled(bool disabled)
         basketRect_ = {};
     }
 }
-
 void RackView::BeginRemove(int index, const Item& item, bool toBasket)
 {
     if (index < 0 || index >= static_cast<int>(cards_.size())) {
@@ -1402,13 +1774,16 @@ void RackView::BeginRemove(int index, const Item& item, bool toBasket)
     }
     RemovedCard removed;
     removed.item = item;
-    removed.box = cards_[static_cast<size_t>(index)];
+    if (const CardBox* display = DisplayCard(index)) {
+        removed.box = *display;
+    } else {
+        removed.box = cards_[static_cast<size_t>(index)];
+    }
     removed.removedMs = rack::NowMs();
     /* 篮子藏起来后没有可落的地方，退回成从绳上掉落。 */
     removed.toBasket = toBasket && !historyDisabled_;
     removed_.push_back(std::move(removed));
 }
-
 void RackView::DrawRemoved(ID2D1RenderTarget* target, float s)
 {
     if (removed_.empty()) {
@@ -1488,7 +1863,6 @@ void RackView::DrawRemoved(ID2D1RenderTarget* target, float s)
         ++it;
     }
 }
-
 void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
                         float expandAmount)
 {
@@ -1527,7 +1901,6 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
     }
     const float y = layout.lineY + retract;
     const float sag = layout.sag;
-
     /* 绳子首尾各 8% 做淡出，看起来像从屏幕外延伸过来，
        而不是两个硬邦邦的断点。 */
     auto makeFadeBrush = [&](const D2D1_COLOR_F& color,
@@ -1552,7 +1925,6 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
                 D2D1::Point2F(layout.lineStart, y), D2D1::Point2F(layout.lineEnd, y)),
             collection.Get(), out.GetAddressOf()));
     };
-
     ComPtr<ID2D1LinearGradientBrush> shadow;
     ComPtr<ID2D1LinearGradientBrush> line;
     ComPtr<ID2D1LinearGradientBrush> highlight;
@@ -1583,7 +1955,6 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
         sink->Close();
         return true;
     };
-
     ComPtr<ID2D1PathGeometry> shadowPath;
     if (buildCurve(1.0f * s, shadowPath)) {
         target->DrawGeometry(shadowPath.Get(), shadow.Get(), 2.2f * s);
@@ -1598,7 +1969,6 @@ void RackView::DrawLine(ID2D1RenderTarget* target, const Theme& theme, float s,
                              std::max(0.4f, ropeWidth * 0.26f) * s);
     }
 }
-
 void RackView::DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Theme& theme,
                        float s)
 {
@@ -1609,7 +1979,6 @@ void RackView::DrawPin(ID2D1RenderTarget* target, const CardBox& box, const Them
     DrawClipAt(target, cx, box.pinTop + lineRetract_ - clipHeight * kClipSlotRatio,
                theme, clipScale);
 }
-
 void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const Theme& theme,
                           float s, float heightDips)
 {
@@ -1619,7 +1988,6 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
     const float height = heightDips * s;
     const D2D1_RECT_F rect =
         D2D1::RectF(cx - width * 0.5f, top, cx + width * 0.5f, top + height);
-
     // 夹子用主题的金属色，而不是固定一套钢色。
     D2D1_COLOR_F peg[3]{};
     D2D1_COLOR_F pegEdge{};
@@ -1656,7 +2024,6 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
     stops[1].color = peg[1];
     stops[2].position = 1.0f;
     stops[2].color = peg[2];
-
     ComPtr<ID2D1GradientStopCollection> collection;
     ComPtr<ID2D1LinearGradientBrush> fill;
     ComPtr<ID2D1SolidColorBrush> edge;
@@ -1671,7 +2038,6 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
         FAILED(target->CreateSolidColorBrush(pegEdge, edge.GetAddressOf()))) {
         return;
     }
-
     const bool wood = rack::ClampInt(theme.index, 0, 3) == 2;
     if (wood) {
         // 木夹子的后夹片，稍微偏右一点。
@@ -1713,7 +2079,6 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
                 grain.Get());
         }
     }
-
     ComPtr<ID2D1SolidColorBrush> highlight;
     if (!wood && SUCCEEDED(target->CreateSolidColorBrush(
             D2D1::ColorF(1.f, 1.f, 1.f, theme.dark ? 0.18f : 0.50f),
@@ -1722,7 +2087,6 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
                          D2D1::Point2F(rect.left + 2.0f * s, rect.bottom - 3.0f * s),
                          highlight.Get(), 0.7f * s);
     }
-
     /* 中间那道槽当作夹子的弹簧轴。 */
     ComPtr<ID2D1SolidColorBrush> slot;
     if (SUCCEEDED(target->CreateSolidColorBrush(
@@ -1737,9 +2101,7 @@ void RackView::DrawClipAt(ID2D1RenderTarget* target, float cx, float top, const 
             slot.Get());
     }
 }
-
 namespace {
-
 /* D2D 的 Rotation(θ) 在屏幕坐标（y 向下）里对应的矩阵。 */
 void RotateByD2D(float& x, float& y, float degrees)
 {
@@ -1751,9 +2113,7 @@ void RotateByD2D(float& x, float& y, float degrees)
     x = nx;
     y = ny;
 }
-
 } /* namespace */
-
 bool RackView::EnsureBasketPixels(int themeIndex, UINT pixelSize)
 {
     if (!graphics_ || assetsDir_.empty() || pixelSize == 0) {
@@ -1783,7 +2143,6 @@ bool RackView::EnsureBasketPixels(int themeIndex, UINT pixelSize)
     basketWarpAngle_ = 1e9f; /* 源换了，帧缓存作废 */
     return true;
 }
-
 /* 把篮子按角度自己重采样成一张位图：软件光栅对「旋转位图」会整像素吸附，
    自己算就没有吸附问题，钩子能稳稳钉在枢轴上。 */
 bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float angleDeg,
@@ -1804,7 +2163,6 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
         std::abs(basketWarpPpd_ - ppd) < 0.01f) {
         return true;
     }
-
     const float pad = 8.0f * s;
     const float padTop = 18.0f * s;
     const float canvasW = basketSize + pad * 2.0f;
@@ -1815,13 +2173,11 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
         return false;
     }
     basketWarpPixels_.assign(static_cast<size_t>(w) * h * 4, 0);
-
     const float pivotX = canvasW * 0.5f;
     const float pivotY = padTop;
     const float pivotLocalX = basketSize * 0.5f;
     const float pivotLocalY = hookDrop;
     const float scale = static_cast<float>(basketSrcW_) / basketSize;
-
     for (UINT y = 0; y < h; ++y) {
         for (UINT x = 0; x < w; ++x) {
             const float dipX = (static_cast<float>(x) + 0.5f) / ppd;
@@ -1857,7 +2213,6 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
             }
         }
     }
-
     if (!basketWarpBitmap_ || basketWarpW_ != w || basketWarpH_ != h) {
         basketWarpBitmap_.Reset();
         const D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
@@ -1878,7 +2233,6 @@ bool RackView::UpdateBasketWarp(ID2D1RenderTarget* target, int themeIndex, float
     basketWarpPpd_ = ppd;
     return true;
 }
-
 void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, float s,
                                float expandAmount, float basketHover, float paper0,
                                int historyCount, int clipboardCount)
@@ -1892,7 +2246,6 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         const float t = rack::Clamp((x - layout.lineStart) / lineSpan, 0.0f, 1.0f);
         return layout.lineY + retract + 4.0f * layout.sag * t * (1.0f - t);
     };
-
     const float accessoriesRight = layout.width - kOuterPad * s;
     const float basketCenter = accessoriesRight - 78.0f * s;
     const float envelopeCenter = EnvelopeCenterX();
@@ -1904,9 +2257,7 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         const float basketBottom = ropeYAt(basketCenter) - 14.0f * s + 112.0f * s;
         badgeTop = std::max(envelopeBottom, basketBottom) + 2.0f * s;
     }
-
     const int themeIndex = rack::ClampInt(theme.index, 0, 3);
-
     /* 篮子先画：从「停用历史」恢复时它就在信封现在的位置，让信封从它上面
        滑开、把篮子露出来，而不是两个配件硬叠在一起。平时两者不重叠。 */
     const ImageBitmap* basket = basketTheme_[themeIndex].valid()
@@ -1952,7 +2303,6 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         }
         DrawCountBadge(target, basketCenter, badgeTop, historyCount, s);
     }
-
     const ImageBitmap* envelopeBack = envelopeThemeBack_[themeIndex].valid()
                                           ? &envelopeThemeBack_[themeIndex]
                                           : &envelope_;
@@ -1966,19 +2316,16 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         const D2D1_RECT_F dest =
             D2D1::RectF(envelopeCenter - envelopeWidth * 0.5f, top,
                         envelopeCenter + envelopeWidth * 0.5f, top + envelopeHeight);
-
         /* 图层顺序（由下往上）：
            背面 → 夹子 → 信纸 → 正面。带主题的背面本身已经包含纸张，
            所以单独的「信纸」图层只给旧版素材兜底。 */
         target->DrawBitmap(envelopeBack->bitmap.Get(), dest, 1.0f,
                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-
         const float envelopeClipScale = s * cardScale_;
         DrawClipAt(target, envelopeCenter,
                    ropeYAt(envelopeCenter) -
                        24.0f * envelopeClipScale * kClipSlotRatio,
                    theme, envelopeClipScale);
-
         // 所有主题共用同一张信纸，换的只是它下面的信封配色。
         if (letter_.valid()) {
             const float amount = rack::Clamp(paper0, 0.0f, 1.05f);
@@ -1991,7 +2338,6 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
             target->DrawBitmap(letter_.bitmap.Get(), paper, 1.0f,
                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         }
-
         if (envelopeFront && envelopeFront->valid()) {
             target->DrawBitmap(envelopeFront->bitmap.Get(), dest, 1.0f,
                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -2000,106 +2346,127 @@ void RackView::DrawAccessories(ID2D1RenderTarget* target, const Theme& theme, fl
         DrawCountBadge(target, envelopeCenter, badgeTop, clipboardCount + historyCount, s);
     }
 }
-
 void RackView::DrawCountBadge(ID2D1RenderTarget* target, float centerX, float top, int count,
                               float s)
 {
-    if (!badgeFormat_) {
+    if (!badgeFormat_ || !target) {
         return;
     }
-    /* 三位数以上要显示成 999+，胶囊跟着文字加宽；两位数以内保持原来的尺寸。 */
-    wchar_t label[8]{};
-    if (count > 999) {
-        wcscpy_s(label, L"999+");
-    } else {
-        swprintf_s(label, L"%d", count);
+    const int cacheKey = count > 999 ? 1000 : std::max(0, count);
+    if (target != badgeCacheOwner_ || std::abs(badgeCacheScale_ - s) > 0.001f ||
+        badgeCacheDark_ != uiDark_) {
+        badgeCache_.clear();
+        badgeCacheOwner_ = target;
+        badgeCacheScale_ = s;
+        badgeCacheDark_ = uiDark_;
     }
-
-    float textWidth = 0.0f;
-    if (graphics_ && graphics_->dwrite()) {
-        ComPtr<IDWriteTextLayout> layout;
-        if (SUCCEEDED(graphics_->dwrite()->CreateTextLayout(
-                label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), 120.0f * s,
-                18.0f * s, layout.GetAddressOf()))) {
-            DWRITE_TEXT_METRICS metrics{};
-            if (SUCCEEDED(layout->GetMetrics(&metrics))) {
-                textWidth = metrics.widthIncludingTrailingWhitespace;
+    ID2D1Bitmap* badgeBitmap = nullptr;
+    float width = 0.0f;
+    float height = 18.0f * s;
+    auto found = badgeCache_.find(cacheKey);
+    if (found != badgeCache_.end()) {
+        badgeBitmap = found->second.bitmap.Get();
+        width = found->second.width;
+        height = found->second.height;
+    } else {
+        /* 三位数以上要显示成 999+，胶囊跟着文字加宽；两位数以内保持原来的尺寸。 */
+        wchar_t label[8]{};
+        if (count > 999) {
+            wcscpy_s(label, L"999+");
+        } else {
+            swprintf_s(label, L"%d", count);
+        }
+        float textWidth = 0.0f;
+        if (graphics_ && graphics_->dwrite()) {
+            ComPtr<IDWriteTextLayout> layout;
+            if (SUCCEEDED(graphics_->dwrite()->CreateTextLayout(
+                    label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), 120.0f * s,
+                    18.0f * s, layout.GetAddressOf()))) {
+                DWRITE_TEXT_METRICS metrics{};
+                if (SUCCEEDED(layout->GetMetrics(&metrics))) {
+                    textWidth = metrics.widthIncludingTrailingWhitespace;
+                }
             }
         }
+        width = std::max(28.0f * s, textWidth + 10.0f * s);
+        const float grid = (s > 0.0f) ? s : 1.0f;
+        const float alignedWidth = std::round(width * grid) / grid;
+        const float alignedHeight = std::round(height * grid) / grid;
+        FLOAT targetDpiX = 96.0f;
+        FLOAT targetDpiY = 96.0f;
+        target->GetDpi(&targetDpiX, &targetDpiY);
+        const float pxPerDip = (targetDpiX > 0.0f) ? targetDpiX / 96.0f : 1.0f;
+        const UINT pixelWidth = static_cast<UINT>(
+            std::max(1.0f, std::round(alignedWidth * pxPerDip * 2.0f)));
+        const UINT pixelHeight = static_cast<UINT>(
+            std::max(1.0f, std::round(alignedHeight * pxPerDip * 2.0f)));
+        const D2D1_SIZE_F softSize = D2D1::SizeF(alignedWidth, alignedHeight);
+        const D2D1_SIZE_U softPixels = D2D1::SizeU(pixelWidth, pixelHeight);
+        ComPtr<ID2D1BitmapRenderTarget> soft;
+        if (FAILED(target->CreateCompatibleRenderTarget(
+                &softSize, &softPixels, nullptr,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, soft.GetAddressOf()))) {
+            return;
+        }
+        soft->SetDpi(96.0f * static_cast<float>(pixelWidth) / alignedWidth,
+                     96.0f * static_cast<float>(pixelHeight) / alignedHeight);
+        soft->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        soft->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        const D2D1_RECT_F local = D2D1::RectF(0.0f, 0.0f, alignedWidth, alignedHeight);
+        const float radius = alignedHeight * 0.5f;
+        const float strokeWidth = 1.0f;
+        const D2D1_RECT_F borderRect =
+            D2D1::RectF(strokeWidth * 0.5f, strokeWidth * 0.5f,
+                        alignedWidth - strokeWidth * 0.5f,
+                        alignedHeight - strokeWidth * 0.5f);
+        const float borderRadius = std::max(0.0f, radius - strokeWidth * 0.5f);
+        ComPtr<ID2D1SolidColorBrush> fill;
+        ComPtr<ID2D1SolidColorBrush> border;
+        ComPtr<ID2D1SolidColorBrush> text;
+        if (FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.12f, 0.15f, 0.82f),
+                                               fill.GetAddressOf())) ||
+            FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.20f),
+                                               border.GetAddressOf())) ||
+            FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.97f, 0.99f),
+                                               text.GetAddressOf()))) {
+            return;
+        }
+        soft->BeginDraw();
+        soft->Clear(D2D1::ColorF(0.f, 0.f));
+        soft->FillRoundedRectangle(D2D1::RoundedRect(local, radius, radius), fill.Get());
+        soft->DrawRoundedRectangle(D2D1::RoundedRect(borderRect, borderRadius, borderRadius),
+                                   border.Get(), strokeWidth);
+        soft->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), local,
+                       text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        if (FAILED(soft->EndDraw())) {
+            return;
+        }
+        ComPtr<ID2D1Bitmap> made;
+        if (FAILED(soft->GetBitmap(made.GetAddressOf())) || !made) {
+            return;
+        }
+        BadgeCacheEntry entry;
+        entry.bitmap = made;
+        entry.width = alignedWidth;
+        entry.height = alignedHeight;
+        badgeCache_[cacheKey] = entry;
+        badgeBitmap = made.Get();
+        width = alignedWidth;
+        height = alignedHeight;
+        if (badgeCache_.size() > 24) {
+            badgeCache_.erase(badgeCache_.begin());
+        }
     }
-    const float width = std::max(28.0f * s, textWidth + 10.0f * s);
-    const float height = 18.0f * s;
-    /* 跟 SnowAir 截图工具栏同一套做法：坐标先取整到整设备像素，胶囊和 1px 内描边
-       画进 2× 离屏位图，再用三次插值贴回。直接把发丝描边画在大画布上时，
-       圆头弧线的覆盖率沿切线时高时低，看着就是锯齿。 */
+    if (!badgeBitmap) {
+        return;
+    }
     const float grid = (s > 0.0f) ? s : 1.0f;
     const float left = std::round((centerX - width * 0.5f) * grid) / grid;
     const float alignedTop = std::round(top * grid) / grid;
-    const float alignedWidth = std::round(width * grid) / grid;
-    const float alignedHeight = std::round(height * grid) / grid;
-
-    FLOAT targetDpiX = 96.0f;
-    FLOAT targetDpiY = 96.0f;
-    target->GetDpi(&targetDpiX, &targetDpiY);
-    const float pxPerDip = (targetDpiX > 0.0f) ? targetDpiX / 96.0f : 1.0f;
-    const UINT pixelWidth = static_cast<UINT>(
-        std::max(1.0f, std::round(alignedWidth * pxPerDip * 2.0f)));
-    const UINT pixelHeight = static_cast<UINT>(
-        std::max(1.0f, std::round(alignedHeight * pxPerDip * 2.0f)));
-
-    const D2D1_SIZE_F softSize = D2D1::SizeF(alignedWidth, alignedHeight);
-    const D2D1_SIZE_U softPixels = D2D1::SizeU(pixelWidth, pixelHeight);
-    ComPtr<ID2D1BitmapRenderTarget> soft;
-    if (FAILED(target->CreateCompatibleRenderTarget(
-            &softSize, &softPixels, nullptr,
-            D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, soft.GetAddressOf()))) {
-        return;
-    }
-    soft->SetDpi(96.0f * static_cast<float>(pixelWidth) / alignedWidth,
-                 96.0f * static_cast<float>(pixelHeight) / alignedHeight);
-    soft->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-    soft->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-
-    const D2D1_RECT_F local = D2D1::RectF(0.0f, 0.0f, alignedWidth, alignedHeight);
-    const float radius = alignedHeight * 0.5f;
-    const float strokeWidth = 1.0f;
-    const D2D1_RECT_F borderRect =
-        D2D1::RectF(strokeWidth * 0.5f, strokeWidth * 0.5f,
-                    alignedWidth - strokeWidth * 0.5f,
-                    alignedHeight - strokeWidth * 0.5f);
-    const float borderRadius = std::max(0.0f, radius - strokeWidth * 0.5f);
-
-    ComPtr<ID2D1SolidColorBrush> fill;
-    ComPtr<ID2D1SolidColorBrush> border;
-    ComPtr<ID2D1SolidColorBrush> text;
-    if (FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.12f, 0.15f, 0.82f),
-                                           fill.GetAddressOf())) ||
-        FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(1.f, 1.f, 1.f, 0.20f),
-                                           border.GetAddressOf())) ||
-        FAILED(soft->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.97f, 0.99f),
-                                           text.GetAddressOf()))) {
-        return;
-    }
-    soft->BeginDraw();
-    soft->Clear(D2D1::ColorF(0.f, 0.f));
-    soft->FillRoundedRectangle(D2D1::RoundedRect(local, radius, radius), fill.Get());
-    soft->DrawRoundedRectangle(D2D1::RoundedRect(borderRect, borderRadius, borderRadius),
-                               border.Get(), strokeWidth);
-    soft->DrawText(label, static_cast<UINT32>(wcslen(label)), badgeFormat_.Get(), local,
-                   text.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-    if (FAILED(soft->EndDraw())) {
-        return;
-    }
-    ComPtr<ID2D1Bitmap> badgeBitmap;
-    if (FAILED(soft->GetBitmap(badgeBitmap.GetAddressOf())) || !badgeBitmap) {
-        return;
-    }
-    target->DrawBitmap(badgeBitmap.Get(),
-                       D2D1::RectF(left, alignedTop, left + alignedWidth,
-                                   alignedTop + alignedHeight),
-                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    target->DrawBitmap(badgeBitmap,
+                       D2D1::RectF(left, alignedTop, left + width, alignedTop + height), 1.0f,
+                       D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 }
-
 void RackView::ShowColorFlash(int itemId, int colorIndex, int part, uint64_t untilMs)
 {
     copyFlashItemId_ = itemId;
@@ -2107,7 +2474,6 @@ void RackView::ShowColorFlash(int itemId, int colorIndex, int part, uint64_t unt
     copyFlashPart_ = part;
     copyFlashUntil_ = untilMs;
 }
-
 void RackView::ClearColorFlash()
 {
     copyFlashItemId_ = -1;
@@ -2115,26 +2481,27 @@ void RackView::ClearColorFlash()
     copyFlashPart_ = 0;
     copyFlashUntil_ = 0;
 }
-
 void RackView::ShowCopyToast(int index, uint64_t untilMs)
 {
     copyToastIndex_ = index;
     copyToastUntil_ = untilMs;
 }
-
 void RackView::ClearCopyToast()
 {
     copyToastIndex_ = -1;
     copyToastUntil_ = 0;
 }
-
 void RackView::DrawCopyToast(ID2D1RenderTarget* target, float s)
 {
     if (copyToastIndex_ < 0 || rack::NowMs() >= copyToastUntil_ ||
         copyToastIndex_ >= static_cast<int>(cards_.size()) || !toastFormat_) {
         return;
     }
-    const CardBox& box = cards_[copyToastIndex_];
+    const CardBox* toastBox = DisplayCard(copyToastIndex_);
+    if (!toastBox) {
+        return;
+    }
+    const CardBox& box = *toastBox;
     const float width = 70.0f * s;
     const float height = 22.0f * s;
     const float centerX = (box.card.left + box.card.right) * 0.5f;
@@ -2160,7 +2527,6 @@ void RackView::DrawCopyToast(ID2D1RenderTarget* target, float s)
     target->DrawText(L"复制成功", 4, toastFormat_.Get(), rect, text.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
-
 void RackView::DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card, int kind,
                              float s)
 {
@@ -2219,7 +2585,6 @@ void RackView::DrawTypeBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
         target->DrawRoundedRectangle(tab, outline.Get(), edge);
     }
 }
-
 void RackView::DrawFileBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
                              const Item& item, float s)
 {
@@ -2242,7 +2607,6 @@ void RackView::DrawFileBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
                                (icon.top + icon.bottom) * 0.5f),
                  iconSize, iconInk.Get());
     }
-
     if (!fileTagFormat_) {
         return;
     }
@@ -2265,7 +2629,6 @@ void RackView::DrawFileBadge(ID2D1RenderTarget* target, const D2D1_RECT_F& card,
                      D2D1::RectF(textLeft, icon.top, textRight, icon.bottom), textInk.Get(),
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
-
 void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, float s,
                               bool hovered)
 {
@@ -2276,7 +2639,6 @@ void RackView::DrawCardShadow(ID2D1RenderTarget* target, const CardBox& box, flo
                hovered ? 0.16f : 0.12f);
     target->SetTransform(D2D1::Matrix3x2F::Identity());
 }
-
 void RackView::DrawFlatIcon(ID2D1RenderTarget* target, card::Type type,
                             D2D1_POINT_2F center, float size, ID2D1Brush* brush, float stroke)
 {
@@ -2403,7 +2765,6 @@ void RackView::DrawFlatIcon(ID2D1RenderTarget* target, card::Type type,
     default: break;
     }
 }
-
 void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
                             const D2D1_RECT_F& rect, float s, bool hotLink, bool hotColor)
 {
@@ -2420,7 +2781,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
         D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
     const D2D1_RECT_F body =
         D2D1::RectF(rect.left, header.bottom, rect.right, rect.bottom);
-
     ComPtr<ID2D1SolidColorBrush> white;
     ComPtr<ID2D1SolidColorBrush> accentBrush;
     ComPtr<ID2D1SolidColorBrush> ringBrush;
@@ -2454,7 +2814,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
                                              flashGreen.GetAddressOf()))) {
         return;
     }
-
     /* 外圈用不透明的「20% 类型色 + 80% 白」预合成色，白卡再内缩一圈。
        这样最外沿的 AA 像素是类型色而不是白色，深色桌面上不会出现
        「GIF 透明图」那种白色毛边。外沿再加 1u 很淡的同色柔光，
@@ -2476,7 +2835,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
     target->FillRectangle(
         D2D1::RectF(header.left, header.top + radius, header.right, header.bottom),
         accentBrush.Get());
-
     const int count = CardCountFor(item);
     std::wstring title = card::TypeLabel(item.cardType);
     if (item.cardType == card::Type::File) {
@@ -2491,7 +2849,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
                      D2D1::RectF(header.left + 11.0f * u, header.top + 4.0f * u,
                                  header.right - 32.0f * u, header.top + 19.0f * u),
                      headerBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-
     std::wstring meta = card::FormatCardTime(item.createdAt);
     if ((item.cardType == card::Type::File || item.cardType == card::Type::Music ||
          item.cardType == card::Type::Video) &&
@@ -2512,7 +2869,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
     DrawFlatIcon(target, item.cardType,
                  D2D1::Point2F(header.right - 16.0f * u, header.top + 16.5f * u), 13.0f * u,
                  headerBrush.Get(), 1.2f * u);
-
     target->PushAxisAlignedClip(body, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     if (item.cardType == card::Type::Color) {
         std::vector<card::Rgba> colors;
@@ -2641,7 +2997,6 @@ void RackView::DrawFlatCard(ID2D1RenderTarget* target, const Item& item,
     }
     target->PopAxisAlignedClip();
 }
-
 void RackView::DrawPaperCard(ID2D1RenderTarget* target, const Item& item,
                              const D2D1_RECT_F& rect, float s)
 {
@@ -2697,7 +3052,6 @@ void RackView::DrawPaperCard(ID2D1RenderTarget* target, const Item& item,
             }
         }
     }
-
     const D2D1_RECT_F header =
         D2D1::RectF(rect.left, rect.top, rect.right, rect.top + kFlatHeader * u);
     ComPtr<ID2D1SolidColorBrush> headerFill;
@@ -2733,7 +3087,6 @@ void RackView::DrawPaperCard(ID2D1RenderTarget* target, const Item& item,
                      bodyInkBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     target->PopAxisAlignedClip();
 }
-
 void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                         float s, float swayAngle, float hoverAmount, bool hovered,
                         bool pressed, bool hotLock, bool hotClose, bool hotLink,
@@ -2753,7 +3106,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
     target->SetTransform(
         D2D1::Matrix3x2F::Scale(cardScale, cardScale, pivot) *
         D2D1::Matrix3x2F::Rotation(box.angle + swayAngle, pivot));
-
     ComPtr<ID2D1SolidColorBrush> fill;
     ComPtr<ID2D1SolidColorBrush> border;
     ComPtr<ID2D1SolidColorBrush> imageBack;
@@ -2765,7 +3117,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                                              imageBack.GetAddressOf()))) {
         return;
     }
-
     if (IsNewCard(item)) {
         if (item.cardType == card::Type::Note) {
             DrawPaperCard(target, item, rect, s);
@@ -2807,7 +3158,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
             target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius),
                                          fill.Get());
         }
-
         D2D1_RECT_F imageRect = rack::Inset(rect, kFrame * s, kFrame * s);
         /* SVG 预览图本身没有留白：再向内收一圈，避免顶到相框。 */
         const bool svgPreview = IsSvgPreviewPath(item.path);
@@ -2860,7 +3210,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
         }    } else {
     target->FillRoundedRectangle(D2D1::RoundedRect(imageRect, 7.0f * s, 7.0f * s),
                                  imageBack.Get());
-
     if (item.thumb.valid()) {
         const D2D1_SIZE_F size = item.thumb.bitmap->GetSize();
         if (size.width > 0.0f && size.height > 0.0f) {
@@ -2872,7 +3221,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
             const float cy = (contentRect.top + contentRect.bottom) * 0.5f;
             D2D1_RECT_F dest = D2D1::RectF(cx - w * 0.5f, cy - h * 0.5f, cx + w * 0.5f,
                                            cy + h * 0.5f);
-
             ComPtr<ID2D1RoundedRectangleGeometry> geometry;
             graphics_->d2d()->CreateRoundedRectangleGeometry(
                 D2D1::RoundedRect(imageRect, 7.0f * s, 7.0f * s),
@@ -2898,7 +3246,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                              D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
-
     }
     }
     if (item.kind == 2) {
@@ -2909,7 +3256,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                                      1.0f * s);
     }
     } /* !IsNewCard */
-
     if (hovered && hoverAmount > 0.15f) {
         const float size = 20.0f * s;
         const D2D1_POINT_2F closeCenter =
@@ -2969,7 +3315,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
                         ink.Get(), 1.2f * s);
                 }
             }
-
             glass(closeCenter, hotClose, true);
             ink->SetColor(hotClose ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f)
                                    : D2D1::ColorF(ui.fg.r, ui.fg.g, ui.fg.b, 0.85f));
@@ -2988,7 +3333,6 @@ void RackView::DrawCard(ID2D1RenderTarget* target, const Item& item, const CardB
     }
     target->SetTransform(D2D1::Matrix3x2F::Identity());
 }
-
 void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardBox& box,
                         const Theme& theme, float s, float swayAngle)
 {
@@ -2998,11 +3342,9 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
     const NotePalette palette = NotePaletteFor(item.noteColor, theme.dark);
     const D2D1_POINT_2F center =
         D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
-
     target->SetTransform(D2D1::Matrix3x2F::Rotation(box.angle + swayAngle, center));
     /* 便签条的外阴影同样不画：它是 alpha>0 的空白像素，
        会把卡片下方的点击一起吃掉。 */
-
     ComPtr<ID2D1SolidColorBrush> fill;
     ComPtr<ID2D1SolidColorBrush> edge;
     ComPtr<ID2D1SolidColorBrush> ink;
@@ -3014,10 +3356,8 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
         target->SetTransform(D2D1::Matrix3x2F::Identity());
         return;
     }
-
     target->FillRectangle(box.note, fill.Get());
     target->DrawRectangle(box.note, edge.Get(), 1.0f * s);
-
     /* 右下角折角。 */
     const float foldSize = 8.0f * s;
     ComPtr<ID2D1PathGeometry> path;
@@ -3032,7 +3372,6 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
         sink->Close();
         target->FillGeometry(path.Get(), fold.Get());
     }
-
     if (noteFormat_) {
         const float padding = 5.0f * s;
         const float maxWidth = (box.note.right - box.note.left) - padding * 2.0f - foldSize;
@@ -3046,19 +3385,22 @@ void RackView::DrawNote(ID2D1RenderTarget* target, const Item& item, const CardB
                                    textLayout.Get(), ink.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
-
     target->SetTransform(D2D1::Matrix3x2F::Identity());
 }
-
 HBITMAP RackView::MakeDragGhost(const Item& item, int width, int height, SIZE* sizeOut)
 {
     if (!graphics_ || !graphics_->d2d() || width < 8 || height < 8) {
         return nullptr;
     }
+    /* 和绳子上一样带一层柔和投影：ghost 不能是“光秃秃一张图”，圆角/描边/阴影要统一。
+       留出 22*scale 的边距给阴影，不然会被位图边界切掉。 */
+    const float pad = 22.0f * scale_;
+    const int bitmapW = width + static_cast<int>(std::lround(pad * 2.0f));
+    const int bitmapH = height + static_cast<int>(std::lround(pad * 2.0f));
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = width;
-    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biWidth = bitmapW;
+    info.bmiHeader.biHeight = -bitmapH;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
@@ -3073,25 +3415,25 @@ HBITMAP RackView::MakeDragGhost(const Item& item, int width, int height, SIZE* s
         return nullptr;
     }
     HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
-
     ComPtr<ID2D1DCRenderTarget> target;
     const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-    RECT bounds{0, 0, width, height};
+    RECT bounds{0, 0, bitmapW, bitmapH};
     HRESULT hr = graphics_->d2d()->CreateDCRenderTarget(&properties, target.GetAddressOf());
     if (SUCCEEDED(hr)) {
         hr = target->BindDC(dc, &bounds);
     }
     if (SUCCEEDED(hr)) {
         CardBox box;
-        box.card = D2D1::RectF(0.0f, 0.0f, static_cast<float>(width),
-                               static_cast<float>(height));
+        box.card = D2D1::RectF(pad, pad, pad + static_cast<float>(width),
+                               pad + static_cast<float>(height));
         box.image = box.card;
         box.pinTop = 0.0f;
         box.angle = 0.0f;
         target->BeginDraw();
         target->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        DrawCardShadow(target.Get(), box, scale_, false);
         /* 直接复用绳子上那套绘制：纸色渐变、形状、字号与内边距全都一致。 */
         DrawCard(target.Get(), item, box, scale_, 0.0f, 0.0f, false, false);
         hr = target->EndDraw();
@@ -3103,12 +3445,11 @@ HBITMAP RackView::MakeDragGhost(const Item& item, int width, int height, SIZE* s
         return nullptr;
     }
     if (sizeOut) {
-        sizeOut->cx = width;
-        sizeOut->cy = height;
+        sizeOut->cx = bitmapW;
+        sizeOut->cy = bitmapH;
     }
     return bitmap;
 }
-
 HBITMAP RackView::MakeColorGhost(const card::Rgba& color, int width, int height,
                                  SIZE* sizeOut)
 {
@@ -3131,7 +3472,6 @@ HBITMAP RackView::MakeColorGhost(const card::Rgba& color, int width, int height,
         return nullptr;
     }
     HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
-
     ComPtr<ID2D1DCRenderTarget> target;
     const D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
         D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -3172,13 +3512,11 @@ HBITMAP RackView::MakeColorGhost(const card::Rgba& color, int width, int height,
     }
     return bitmap;
 }
-
 RackHit RackView::HitTest(float x, float y, float scale) const
 {
     RackHit hit;
     const RackLayout& layout = layout_;
     const float s = std::max(0.5f, scale);
-
     const float lineHitBottom = layout.lineY + layout.sag + 8.0f * s;
     const bool lineArea = y >= 0.0f && y <= lineHitBottom &&
                           x >= layout.lineStart - 6.0f * s &&
@@ -3188,6 +3526,99 @@ RackHit RackView::HitTest(float x, float y, float scale) const
             hit.part = RackPart::Line;
         }
         return hit;
+    }
+
+    /* 配件画在卡片上面，命中也要先判配件，否则压在信封下的卡会抢点击。 */
+    if (rack::PointIn(envelopeRect_, x, y)) {
+        hit.part = RackPart::Envelope;
+        return hit;
+    }
+    if (!historyDisabled_ && rack::PointIn(basketRect_, x, y)) {
+        hit.part = RackPart::Basket;
+        return hit;
+    }
+
+    /* 叠层：被首/尾卡盖住的部分仍算首/尾卡；露出来的部分可以单独悬停。
+       露出来的只是一条很窄的边，命中用不旋转的卡框再外扩 2px：
+       按角度旋转坐标会把边缘上的点判到框外，导致边缘命中不准。 */
+    auto stackHit = [&](const CardBox* box, int index) -> bool {
+        if (!box || index < 0) {
+            return false;
+        }
+        const float pad = 2.0f * s;
+        const D2D1_RECT_F body = D2D1::RectF(box->card.left - pad, box->card.top - pad,
+                                             box->card.right + pad, box->card.bottom + pad);
+        if (index == lastHovered_) {
+            const D2D1_RECT_F closeRect =
+                D2D1::RectF(box->card.right - 26.0f * s, box->card.top + 6.0f * s,
+                            box->card.right - 6.0f * s, box->card.top + 26.0f * s);
+            if (rack::PointIn(closeRect, x, y)) {
+                hit.part = RackPart::Close;
+                hit.index = index;
+                return true;
+            }
+            const D2D1_RECT_F lockRect =
+                D2D1::RectF(box->card.left + 6.0f * s, box->card.top + 6.0f * s,
+                            box->card.left + 26.0f * s, box->card.top + 26.0f * s);
+            if (rack::PointIn(lockRect, x, y)) {
+                hit.part = RackPart::Lock;
+                hit.index = index;
+                return true;
+            }
+        }
+        if (box->hasNote && rack::PointIn(box->note, x, y)) {
+            hit.part = RackPart::Note;
+            hit.index = index;
+            return true;
+        }
+        const float cx = (box->card.left + box->card.right) * 0.5f;
+        const D2D1_RECT_F clipRect =
+            D2D1::RectF(cx - 10.0f * s, box->pinTop - 10.0f * s, cx + 10.0f * s,
+                        box->card.top + 2.0f * s);
+        if (rack::PointIn(clipRect, x, y)) {
+            hit.part = RackPart::Clip;
+            hit.index = index;
+            return true;
+        }
+        if (rack::PointIn(body, x, y)) {
+            hit.part = RackPart::Card;
+            hit.index = index;
+            return true;
+        }
+        return false;
+    };
+    /* 自定义卡绘制在右叠组上面，命中测试也应优先判断它们。 */
+    auto overCustomCard = [&](float px, float py) {
+        for (int i = static_cast<int>(cards_.size()) - 1; i >= layout.groupCount; --i) {
+            if (i == editingCard_) continue;
+            const CardBox& box = cards_[static_cast<size_t>(i)];
+            const D2D1_POINT_2F pivot =
+                D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
+            const D2D1_POINT_2F local = RotateAround(D2D1::Point2F(px, py), pivot, -box.angle);
+            if (box.hasNote && rack::PointIn(box.note, local.x, local.y)) {
+                return true;
+            }
+            if (rack::PointIn(box.card, local.x, local.y)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool overCustom = overCustomCard(x, y);
+    if (!overCustom && IsStackIndex(lastHovered_)) {
+        if (const CardBox* box = StackBoxForIndex(lastHovered_)) {
+            if (stackHit(box, lastHovered_)) {
+                return hit;
+            }
+        }
+    }
+    /* 右叠组画在可见行上面，命中也要先判它：正面那张压着尾卡。 */
+    for (int depth = 0; !overCustom && depth < static_cast<int>(rightStackBoxes_.size()); ++depth) {
+        const int idx = rightStackIndices_[static_cast<size_t>(depth)];
+        if (idx != lastHovered_ &&
+            stackHit(&rightStackBoxes_[static_cast<size_t>(depth)], idx)) {
+            return hit;
+        }
     }
 
     for (int i = static_cast<int>(cards_.size()) - 1; i >= 0; --i) {
@@ -3274,17 +3705,14 @@ RackHit RackView::HitTest(float x, float y, float scale) const
             return hit;
         }
     }
+    for (int depth = 0; depth < static_cast<int>(leftStackBoxes_.size()); ++depth) {
+        const int idx = leftStackIndices_[static_cast<size_t>(depth)];
+        if (idx != lastHovered_ &&
+            stackHit(&leftStackBoxes_[static_cast<size_t>(depth)], idx)) {
+            return hit;
+        }
+    }
 
-    /* 信封画在篮子上面：两者在换槽位的动画里会重叠，命中也要按画面上
-       谁在上面来判，否则垫在下面的篮子会抢走信封的点击。 */
-    if (rack::PointIn(envelopeRect_, x, y)) {
-        hit.part = RackPart::Envelope;
-        return hit;
-    }
-    if (!historyDisabled_ && rack::PointIn(basketRect_, x, y)) {
-        hit.part = RackPart::Basket;
-        return hit;
-    }
     if (lineArea) {
         hit.part = RackPart::Line;
         return hit;
@@ -3294,7 +3722,6 @@ RackHit RackView::HitTest(float x, float y, float scale) const
     }
     return hit;
 }
-
 const CardBox* RackView::Card(int index) const
 {
     if (index < 0 || index >= static_cast<int>(cards_.size())) {
@@ -3303,4 +3730,10 @@ const CardBox* RackView::Card(int index) const
     return &cards_[static_cast<size_t>(index)];
 }
 
-
+const CardBox* RackView::DisplayCard(int index) const
+{
+    if (const CardBox* stack = StackBoxForIndex(index)) {
+        return stack;
+    }
+    return Card(index);
+}

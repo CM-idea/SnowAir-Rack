@@ -177,6 +177,14 @@ bool ItemStore::Load(std::vector<Item>& items) const
             offset && offset->type == json::Type::Number) {
             item.rackOffsetX = static_cast<float>(offset->number);
         }
+        if (const json::Value* custom = value.Get("custom");
+            custom && custom->type == json::Type::Bool) {
+            item.custom = custom->boolean;
+        }
+        if (const json::Value* customX = value.Get("customX");
+            customX && customX->type == json::Type::Number) {
+            item.customX = static_cast<float>(customX->number);
+        }
         if (const json::Value* locked = value.Get("locked");
             locked && locked->type == json::Type::Bool) {
             item.locked = locked->boolean;
@@ -266,6 +274,9 @@ bool ItemStore::Save(const std::vector<Item>& items) const
         output += ", \"id\": " + std::to_string(item.id);
         output += ", \"aspect\": " + std::to_string(item.aspect);
         output += ", \"offsetX\": " + std::to_string(item.rackOffsetX);
+        output += ", \"custom\": ";
+        output += item.custom ? "true" : "false";
+        output += ", \"customX\": " + std::to_string(item.customX);
         output += ", \"locked\": ";
         output += item.locked ? "true" : "false";
         output += ", \"addedMs\": " + std::to_string(item.addedMs);

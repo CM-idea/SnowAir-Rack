@@ -7,9 +7,13 @@
 #pragma comment(lib, "uiautomationcore.lib")
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
+#include <vector>
 #include <shlobj.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -360,8 +364,183 @@ HBITMAP MakeTextDragBitmap(const std::wstring& text, int cardWidth, int cardHeig
     return bitmap;
 }
 
+/* ---- 拖拽预览窗 ----
+   卡片 ghost 跟着鼠标走，并按移动方向轻轻摆一个角度（像被手带着走），
+   松手前一直保持这个预览；OLE 自带的缩略图是隐藏的（1x1 透明）。 */
+struct DragPreviewState {
+    HWND hwnd = nullptr;
+    std::vector<uint8_t> pixels;   /* 预乘 BGRA，top-down 源图 */
+    int width = 0;
+    int height = 0;
+    int canvas = 0;                /* 旋转画布（正方形，足够放下任意角度） */
+    HBITMAP bitmap = nullptr;
+    HDC dc = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    void* bits = nullptr;
+    float angle = 0.0f;
+    float angleVel = 0.0f;
+    float lagX = 0.0f;
+    float lagY = 0.0f;
+    int lastX = 0;
+    int lastY = 0;
+    uint64_t lastMs = 0;
+};
+
+std::unordered_map<HWND, DragPreviewState*>& DragPreviews()
+{
+    static std::unordered_map<HWND, DragPreviewState*> map;
+    return map;
+}
+
+float ClampF(float value, float low, float high)
+{
+    return value < low ? low : (value > high ? high : value);
+}
+
+void UpdateDragPreview(HWND hwnd)
+{
+    auto found = DragPreviews().find(hwnd);
+    if (found == DragPreviews().end() || !found->second) {
+        return;
+    }
+    DragPreviewState& state = *found->second;
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const uint64_t now = GetTickCount64();
+    float dt = state.lastMs != 0 ? static_cast<float>(now - state.lastMs) / 1000.0f : 0.016f;
+    if (dt <= 0.0f || dt > 0.12f) {
+        dt = 0.016f;
+    }
+    const float vx = static_cast<float>(cursor.x - state.lastX) / dt;
+    const float vy = static_cast<float>(cursor.y - state.lastY) / dt;
+    state.lastX = cursor.x;
+    state.lastY = cursor.y;
+    state.lastMs = now;
+
+    /* 摆动：目标角跟水平速度走。这里用阻尼振子的解析解，
+       不按帧做欧拉积分：拖拽时 GiveFeedback 的间隔会有几十毫秒的抖动，
+       大 dt 下欧拉积分会发散，表现就是停下来以后还在无限左右摆。 */
+    const float target = ClampF(vx * 0.035f, -9.0f, 9.0f);
+    const float response = 0.16f;
+    const float zeta = 0.8f;
+    const float natural = 2.0f * 3.14159265f / response;
+    const float decay = natural * zeta;
+    const float damped = natural * std::sqrt(1.0f - zeta * zeta);
+    const float offset = state.angle - target;
+    const float envelope = std::exp(-decay * dt);
+    const float cosine = std::cos(damped * dt);
+    const float sine = std::sin(damped * dt);
+    const float coefficient = (state.angleVel + decay * offset) / damped;
+    state.angle = target + envelope * (offset * cosine + coefficient * sine);
+    state.angleVel =
+        envelope * (state.angleVel * cosine - (decay * coefficient + damped * offset) * sine);
+    if (std::abs(state.angle - target) < 0.02f && std::abs(state.angleVel) < 0.1f) {
+        state.angle = target;
+        state.angleVel = 0.0f;
+    }
+    state.angle = ClampF(state.angle, -12.0f, 12.0f);
+    /* 位置微微落后于指针，像被拖着走。 */
+    const float lagTargetX = ClampF(vx * 0.018f, -10.0f, 10.0f);
+    const float lagTargetY = ClampF(vy * 0.012f, -8.0f, 8.0f);
+    const float lerp = std::min(1.0f, dt * 18.0f);
+    state.lagX += (lagTargetX - state.lagX) * lerp;
+    state.lagY += (lagTargetY - state.lagY) * lerp;
+
+    if (!state.bits || state.canvas <= 0) {
+        return;
+    }
+    auto* dst = static_cast<uint8_t*>(state.bits);
+    memset(dst, 0, static_cast<size_t>(state.canvas) * state.canvas * 4);
+    const float radians = state.angle * 3.14159265f / 180.0f;
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    const float centerX = state.width * 0.5f;
+    const float centerY = state.height * 0.5f;
+    const float origin = state.canvas * 0.5f;
+    const int w = state.width;
+    const int h = state.height;
+    const int canvas = state.canvas;
+    if (std::abs(state.angle) < 0.02f) {
+        /* 不旋转时原样拷贝：双线性采样会把边和圆角糊掉半像素，看起来就“不锐”。 */
+        const int ox = (canvas - w) / 2;
+        const int oy = (canvas - h) / 2;
+        for (int y = 0; y < h; ++y) {
+            memcpy(dst + (static_cast<size_t>(y + oy) * canvas + ox) * 4,
+                   state.pixels.data() + static_cast<size_t>(y) * w * 4,
+                   static_cast<size_t>(w) * 4);
+        }
+    } else {
+    for (int y = 0; y < canvas; ++y) {
+        for (int x = 0; x < canvas; ++x) {
+            const float dx = static_cast<float>(x) + 0.5f - origin;
+            const float dy = static_cast<float>(y) + 0.5f - origin;
+            const float sx = dx * c + dy * s + centerX;
+            const float sy = -dx * s + dy * c + centerY;
+            if (sx < 0.0f || sy < 0.0f || sx >= static_cast<float>(w) ||
+                sy >= static_cast<float>(h)) {
+                continue;
+            }
+            const int x0 = static_cast<int>(sx);
+            const int y0 = static_cast<int>(sy);
+            const int x1 = std::min(w - 1, x0 + 1);
+            const int y1 = std::min(h - 1, y0 + 1);
+            const float fx = sx - static_cast<float>(x0);
+            const float fy = sy - static_cast<float>(y0);
+            const uint8_t* p00 = state.pixels.data() + (static_cast<size_t>(y0) * w + x0) * 4;
+            const uint8_t* p10 = state.pixels.data() + (static_cast<size_t>(y0) * w + x1) * 4;
+            const uint8_t* p01 = state.pixels.data() + (static_cast<size_t>(y1) * w + x0) * 4;
+            const uint8_t* p11 = state.pixels.data() + (static_cast<size_t>(y1) * w + x1) * 4;
+            uint8_t* out = dst + (static_cast<size_t>(y) * canvas + x) * 4;
+            for (int channel = 0; channel < 4; ++channel) {
+                const float top = p00[channel] + (p10[channel] - p00[channel]) * fx;
+                const float bottom = p01[channel] + (p11[channel] - p01[channel]) * fx;
+                out[channel] = static_cast<uint8_t>(top + (bottom - top) * fy + 0.5f);
+            }
+        }
+    }
+    }
+
+    POINT destination{cursor.x - canvas / 2 - static_cast<int>(std::lround(state.lagX)),
+                      cursor.y - canvas / 2 - static_cast<int>(std::lround(state.lagY))};
+    SIZE size{canvas, canvas};
+    POINT source{0, 0};
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    HDC screen = GetDC(nullptr);
+    if (screen) {
+        UpdateLayeredWindow(hwnd, screen, &destination, &size, state.dc, &source, 0, &blend,
+                            ULW_ALPHA);
+        ReleaseDC(nullptr, screen);
+    }
+}
+
+void DestroyDragPreview(HWND hwnd)
+{
+    auto found = DragPreviews().find(hwnd);
+    if (found != DragPreviews().end()) {
+        DragPreviewState* state = found->second;
+        DragPreviews().erase(found);
+        if (state) {
+            if (state->dc) {
+                if (state->oldBitmap) {
+                    SelectObject(state->dc, state->oldBitmap);
+                }
+                DeleteDC(state->dc);
+            }
+            if (state->bitmap) {
+                DeleteObject(state->bitmap);
+            }
+            delete state;
+        }
+    }
+    if (hwnd && IsWindow(hwnd)) {
+        DestroyWindow(hwnd);
+    }
+}
+
 HWND CreateDragPreview(HBITMAP bitmap, int width, int height)
 {
+    (void)width;
+    (void)height;
     static bool registered = false;
     constexpr wchar_t kClass[] = L"SnowAirRackDragPreview";
     if (!registered) {
@@ -376,36 +555,70 @@ HWND CreateDragPreview(HBITMAP bitmap, int width, int height)
         }
         registered = true;
     }
+    BITMAP source{};
+    if (!bitmap || !GetObjectW(bitmap, sizeof(source), &source) || source.bmBitsPixel != 32 ||
+        !source.bmBits) {
+        return nullptr;
+    }
+    const int w = source.bmWidth;
+    const int h = std::abs(source.bmHeight);
+    if (w < 4 || h < 4) {
+        return nullptr;
+    }
     HWND hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
             WS_EX_TOPMOST,
-        kClass, L"", WS_POPUP, 0, 0, width, height, nullptr, nullptr,
+        kClass, L"", WS_POPUP, 0, 0, w, h, nullptr, nullptr,
         GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
         return nullptr;
     }
-
-    HDC screen = GetDC(nullptr);
-    HDC memory = CreateCompatibleDC(screen);
-    HGDIOBJ old = SelectObject(memory, bitmap);
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    POINT destination{cursor.x - width / 2, cursor.y - height / 2};
-    POINT source{0, 0};
-    SIZE size{width, height};
-    const BOOL updated = UpdateLayeredWindow(hwnd, screen, &destination, &size, memory,
-                                             &source, 0, &blend, ULW_ALPHA);
-    SelectObject(memory, old);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    if (!updated) {
+    auto* state = new (std::nothrow) DragPreviewState;
+    if (!state) {
         DestroyWindow(hwnd);
         return nullptr;
     }
+    state->hwnd = hwnd;
+    state->width = w;
+    state->height = h;
+    state->pixels.assign(static_cast<const uint8_t*>(source.bmBits),
+                         static_cast<const uint8_t*>(source.bmBits) +
+                             static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    state->canvas = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(w) * w +
+                                                         static_cast<double>(h) * h))) +
+                    6;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = state->canvas;
+    info.bmiHeader.biHeight = -state->canvas;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    state->bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &state->bits, nullptr, 0);
+    if (!state->bitmap || !state->bits) {
+        if (state->bitmap) {
+            DeleteObject(state->bitmap);
+        }
+        delete state;
+        DestroyWindow(hwnd);
+        return nullptr;
+    }
+    state->dc = CreateCompatibleDC(nullptr);
+    if (!state->dc) {
+        DeleteObject(state->bitmap);
+        delete state;
+        DestroyWindow(hwnd);
+        return nullptr;
+    }
+    state->oldBitmap = SelectObject(state->dc, state->bitmap);
+    POINT start{};
+    GetCursorPos(&start);
+    state->lastX = start.x;
+    state->lastY = start.y;
+    state->lastMs = GetTickCount64();
+    DragPreviews()[hwnd] = state;
+    UpdateDragPreview(hwnd);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    SetWindowPos(hwnd, HWND_TOPMOST, destination.x, destination.y, width, height,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return hwnd;
 }
 
@@ -414,8 +627,8 @@ public:
     explicit RackDataObject(const std::wstring& path) : path_(path)
     {
         /* 图片卡拖拽只给 CF_HDROP：和从资源管理器拖一个 PNG 完全同一条路径。
-           Adobe 的拖放通道不认 DIBV5/PNG，取 CF_DIB 又会把 alpha 洗成白底；
-           只给文件后它按「导入文件」处理，透明通道由 PNG 自己带，Figma 等也照常收。 */
+           部分目标软件的拖放通道不认 DIBV5/PNG，取 CF_DIB 又会把 alpha 洗成白底；
+           只给文件后它按「导入文件」处理，透明通道由 PNG 自己带，其他软件也照常接收。 */
         formats_[count_++] = MakeFormat(CF_HDROP);
     }
 
@@ -1064,19 +1277,9 @@ public:
             return DRAGDROP_S_USEDEFAULTCURSORS;
         };
         if (preview_ && IsWindow(preview_)) {
-            POINT cursor{};
-            GetCursorPos(&cursor);
-            RECT rect{};
-            GetWindowRect(preview_, &rect);
-            const int x = cursor.x - (rect.right - rect.left) / 2;
-            const int y = cursor.y - (rect.bottom - rect.top) / 2;
-            /* 预览窗口创建时已经置顶：这里只平移，不再每次 SetWindowPos(HWND_TOPMOST)。
-               反复请求置顶会触发窗口管理器重排，拖拽就会发涩。 */
-            if (x == rect.left && y == rect.top) {
-                return applyCursor();
-            }
-            SetWindowPos(preview_, nullptr, x, y, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            /* ghost 跟着鼠标走，并按移动方向轻轻摆一个角度；发涩的问题交给
+               预览窗自己的分层绘制，不再反复 SetWindowPos(HWND_TOPMOST)。 */
+            UpdateDragPreview(preview_);
         }
         return applyCursor();
     }
@@ -1195,7 +1398,7 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
             source->Release();
         }
         if (dragPreview) {
-            DestroyWindow(dragPreview);
+            DestroyDragPreview(dragPreview);
         }
         if (dragBitmap) {
             DeleteObject(dragBitmap);
@@ -1216,9 +1419,9 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
     void* emptyBits = nullptr;
     invisible = CreateDIBSection(nullptr, &emptyInfo, DIB_RGB_COLORS, &emptyBits,
                                  nullptr, 0);
-    if (invisible && SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr,
-                                                CLSCTX_INPROC_SERVER,
-                                                IID_PPV_ARGS(&helper)))) {
+    if (dragPreview && invisible &&
+        SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&helper)))) {
         SHDRAGIMAGE image{};
         image.sizeDragImage = {1, 1};
         image.hbmpDragImage = invisible;
@@ -1244,7 +1447,7 @@ DWORD BeginDrag(const std::wstring& path, HWND rack, RECT returnBand, int cardWi
         DeleteObject(invisible);
     }
     if (dragPreview) {
-        DestroyWindow(dragPreview);
+        DestroyDragPreview(dragPreview);
     }
     if (dragBitmap) {
         DeleteObject(dragBitmap);
@@ -1300,7 +1503,7 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
             source->Release();
         }
         if (dragPreview) {
-            DestroyWindow(dragPreview);
+            DestroyDragPreview(dragPreview);
         }
         if (dragBitmap) {
             DeleteObject(dragBitmap);
@@ -1319,9 +1522,9 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
     emptyInfo.bmiHeader.biBitCount = 32;
     void* emptyBits = nullptr;
     invisible = CreateDIBSection(nullptr, &emptyInfo, DIB_RGB_COLORS, &emptyBits, nullptr, 0);
-    if (invisible && SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr,
-                                                CLSCTX_INPROC_SERVER,
-                                                IID_PPV_ARGS(&helper)))) {
+    if (dragPreview && invisible &&
+        SUCCEEDED(CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&helper)))) {
         SHDRAGIMAGE image{};
         image.sizeDragImage = {1, 1};
         image.hbmpDragImage = invisible;
@@ -1337,7 +1540,7 @@ DWORD BeginTextDrag(const std::wstring& text, HWND rack, RECT returnBand, HBITMA
         DeleteObject(invisible);
     }
     if (dragPreview) {
-        DestroyWindow(dragPreview);
+        DestroyDragPreview(dragPreview);
     }
     if (dragBitmap) {
         DeleteObject(dragBitmap);

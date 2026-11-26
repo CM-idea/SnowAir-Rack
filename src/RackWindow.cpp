@@ -1,5 +1,6 @@
 #include "RackWindow.h"
 #include <fstream>
+#include <unordered_map>
 
 #include "Clipboard.h"
 #include "Config.h"
@@ -7,6 +8,7 @@
 #include "NoteEditor.h"
 #include "NoteStore.h"
 #include "Plugin.h"
+#include "RackLayoutMath.h"
 #include "Util.h"
 
 #include <commdlg.h>
@@ -26,6 +28,7 @@ constexpr float kTopBarBand = 24.0f;
 constexpr UINT kMsgTopBarClick = WM_APP + 2;
 constexpr UINT kMsgColorWheel = WM_APP + 3;
 constexpr UINT kMsgRackRightClick = WM_APP + 4;
+constexpr UINT kMsgRackScroll = WM_APP + 5;
 
 bool CanPinItem(const Item& item)
 {
@@ -191,7 +194,24 @@ bool RackWindow::Init(Plugin* plugin, Graphics* graphics)
     /* 2x 超采样后线性缩回：卡片圆角/20% 外圈/文字更平滑。 */
     SetSupersample(true);
     lastInside_ = rack::NowMs();
-    normalizeSpacingPending_ = !plugin_->items().empty();
+    /* 一次性迁移：清掉旧版本留下的偏移（旧偏移会让普通卡交叉）。
+       迁移过后，偏移就是用户的自定义位置，跨启动保留。 */
+    const std::wstring migrateFlag =
+        util::JoinPath(util::GetDataDir(), L"row_offset_model2.flag");
+    if (!util::FileExists(migrateFlag)) {
+        bool clearedOffsets = false;
+        for (auto& item : plugin_->items()) {
+            if (item.rackOffsetX != 0.0f) {
+                item.rackOffsetX = 0.0f;
+                clearedOffsets = true;
+            }
+        }
+        if (clearedOffsets) {
+            plugin_->SaveItems();
+        }
+        std::ofstream flag(migrateFlag.c_str());
+        flag << 2;
+    }
     SetTimer(hwnd(), kTimerPoll, kPollIntervalMs, nullptr);
     return true;
 }
@@ -216,7 +236,7 @@ void RackWindow::Shutdown()
     plugin_ = nullptr;
 }
 
-void RackWindow::OnItemsChanged(bool added)
+void RackWindow::OnItemsChanged(bool added, int addedId)
 {
     DismissPreview();
     if (!plugin_ || plugin_->items().empty()) {
@@ -264,15 +284,24 @@ void RackWindow::OnItemsChanged(bool added)
     if (!monitor_) {
         monitor_ = CursorMonitor();
     }
+    /* 新卡片按 id 找位置：自定义卡排在吸附组后面，items.back() 不一定是新卡。 */
+    int arrivalIndex = -1;
     if (added) {
-        view_.BeginArrival(static_cast<int>(plugin_->items().size()) - 1);
+        arrivalIndex = addedId >= 0 ? plugin_->IndexById(addedId) : -1;
+        if (arrivalIndex < 0) {
+            arrivalIndex = static_cast<int>(plugin_->items().size()) - 1;
+        }
+        if (view_.AtScrollEnd()) {
+            view_.ScrollToEnd();
+        }
+        view_.BeginArrival(arrivalIndex);
     }
     PositionForMonitor(monitor_);
     if (added) {
         POINT cursor{};
         GetCursorPos(&cursor);
         ScreenToClient(hwnd(), &cursor);
-        const Item& incoming = plugin_->items().back();
+        const Item& incoming = plugin_->items()[static_cast<size_t>(arrivalIndex)];
         if (incoming.captureW > 0 && incoming.captureH > 0) {
             POINT tl{incoming.captureX, incoming.captureY};
             POINT br{incoming.captureX + incoming.captureW,
@@ -286,6 +315,14 @@ void RackWindow::OnItemsChanged(bool added)
             view_.SetArrivalStart(static_cast<float>(cursor.x),
                                   static_cast<float>(cursor.y));
         }
+        RackLog(L"新卡片入场：index=%d 起点=(%ld,%ld) 目标=(%.0f,%.0f)", arrivalIndex,
+                cursor.x, cursor.y,
+                view_.Card(arrivalIndex)
+                    ? (view_.Card(arrivalIndex)->card.left + view_.Card(arrivalIndex)->card.right) * 0.5f
+                    : -1.0f,
+                view_.Card(arrivalIndex)
+                    ? (view_.Card(arrivalIndex)->card.top + view_.Card(arrivalIndex)->card.bottom) * 0.5f
+                    : -1.0f);
         if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
         /* 快捷键/常驻模式被手动隐藏时，新卡片只更新数据，不主动把绳子拉出来；
            等用户按快捷键显示。悬停模式保持原来的「新卡片 peek」。 */
@@ -302,6 +339,13 @@ void RackWindow::OnItemsChanged(bool added)
         }
         Render();
     }
+    /* 卡片增删后吸附组槽位会变，检查自定义卡有没有真的被压住。 */
+    ResolveCustomOverlaps();
+    if (needsLayout_ && hwnd()) {
+        Reposition();
+        Render();
+    }
+    RelaxGroupOffsetsIfNoCustoms();
 }
 
 void RackWindow::OnConfigChanged()
@@ -374,6 +418,13 @@ void RackWindow::OnConfigChanged()
     if (newDisplayMode == kDisplayAlways && !manuallyHidden_ && expand_ < 0.9f) {
         Expand(false);
     }
+    /* 启动后按真实布局收一次：旧版本/迁移过来的自定义卡可能正好压在组上。 */
+    if (!startupResolveDone_ && hwnd() && !plugin_->items().empty()) {
+        startupResolveDone_ = true;
+        ResolveCustomOverlaps();
+        Reposition();
+        RelaxGroupOffsetsIfNoCustoms();
+    }
     Render();
 }
 
@@ -418,8 +469,10 @@ void RackWindow::Expand(bool peek)
         return;
     }
     /* 手动隐藏状态下，除了快捷键路径（会先清掉 manuallyHidden_），
-       任何自动展开都不能把绳子拉出来。 */
-    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+       任何自动展开都不能把绳子拉出来。设置页在预览晾衣架时例外：
+       用户正在调它，必须把架子显示出来。 */
+    const bool settingsPreview = plugin_->PreviewPinned();
+    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover && !settingsPreview) {
         return;
     }
     const uint64_t now = rack::NowMs();
@@ -587,7 +640,15 @@ bool RackWindow::PointHittable(POINT screen) const
     }
     POINT client = screen;
     ScreenToClient(hwnd(), &client);
-    return AlphaAt(client.x, client.y);
+    if (!AlphaAt(client.x, client.y)) {
+        return false;
+    }
+    /* 堆叠后层、数字胶囊等装饰像素 alpha>0，但不是可操作区域：
+       必须再走一次精确命中，避免低级鼠标钩子把它们当成卡片。 */
+    const RackHit hit = view_.HitTest(static_cast<float>(client.x),
+                                      static_cast<float>(client.y), scale_);
+    return hit.part != RackPart::None && hit.part != RackPart::Background &&
+           hit.part != RackPart::Line;
 }
 
 void RackWindow::CheckMissingFiles()
@@ -700,6 +761,13 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
                 /* 颜色卡吃掉的滚轮不要再传给下面窗口。 */
                 return 1;
             }
+            /* 其它位置：鼠标在绳子/卡片/堆叠上时，滚轮切换可见窗口。 */
+            if (topBarOwner_->view_.RackAreaContains(static_cast<float>(client.x),
+                                                     static_cast<float>(client.y))) {
+                PostMessageW(topBarOwner_->hwnd(), kMsgRackScroll,
+                             static_cast<WPARAM>(GET_WHEEL_DELTA_WPARAM(mouse->mouseData)), 0);
+                return 1;
+            }
         }
     }
     if (code == HC_ACTION && wParam == WM_LBUTTONDOWN && topBarOwner_ &&
@@ -712,46 +780,118 @@ LRESULT CALLBACK RackWindow::TopBarHookProc(int code, WPARAM wParam, LPARAM lPar
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-void RackWindow::NormalizeLoadedSpacing()
+void RackWindow::ResolveCustomOverlaps(int ignoreId)
 {
-    if (!plugin_) {
+    if (!plugin_ || !hwnd()) {
         return;
     }
-    /* 0.1.1 的做法：按画面上的左右顺序补最小间距，偏移保留下来，
-       视觉顺序才不会被启动时清零。 */
-    struct Entry {
-        float left = 0.0f;
-        int index = -1;
-    };
-    std::vector<Entry> order;
-    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
-        if (const CardBox* box = view_.Card(i)) {
-            order.push_back({box->card.left, i});
+    auto& items = plugin_->items();
+    /* 只把「真的压住了」的自定义卡并回槽位。落点规则允许卡片停在两卡之间
+       （两侧各留不到 2G 也合法），这里再用 2G 判定会把刚落下的卡又弹回槽位，
+       看起来就是“松手后突然位移”。 */
+    constexpr float kOverlapTolerance = 1.0f;
+    /* 在“内容坐标”里检查：槽位目标和自定义卡的 customX 是同一套坐标，
+       和居中/滚动/弹簧无关，所以这个判断是稳定的、不依赖当前画面。 */
+    for (int pass = 0; pass < 8; ++pass) {
+        int groupCount = 0;
+        for (const auto& item : items) {
+            if (!item.custom) {
+                ++groupCount;
+            }
         }
-    }
-    std::sort(order.begin(), order.end(),
-              [](const Entry& a, const Entry& b) { return a.left < b.left; });
-    const float gap = view_.DefaultGap();
-    float previousRight = 0.0f;
-    bool first = true;
-    bool changed = false;
-    for (const auto& entry : order) {
-        const CardBox* box = view_.Card(entry.index);
-        if (!box) continue;
-        const float width = box->card.right - box->card.left;
-        float left = box->card.left;
-        if (!first && left - previousRight < gap) {
-            const float shift = gap - (left - previousRight);
-            plugin_->items()[entry.index].rackOffsetX += shift;
-            left += shift;
-            changed = true;
+        if (groupCount >= static_cast<int>(items.size())) {
+            return;
         }
-        previousRight = left + width;
-        first = false;
-    }
-    if (changed) {
-        plugin_->SaveItems();
-        needsLayout_ = true;
+        std::vector<Item> group;
+        group.reserve(static_cast<size_t>(groupCount));
+        for (int g = 0; g < groupCount; ++g) {
+            group.push_back(items[static_cast<size_t>(g)]);
+        }
+        const std::vector<float> targets = view_.TargetLefts(group);
+        bool joined = false;
+        for (int i = groupCount; i < static_cast<int>(items.size()) && !joined; ++i) {
+            if (!items[static_cast<size_t>(i)].custom) {
+                continue;
+            }
+            if (items[static_cast<size_t>(i)].id == ignoreId) {
+                continue;   /* 刚放下的卡：它就是要停在那里 */
+            }
+            const float customLeft = items[static_cast<size_t>(i)].customX;
+            const float customWidth = view_.CardWidth(items[static_cast<size_t>(i)]);
+            bool conflict = false;
+            for (int g = 0; g < groupCount && !conflict; ++g) {
+                /* 叠组里的卡画在固定叠位、不按槽位；自定义卡又画在叠组上面，
+                   拿它们的槽位判重叠会把卡误收进组里。 */
+                if (view_.IsStackIndex(g)) {
+                    continue;
+                }
+                /* 吸附组可能为了让路而带着偏移：按（含缓动目标的）实际位置判断。 */
+                const float gLeft = targets[static_cast<size_t>(g)] +
+                                    PendingGroupOffset(group[static_cast<size_t>(g)].id,
+                                                       group[static_cast<size_t>(g)].rackOffsetX);
+                const float gRight = gLeft + view_.CardWidth(group[static_cast<size_t>(g)]);
+                const float gapBetween = std::max(customLeft, gLeft) -
+                                         std::min(customLeft + customWidth, gRight);
+                if (gapBetween < kOverlapTolerance) {
+                    conflict = true;
+                }
+            }
+            for (int j = groupCount; j < i && !conflict; ++j) {
+                if (!items[static_cast<size_t>(j)].custom) {
+                    continue;
+                }
+                const float oLeft = items[static_cast<size_t>(j)].customX;
+                const float oRight = oLeft + view_.CardWidth(items[static_cast<size_t>(j)]);
+                const float gapBetween = std::max(customLeft, oLeft) -
+                                         std::min(customLeft + customWidth, oRight);
+                if (gapBetween < kOverlapTolerance) {
+                    conflict = true;
+                }
+            }
+            if (!conflict) {
+                continue;
+            }
+            const float center = customLeft + customWidth * 0.5f;
+            int at = 0;
+            for (int k = 0; k < groupCount; ++k) {
+                const float otherCenter =
+                    targets[static_cast<size_t>(k)] +
+                    view_.CardWidth(group[static_cast<size_t>(k)]) * 0.5f;
+                if (otherCenter < center) {
+                    ++at;
+                }
+            }
+            if (at < 0) {
+                at = 0;
+            }
+            if (at > groupCount) {
+                at = groupCount;
+            }
+            const CardBox* before = view_.Card(i);
+            const float visual = before ? before->card.left : 0.0f;
+            Item moved = items[static_cast<size_t>(i)];
+            moved.custom = false;
+            moved.rackOffsetX = 0.0f;
+            items.erase(items.begin() + i);
+            items.insert(items.begin() + at, moved);
+            std::vector<Item> groupAfter;
+            groupAfter.reserve(static_cast<size_t>(groupCount + 1));
+            for (int g = 0; g <= groupCount && g < static_cast<int>(items.size()); ++g) {
+                groupAfter.push_back(items[static_cast<size_t>(g)]);
+            }
+            const std::vector<float> after = view_.TargetLefts(groupAfter);
+            const float slotScreen = view_.ScreenLeftForContentLeft(after[static_cast<size_t>(at)]);
+            if (Item* item = plugin_->ItemById(moved.id)) {
+                item->rackOffsetX = visual - slotScreen;
+                view_.SnapSlotForId(item->id, after[static_cast<size_t>(at)]);
+                offsetAnims_.push_back(
+                    {item->id, item->rackOffsetX, 0.0f, rack::NowMs(), 260.0f});
+            }
+            joined = true;
+        }
+        if (!joined) {
+            return;
+        }
     }
 }
 
@@ -760,114 +900,226 @@ void RackWindow::FinishCardDrag(int id)
     if (!plugin_) {
         return;
     }
-    struct Entry {
-        float center = 0.0f;
-        float left = 0.0f;
-        float width = 0.0f;
-        int index = -1;
-    };
-    std::vector<Entry> order;
-    for (int i = 0; i < static_cast<int>(plugin_->items().size()); ++i) {
-        if (const CardBox* box = view_.Card(i)) {
-            order.push_back({(box->card.left + box->card.right) * 0.5f, box->card.left,
-                             box->card.right - box->card.left, i});
-        }
-    }
-    if (order.empty()) {
+    auto& items = plugin_->items();
+    const int dragIndex = plugin_->IndexById(id);
+    Item* dragged = plugin_->ItemById(id);
+    if (!dragged || dragIndex < 0) {
         return;
     }
-    std::sort(order.begin(), order.end(),
-              [](const Entry& a, const Entry& b) { return a.center < b.center; });
-
-    std::vector<Item> reordered;
-    reordered.reserve(order.size());
-    for (const Entry& entry : order) {
-        reordered.push_back(plugin_->items()[static_cast<size_t>(entry.index)]);
-    }
-    if (reordered.size() != plugin_->items().size()) {
-        return;
-    }
-
-    const std::vector<float> targets = view_.TargetLefts(reordered);
-    std::vector<float> oldOffsets(reordered.size(), 0.0f);
-    std::vector<float> offsets(reordered.size(), 0.0f);
-    for (size_t i = 0; i < reordered.size(); ++i) {
-        oldOffsets[i] = reordered[i].rackOffsetX;
-    }
-
-    /* 拖到「两倍槽位间距」以内就吸附回槽位；超过才保留落点。
-       之前是没有任何阈值，拖多远都会弹回。 */
-    const float snapDistance = 2.0f * view_.DefaultGap();
-    for (size_t i = 0; i < reordered.size(); ++i) {
-        const Entry& entry = order[i];
-        const float desired = entry.left - targets[i];
-        const bool dragged = reordered[i].id == id;
-        const bool wasFree = std::abs(oldOffsets[i]) > snapDistance;
-        if (dragged) {
-            offsets[i] = std::abs(desired) <= snapDistance ? 0.0f : desired;
-        } else if (wasFree) {
-            // 之前已经自由摆放的卡：保持它现在看到的绝对位置，不跟着重排弹走。
-            offsets[i] = desired;
-        } else {
-            offsets[i] = 0.0f;
+    const float gap = view_.DefaultGap();
+    const float width = view_.CardWidth(*dragged);
+    const bool wasCustom = dragged->custom;
+    /* 当前吸附组（不含自定义卡）和每张卡的屏幕左边缘。 */
+    std::vector<Item> group;
+    for (const auto& item : items) {
+        if (!item.custom) {
+            group.push_back(item);
         }
     }
-
-    /* 自由位置导致贴得太近/重叠时，整排回到槽位（用户说的“图片太多挤到一起才吸附”）。 */
-    struct FinalBox {
-        float left = 0.0f;
-        float right = 0.0f;
-    };
-    std::vector<FinalBox> finals;
-    finals.reserve(reordered.size());
-    for (size_t i = 0; i < reordered.size(); ++i) {
-        const float left = targets[i] + offsets[i];
-        finals.push_back({left, left + order[i].width});
+    const std::vector<float> groupTargets = view_.TargetLefts(group);
+    std::vector<float> groupLefts(group.size(), 0.0f);
+    for (size_t g = 0; g < group.size(); ++g) {
+        groupLefts[g] = view_.ScreenLeftForContentLeft(groupTargets[g]) + group[g].rackOffsetX;
     }
-    std::sort(finals.begin(), finals.end(),
-              [](const FinalBox& a, const FinalBox& b) { return a.left < b.left; });
-    bool crowded = false;
-    const float minGap = 6.0f * scale_;
-    for (size_t i = 1; i < finals.size(); ++i) {
-        if (finals[i].left - finals[i - 1].right < minGap) {
-            crowded = true;
+    const int dragGroupPos = [&]() -> int {
+        if (wasCustom) {
+            return -1;
+        }
+        for (size_t g = 0; g < group.size(); ++g) {
+            if (group[g].id == id) {
+                return static_cast<int>(g);
+            }
+        }
+        return -1;
+    }();
+    float dropLeft = 0.0f;
+    if (wasCustom) {
+        dropLeft = view_.ScreenLeftForContentLeft(dragged->customX);
+    } else if (dragGroupPos >= 0 &&
+               dragGroupPos < static_cast<int>(groupLefts.size())) {
+        dropLeft = groupLefts[static_cast<size_t>(dragGroupPos)];
+    } else {
+        return;
+    }
+    const float dropCenter = dropLeft + width * 0.5f;
+    struct Visual {
+        int groupPos = -1;
+        int itemIndex = -1;
+        bool custom = false;
+        float left = 0.0f;
+        float w = 0.0f;
+    };
+    std::vector<Visual> others;
+    for (size_t g = 0; g < group.size(); ++g) {
+        if (!wasCustom && static_cast<int>(g) == dragGroupPos) {
+            continue;
+        }
+        others.push_back({static_cast<int>(g), static_cast<int>(g), false, groupLefts[g],
+                          view_.CardWidth(group[g])});
+    }
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        if (!items[static_cast<size_t>(i)].custom || items[static_cast<size_t>(i)].id == id) {
+            continue;
+        }
+        others.push_back({-1, i, true, view_.ScreenLeftForContentLeft(items[static_cast<size_t>(i)].customX),
+                          view_.CardWidth(items[static_cast<size_t>(i)])});
+    }
+    /* 落点中心压在谁身上。叠组里的卡片按实际绘制位置计算，不按槽位：
+       它们的槽位在屏幕外，按槽位判断会并入不可见的位置。 */
+    int coveredGroupPos = -1;
+    int coveredItemIndex = -1;
+    for (const Visual& v : others) {
+        if (dropCenter > v.left && dropCenter < v.left + v.w) {
+            if (v.custom) {
+                coveredItemIndex = v.itemIndex;
+                break;
+            }
+            if (view_.IsStackIndex(v.groupPos)) {
+                continue;
+            }
+            coveredGroupPos = v.groupPos;
             break;
         }
     }
-    if (crowded) {
-        std::fill(offsets.begin(), offsets.end(), 0.0f);
-    }
-
-    view_.SnapSlotsTo(reordered, targets);
-    plugin_->items() = std::move(reordered);
-    offsetAnims_.clear();
-    const uint64_t now = rack::NowMs();
-    for (size_t i = 0; i < plugin_->items().size(); ++i) {
-        Item& item = plugin_->items()[i];
-        const float oldOffset = oldOffsets[i];
-        const float newOffset = offsets[i];
-        if (std::abs(newOffset) > 0.35f) {
-            // 保留位置：直接落到最终视觉位置，不再缓动回 0。
-            item.rackOffsetX = newOffset;
-        } else if (std::abs(oldOffset) > 0.35f) {
-            // 吸附回槽位：从当前偏移缓动到 0。
-            item.rackOffsetX = oldOffset;
-            offsetAnims_.push_back({item.id, oldOffset, 0.0f, now, 180.0f});
-            item.shakeStartMs = now;
-            item.shakeAmp = 2.2f;
-        } else {
-            item.rackOffsetX = 0.0f;
+    /* 落点中心压在谁身上：压住卡片 => 并回吸附组（按落点重排）；
+       落在空档/绳子空白处 => 就停在落点当自定义位置，两侧不够放时让开。 */
+    int centerInsert = 0;
+    int splitIndex = 0;
+    for (const Visual& v : others) {
+        const float c = v.left + v.w * 0.5f;
+        if (c < dropCenter && !v.custom) {
+            /* centerInsert 用于组内插入下标（含叠组）；splitIndex 只数可见行的卡，
+               叠组本来就不跟着 rackOffsetX 动。 */
+            ++centerInsert;
+            if (!view_.IsStackIndex(v.groupPos)) {
+                ++splitIndex;
+            }
         }
     }
-    plugin_->SaveItems();
+    const bool onCard = coveredGroupPos >= 0 || coveredItemIndex >= 0;
+    /* 只挪开一点点就松手：回自己拖拽前的位置（可见卡按槽位、叠卡按叠组位置）。 */
+    const bool backToOwnSlot = !onCard && !wasCustom && dragGroupPos >= 0 &&
+                               std::abs(dropLeft - cardDragStartLeft_) <= gap * 0.75f;
+    bool joinGroup = false;
+    int insertAt = -1;
+    if (onCard) {
+        joinGroup = true;
+        if (coveredGroupPos >= 0) {
+            const float coveredCenter =
+                groupLefts[static_cast<size_t>(coveredGroupPos)] +
+                view_.CardWidth(group[static_cast<size_t>(coveredGroupPos)]) * 0.5f;
+            insertAt = coveredGroupPos + (dropCenter > coveredCenter ? 1 : 0);
+            if (!wasCustom && dragGroupPos >= 0 && dragGroupPos < coveredGroupPos) {
+                --insertAt;
+            }
+        } else {
+            /* 压在一张自定义卡上：插到落点左右最近的组内位置（others 已经不含被拖卡）。 */
+            insertAt = centerInsert;
+        }
+    } else if (backToOwnSlot) {
+        joinGroup = true;
+        insertAt = dragGroupPos;
+    }
+    /* 先让其他卡片未完成的偏移缓动到达终点，再执行重排，避免停在中间位置。 */
+    SettleOffsetAnims();
+    const uint64_t now = rack::NowMs();
+    if (!joinGroup) {
+        /* 自定义位置：留在落点，不占槽位；不能停到信封下面。 */
+        float customLeft = dropLeft;
+        const float maxScreen = view_.AccessoryLeft() - gap - width;
+        if (customLeft > maxScreen) {
+            customLeft = maxScreen;
+        }
+        Item* item = plugin_->ItemById(id);
+        if (!item) {
+            return;
+        }
+        item->custom = true;
+        item->rackOffsetX = 0.0f;
+        /* 落点按这张卡离开吸附组后的居中基准换算：下一次 Layout 会按新内容重新居中，
+           同一帧按新基准绘制，松手位置不会偏移。 */
+        std::vector<Item> remaining;
+        remaining.reserve(items.size());
+        for (const auto& other : items) {
+            if (!other.custom && other.id != id) {
+                remaining.push_back(other);
+            }
+        }
+        const float remainingWidth = view_.ContentWidthForItems(remaining);
+        const float rowWidthNow = view_.layout().rowRight - view_.layout().rowLeft;
+        const float baseNow = view_.ProjectedContentBase(remainingWidth);
+        const float maxScrollNow = std::max(0.0f, remainingWidth - rowWidthNow);
+        float scrollNow = std::min(view_.ScrollTargetX(), maxScrollNow);
+        if (view_.AtScrollEnd()) {
+            scrollNow = maxScrollNow;
+        }
+        item->customX = customLeft - baseNow + scrollNow;
+        if (!wasCustom) {
+            Item moved = *item;
+            items.erase(items.begin() + dragIndex);
+            items.push_back(moved);
+        }
+        /* 落点两侧空间不足时，吸附组向两侧让开，卡片才能停在落点。 */
+        PushGroupAside(id, splitIndex, customLeft, customLeft + width);
+    } else {
+        std::vector<Item> newGroup;
+        newGroup.reserve(group.size());
+        for (size_t g = 0; g < group.size(); ++g) {
+            if (!wasCustom && static_cast<int>(g) == dragGroupPos) {
+                continue;
+            }
+            newGroup.push_back(group[g]);
+        }
+        if (insertAt < 0) {
+            insertAt = 0;
+        }
+        if (insertAt > static_cast<int>(newGroup.size())) {
+            insertAt = static_cast<int>(newGroup.size());
+        }
+        Item moved = *plugin_->ItemById(id);
+        moved.custom = false;
+        moved.rackOffsetX = 0.0f;
+        newGroup.insert(newGroup.begin() + insertAt, moved);
+        std::vector<Item> suffix;
+        for (const auto& item : items) {
+            if (item.custom && item.id != id) {
+                suffix.push_back(item);
+            }
+        }
+        items.clear();
+        items.insert(items.end(), newGroup.begin(), newGroup.end());
+        items.insert(items.end(), suffix.begin(), suffix.end());
+        const std::vector<float> newTargets = view_.TargetLefts(newGroup);
+        /* 用当前基准算槽位屏幕位置：Layout 会为居中基准变化补偿 slot.pos，
+           这里再按新基准算会把补偿算两遍，动画起点会偏一截。 */
+        const float slotScreen = view_.ScreenLeftForContentLeft(newTargets[static_cast<size_t>(insertAt)]);
+        if (Item* item = plugin_->ItemById(id)) {
+            item->rackOffsetX = dropLeft - slotScreen;
+            view_.SnapSlotForId(id, newTargets[static_cast<size_t>(insertAt)]);
+            /* 拖动距离较小时回到拖拽前的位置（保留原有偏移）；
+               并回吸附组时偏移归零（落在槽位）。
+               不延迟：偏移与槽位弹簧同时开始，卡片从落点直接回到目标位置。 */
+            const float settleOffset = backToOwnSlot ? cardDragStartOffset_ : 0.0f;
+            offsetAnims_.push_back({id, item->rackOffsetX, settleOffset, now, 260.0f});
+        }
+    }
     needsLayout_ = true;
     if (hwnd()) {
         Reposition();
+        /* 按最新的目标布局检查自定义卡：真叠住了才并回槽位（刚放下的这张除外）。 */
+        ResolveCustomOverlaps(id);
+        Reposition();
         Render();
-        if (!offsetAnims_.empty()) {
-            swingUntil_ = std::max(swingUntil_, now + 1250);
-            SetTimer(hwnd(), kTimerAnim, 16, nullptr);
-        }
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
+    /* 一张自定义卡都不剩时，把让位偏移收回槽位，绳子恢复成一排。 */
+    RelaxGroupOffsetsIfNoCustoms();
+    /* 拿到最新的 customX/偏移后再存：重启后自定义位置才对得上。 */
+    plugin_->SaveItems();
+    if (const CardBox* box = view_.Card(plugin_->IndexById(id))) {
+        RackLog(L"拖拽落位：id=%d 松手左缘=%.0f 布局左缘=%.0f custom=%d", id,
+                static_cast<double>(dropLeft), static_cast<double>(box->card.left),
+                plugin_->ItemById(id) ? plugin_->ItemById(id)->custom : 0);
     }
 }
 
@@ -1023,8 +1275,9 @@ void RackWindow::Animate()
                 finished = true;
                 continue;
             }
+            const uint64_t elapsed = now > it->start ? now - it->start : 0;
             const float t = rack::Clamp(
-                static_cast<float>(now - it->start) / 180.0f, 0.0f, 1.0f);
+                static_cast<float>(elapsed) / std::max(1.0f, it->ms), 0.0f, 1.0f);
             Item& item = plugin_->items()[index];
             if (t >= 1.0f) {
                 item.rackOffsetX = it->to;
@@ -1038,10 +1291,11 @@ void RackWindow::Animate()
         }
         if (finished && offsetAnims_.empty()) {
             plugin_->SaveItems();
-            /* 动画收尾后还有可能挨在一起（比如左边那张被用户往右拖过），
-               再按最小间距推开一次，仍然是缓动。 */
-            NormalizeSpacing(220.0f);
         }
+    }
+    if (normalizeAt_ != 0 && now >= normalizeAt_) {
+        normalizeAt_ = 0;
+        NormalizeSpacing(240.0f);
     }
     if (animating_) {
         const float t = static_cast<float>(now - animStart_) /
@@ -1061,7 +1315,7 @@ void RackWindow::Animate()
     lastAnimMs_ = now;
 
     StepSpring(basketHover_, basketHoverVelocity_, basketHoverTarget_, dt, 0.50f, 0.50f);
-    StepSpring(cardHover_, cardHoverVelocity_, cardHoverTarget_, dt, 0.30f, 0.60f);
+    StepSpring(cardHover_, cardHoverVelocity_, cardHoverTarget_, dt, 0.18f, 0.72f);
 
     /* 信封里那张纸只有一层，弹簧仅跟踪一个值。 */
     const float paperTarget = envelopeHoverTarget_ > 0.5f ? 1.0f : 0.0f;
@@ -1092,7 +1346,7 @@ void RackWindow::Animate()
         std::abs(cardHover_ - cardHoverTarget_) < 0.003f && paperSettled;
     if (!animating_ && !cardScaleAnimating_ && offsetAnims_.empty() && pendingAdjustId_ < 0 &&
         now >= swingUntil_ && now >= shakeUntil_ && hoverSettled && !view_.HasRemoved() &&
-        !view_.HasSliding() &&
+        !view_.HasSliding() && normalizeAt_ == 0 &&
         !view_.HasArrival() && pendingPinKind_ == PendingPin::None) {
         if (hideWhenRemovalsDone_ && plugin_->items().empty()) {
             hideWhenRemovalsDone_ = false;
@@ -1124,6 +1378,138 @@ void RackWindow::Animate()
     if (!animating_ && expand_ >= 0.99f && !missingChecked_) {
         missingChecked_ = true;
         CheckMissingFiles();
+    }
+}
+
+void RackWindow::SettleOffsetAnims()
+{
+    const bool had = !offsetAnims_.empty();
+    if (plugin_) {
+        for (const auto& anim : offsetAnims_) {
+            if (Item* item = plugin_->ItemById(anim.id)) {
+                item->rackOffsetX = anim.to;
+            }
+        }
+    }
+    offsetAnims_.clear();
+    /* 动画被提前取消时，偏移已到达最终值；此时保存，重启后卡片不会停在中间位置。 */
+    if (had && plugin_) {
+        plugin_->SaveItems();
+    }
+}
+
+float RackWindow::PendingGroupOffset(int id, float fallback) const
+{
+    for (const auto& anim : offsetAnims_) {
+        if (anim.id == id) {
+            return anim.to;
+        }
+    }
+    return fallback;
+}
+
+void RackWindow::RelaxGroupOffsetsIfNoCustoms()
+{
+    if (!plugin_ || !hwnd()) {
+        return;
+    }
+    for (const auto& item : plugin_->items()) {
+        if (item.custom) {
+            return;   /* 还有自定义卡：让位偏移继续保留 */
+        }
+    }
+    const uint64_t now = rack::NowMs();
+    bool animated = false;
+    for (auto& item : plugin_->items()) {
+        if (std::abs(item.rackOffsetX) < 0.5f) {
+            continue;
+        }
+        bool pending = false;
+        for (const auto& anim : offsetAnims_) {
+            if (anim.id == item.id) {
+                pending = true;
+                break;
+            }
+        }
+        if (pending) {
+            continue;
+        }
+        offsetAnims_.push_back({item.id, item.rackOffsetX, 0.0f, now + 40, 260.0f});
+        animated = true;
+    }
+    if (animated) {
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    }
+}
+
+void RackWindow::PushGroupAside(int skipId, int splitIndex, float obstacleLeft,
+                                float obstacleRight)
+{
+    if (!plugin_ || !hwnd()) {
+        return;
+    }
+    auto& items = plugin_->items();
+    std::vector<Item> pushGroup;
+    pushGroup.reserve(items.size());
+    for (int index = 0; index < static_cast<int>(items.size()); ++index) {
+        const Item& item = items[static_cast<size_t>(index)];
+        if (item.custom || item.id == skipId) {
+            continue;
+        }
+        /* 叠组绘制在固定位置，不跟随 rackOffsetX：为它们计算让位没有意义，
+           还会影响可见行的让位量。 */
+        if (view_.IsStackIndex(index)) {
+            continue;
+        }
+        pushGroup.push_back(item);
+    }
+    if (pushGroup.empty()) {
+        return;
+    }
+    const int total = static_cast<int>(pushGroup.size());
+    const int split = rack::ClampInt(splitIndex, 0, total);
+    const float gap = view_.DefaultGap();
+    const std::vector<float> targets = view_.TargetLefts(pushGroup);
+    const float contentWidth = view_.ContentWidthForItems(pushGroup);
+    const float rowWidth = view_.layout().rowRight - view_.layout().rowLeft;
+    /* 内容变窄时布局会锚在旧基准上，让位必须按同一个基准算。 */
+    const float base = view_.ProjectedContentBase(contentWidth);
+    /* 卡片离开吸附组后内容变窄：滚动会回到新的末端（和平时删卡一致）。
+       让位按最终位置算，松手后卡片才不会先让开再被卷动带回去。 */
+    const float maxScroll = std::max(0.0f, contentWidth - rowWidth);
+    float scroll = std::min(view_.ScrollTargetX(), maxScroll);
+    if (view_.AtScrollEnd()) {
+        scroll = maxScroll;
+    }
+    std::vector<float> natural(pushGroup.size(), 0.0f);
+    std::vector<float> widths(pushGroup.size(), 0.0f);
+    std::vector<float> existing(pushGroup.size(), 0.0f);
+    for (size_t g = 0; g < pushGroup.size(); ++g) {
+        existing[g] = pushGroup[g].rackOffsetX;
+        natural[g] = base + targets[g] - scroll + existing[g];
+        widths[g] = view_.CardWidth(pushGroup[g]);
+    }
+    /* 左边一组从落点往左依次排开，右边一组往右，保证相邻至少一个 gap。 */
+    const std::vector<float> offsets =
+        rack::PushApartOffsets(natural, widths, split, obstacleLeft, obstacleRight, gap);
+    const uint64_t now = rack::NowMs();
+    bool animated = false;
+    for (size_t g = 0; g < pushGroup.size() && g < offsets.size(); ++g) {
+        const float targetOffset = existing[g] + offsets[g];
+        Item* item = plugin_->ItemById(pushGroup[g].id);
+        if (!item) {
+            continue;
+        }
+        if (std::abs(targetOffset - item->rackOffsetX) < 0.5f) {
+            continue;
+        }
+        offsetAnims_.push_back({item->id, item->rackOffsetX, targetOffset, now + 40, 260.0f});
+        animated = true;
+    }
+    if (animated) {
+        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+        RackLog(L"拖拽让位：落点=%.0f..%.0f 两侧让开", static_cast<double>(obstacleLeft),
+                static_cast<double>(obstacleRight));
     }
 }
 
@@ -1214,6 +1600,19 @@ void RackWindow::Reposition()
         }
     }
     needsLayout_ = false;
+    UpdateMaxTotal();
+}
+
+void RackWindow::UpdateMaxTotal()
+{
+    if (!plugin_ || !hwnd() || updatingMaxTotal_) {
+        return;
+    }
+    const int capacity = std::max(1, view_.Capacity());
+    const int maxTotal = plugin_->config().maxMode == 0 ? capacity : 0;
+    updatingMaxTotal_ = true;
+    plugin_->SetMaxTotal(maxTotal);
+    updatingMaxTotal_ = false;
 }
 
 void RackWindow::PositionForMonitor(HMONITOR monitor)
@@ -1237,8 +1636,10 @@ void RackWindow::EnsureVisible()
     if (!hwnd() || !plugin_ || !plugin_->config().enabled || hiddenForFullscreen_) {
         return;
     }
-    /* 快捷键/常驻模式下被快捷键隐藏时，任何自动路径都不能再把窗口拉出来。 */
-    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+    /* 快捷键/常驻模式下被快捷键隐藏时，任何自动路径都不能再把窗口拉出来。
+       设置页正在预览晾衣架时例外，否则用户打开设置看不到架子。 */
+    if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover &&
+        !plugin_->PreviewPinned()) {
         return;
     }
     if (!visible()) {
@@ -1328,13 +1729,25 @@ void RackWindow::Tick()
     }
 
     if (plugin_->PreviewPinned()) {
+        /* 设置页正在预览晾衣架：快捷键/常驻模式下即使手动隐藏过，也要拉出来；
+           用户正在调它，看不到架子就没法调。 */
+        settingsPreviewShown_ = true;
         if (!visible()) EnsureVisible();
         if (expand_ < 0.9f) Expand(false);
         lastInside_ = rack::NowMs();
-    } else if (collapseAfterPreview_) {
-        /* 设置页的预览刚结束：把之前因为 pin 住而没执行的那次收起补上。 */
-        collapseAfterPreview_ = false;
-        Collapse();
+    } else {
+        if (settingsPreviewShown_) {
+            settingsPreviewShown_ = false;
+            /* 预览结束：之前如果是快捷键/常驻模式下手动隐藏的，回到隐藏状态。 */
+            if (manuallyHidden_ && plugin_->config().displayMode != kDisplayHover) {
+                collapseAfterPreview_ = true;
+            }
+        }
+        if (collapseAfterPreview_) {
+            /* 设置页的预览刚结束：把之前因为 pin 住而没执行的那次收起补上。 */
+            collapseAfterPreview_ = false;
+            Collapse();
+        }
     }
 
     if (!plugin_->config().enabled) {
@@ -1413,11 +1826,6 @@ void RackWindow::Tick()
 
     UpdateHover();
     UpdatePreview();
-
-    if (normalizeSpacingPending_) {
-        normalizeSpacingPending_ = false;
-        NormalizeLoadedSpacing();
-    }
 
     if (needsLayout_) {
         Reposition();
@@ -1578,6 +1986,19 @@ void RackWindow::UpdateClickThrough()
     SetClickThrough(!keepMouse && expand_ <= 0.001f);
 }
 
+void RackWindow::UpdateHoverFromMouse()
+{
+    if (!plugin_ || dragStarted_ || mouseDown_) {
+        return;
+    }
+    const uint64_t now = rack::NowMs();
+    if (lastHoverPollMs_ != 0 && now - lastHoverPollMs_ < 8) {
+        return;
+    }
+    lastHoverPollMs_ = now;
+    UpdatePreview();
+}
+
 void RackWindow::UpdatePreview()
 {
     if (!plugin_ || dragStarted_ || mouseDown_) {
@@ -1586,7 +2007,13 @@ void RackWindow::UpdatePreview()
     POINT cursor{};
     GetCursorPos(&cursor);
 
-    const RackHit hit = HitAtCursor();
+    RackHit hit = HitAtCursor();
+    /* 鼠标停在叠组上滚轮时，不实时把某张叠卡提出来（悬停/预览都先按背景处理）。 */
+    if (hit.index >= 0 && view_.IsStackIndex(hit.index) && view_.IsScrolling()) {
+        hit.part = RackPart::Background;
+        hit.index = -1;
+        hit.colorIndex = -1;
+    }
     const RackPart part = hit.part;
     const int index = hit.index;
     const int colorIndex = part == RackPart::CardColor ? hit.colorIndex : -1;
@@ -1638,7 +2065,7 @@ void RackWindow::UpdatePreview()
         } else if (preview_.showing() && previewIndex_ == index) {
             RECT anchor{};
             const POINT origin = screenOrigin();
-            const CardBox* box = view_.Card(index);
+            const CardBox* box = view_.DisplayCard(index);
             if (box) {
                 anchor.left = static_cast<LONG>(box->card.left) + origin.x;
                 anchor.top = static_cast<LONG>(box->card.top) + origin.y;
@@ -1700,7 +2127,7 @@ int RackWindow::HitIndexAtCursor(RackPart* outPart) const
 
 D2D1_RECT_F RackWindow::CardScreenRect(int index) const
 {
-    const CardBox* box = view_.Card(index);
+    const CardBox* box = view_.DisplayCard(index);
     if (!box) {
         return D2D1::RectF();
     }
@@ -1821,7 +2248,7 @@ void RackWindow::CopyItem(int index)
             return;
         }
     }
-    /* SVG 卡片复制的是 SVG 代码本身，粘贴到 Figma / Illustrator 里是矢量；
+    /* SVG 卡片复制的是 SVG 代码本身，粘贴到支持矢量代码的设计软件里仍是矢量；
        不另存 .svg 文件。 */
     const std::wstring svgText = plugin_->SvgText(index);
     if (!svgText.empty()) {
@@ -1829,8 +2256,8 @@ void RackWindow::CopyItem(int index)
     } else if (copyItem.kind == 1) {
         clipboard::CopyText(copyItem.note);
     } else if (copyItem.kind == 0) {
-        // 和拖拽保持同一条路径：只给 CF_HDROP，Adobe 按「粘贴文件」导入 PNG，
-        // 透明通道由文件本身带；位图剪贴板会被 Adobe 取走并洗成白底。
+        // 和拖拽保持同一条路径：只给 CF_HDROP，目标软件按「粘贴文件」导入 PNG，
+        // 透明通道由文件本身带；位图剪贴板可能被优先取走并洗成白底。
         clipboard::CopyFilePath(copyItem.path);
     } else if (!copyItem.paths.empty()) {
         if (copyItem.paths.size() > 1) {
@@ -2030,25 +2457,16 @@ void RackWindow::RemoveItem(int index, bool toBasket)
     }
     view_.BeginRemove(index, plugin_->items()[index], toBasket);
     SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+    /* 自定义位置保留：删掉一张卡后不要把其他卡弹回槽位。 */
+    SettleOffsetAnims();
     plugin_->RemoveItemAt(index);
-    /* 移除一张卡片后，剩下的卡片回到布局的均匀槽位；否则旧的手动 offset 会让
-       两边卡片看起来反而向两边分开/继续叠着。 */
-    offsetAnims_.clear();
-    const uint64_t now = rack::NowMs();
-    bool hadOffset = false;
-    for (auto& item : plugin_->items()) {
-        if (std::abs(item.rackOffsetX) > 0.35f) {
-            offsetAnims_.push_back({item.id, item.rackOffsetX, 0.0f, now, 180.0f});
-            hadOffset = true;
-        }
-    }
-    if (hadOffset) {
-        SetTimer(hwnd(), kTimerAnim, 16, nullptr);
-    }
     /* 位置动画由 RackView 的弹簧负责（目标位置按索引算，卡片通过弹簧平滑过渡），
        这里只要保证让位动画在跑。 */
     Reposition();
+    ResolveCustomOverlaps();
+    Reposition();
     Render();
+    RelaxGroupOffsetsIfNoCustoms();
 }
 void RackWindow::QueueEditNote(int index)
 {
@@ -2478,6 +2896,9 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
         return;
     }
     view_.LoadAssets(target);
+    /* 卡片缩略图缓存放在轻雪的缓存目录（<Cache>\Misc\Rack），跟着「缓存位置」设置走；
+       RackThumbDir 还会把旧位置的缩略图搬过来。 */
+    const std::wstring thumbDir = util::RackThumbDir();
     for (auto& item : plugin_->items()) {
         if (item.thumb.valid() || item.thumbAttempted) {
             continue;
@@ -2489,8 +2910,13 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
         if (item.kind == 2 && item.thumbPath.empty()) {
             continue;   /* 录屏没有封面：退化成纯文字卡片 */
         }
-        const std::wstring& source =
-            (item.kind == 2 && !item.thumbPath.empty()) ? item.thumbPath : item.path;
+        std::wstring source = !item.thumbPath.empty() ? item.thumbPath : item.path;
+        if (!item.thumbPath.empty() && !util::FileExists(source)) {
+            source = item.path;   /* 宿主缩略图被清掉了：退回原图 */
+        }
+        if (source.empty()) {
+            continue;
+        }
         UINT w = 0, h = 0;
         if (SUCCEEDED(graphics_->images().GetSize(source, w, h)) && w > 0 && h > 0) {
             const float aspect = static_cast<float>(w) / static_cast<float>(h);
@@ -2499,10 +2925,23 @@ void RackWindow::BeforeDraw(ID2D1RenderTarget* target)
                 needsLayout_ = true;
             }
         }
+        /* 卡片只画小图：第一次从原图缩出一份 512px 的 PNG 缓存，之后（包括下次
+           启动）直接读缓存，卡片多时不再反复解 4K 原图；悬停预览仍然读原图。
+           如果轻雪给了 thumb（录屏封面/宿主缩略图），source 就是它。 */
+        std::wstring cardSource = source;
+        if (!thumbDir.empty()) {
+            const std::wstring cacheFile =
+                util::JoinPath(thumbDir, ThumbCacheKey(item) + L".png");
+            const std::wstring cached =
+                graphics_->images().EnsureThumbnail(source, cacheFile, 512);
+            if (!cached.empty()) {
+                cardSource = cached;
+            }
+        }
         /* 卡片图只有约 140 DIP 宽。用 WIC Fant 先按接近显示尺寸缩小，
            比绘制时让 D2D 缩小 640px 的缩略图更干净——那样会
            把细线糊成一团。 */
-        graphics_->images().Load(source, 192.0f * scale_, target, item.thumb);
+        graphics_->images().Load(cardSource, 192.0f * scale_, target, item.thumb);
     }
 }
 
@@ -2529,30 +2968,26 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
         }
     };
 
-    for (int i = 0;; ++i) {
-        const CardBox* box = view_.CardAt(i);
-        if (!box) {
-            break;
-        }
-        const int x0 = std::max(0, static_cast<int>(std::floor(box->card.left)) - margin);
-        const int y0 = std::max(0, static_cast<int>(std::floor(box->card.top)) - margin);
-        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(box->card.right)) + margin);
-        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(box->card.bottom)) + margin);
+    auto fillBox = [&](const CardBox& box) {
+        const int x0 = std::max(0, static_cast<int>(std::floor(box.card.left)) - margin);
+        const int y0 = std::max(0, static_cast<int>(std::floor(box.card.top)) - margin);
+        const int x1 = std::min(width - 1, static_cast<int>(std::ceil(box.card.right)) + margin);
+        const int y1 = std::min(height - 1, static_cast<int>(std::ceil(box.card.bottom)) + margin);
 
         const D2D1_POINT_2F pivot =
-            D2D1::Point2F((box->card.left + box->card.right) * 0.5f, box->card.top);
-        const float radians = box->angle * 3.1415926535f / 180.0f;
+            D2D1::Point2F((box.card.left + box.card.right) * 0.5f, box.card.top);
+        const float radians = box.angle * 3.1415926535f / 180.0f;
         const float ca = std::cos(radians);
         const float sa = std::sin(radians);
-        const float left = box->card.left - extra;
-        const float top = box->card.top - extra;
-        const float right = box->card.right + extra;
-        const float bottom = box->card.bottom + extra;
+        const float left = box.card.left - extra;
+        const float top = box.card.top - extra;
+        const float right = box.card.right + extra;
+        const float bottom = box.card.bottom + extra;
         float radius = 0.0f;
-        if (box->cardType == card::Type::Note) {
+        if (box.cardType == card::Type::Note) {
             radius = 0.0f;
-        } else if (box->flat) {
-            radius = (box->card.right - box->card.left) / 10.0f;
+        } else if (box.flat) {
+            radius = (box.card.right - box.card.left) / 10.0f;
         } else {
             radius = 12.0f * scale_;
         }
@@ -2568,13 +3003,40 @@ void RackWindow::AfterDraw(HDC dc, void* bits, int width, int height)
                 if (RoundedRectContains(pivot.x + (lx - pivot.x) / kCardHoverScale,
                                         pivot.y + (ly - pivot.y) / kCardHoverScale, left, top,
                                         right, bottom, radius) ||
-                    (box->hasNote && lx >= box->note.left - extra &&
-                     lx <= box->note.right + extra && ly >= box->note.top - extra &&
-                     ly <= box->note.bottom + extra)) {
+                    (box.hasNote && lx >= box.note.left - extra &&
+                     lx <= box.note.right + extra && ly >= box.note.top - extra &&
+                     ly <= box.note.bottom + extra)) {
                     setOpaque(x, y);
                 }
             }
         }
+    };
+
+    /* 只给可见行和堆叠顶层补 alpha：堆叠后层只画，不参与鼠标命中。 */
+    const RackLayout& layoutNow = view_.layout();
+    const int first = rack::ClampInt(layoutNow.visibleFirst, 0,
+                                     static_cast<int>(plugin_->items().size()));
+    const int last = std::min(static_cast<int>(plugin_->items().size()),
+                              first + layoutNow.visibleCount);
+    for (int i = first; i < last; ++i) {
+        if (const CardBox* box = view_.CardAt(i)) {
+            fillBox(*box);
+        }
+    }
+    /* 自定义位置的卡片也要参与命中测试。 */
+    for (int i = std::max(0, layoutNow.groupCount); i < static_cast<int>(plugin_->items().size());
+         ++i) {
+        if (const CardBox* box = view_.CardAt(i)) {
+            fillBox(*box);
+        }
+    }
+    /* 叠层也要参与命中测试（悬停其中一张会临时提到前面），
+       所以每一层的形状都补 alpha；后层被前层盖住的部分仍由 HitTest 先判前层。 */
+    for (const CardBox& box : view_.StackBoxes(true)) {
+        fillBox(box);
+    }
+    for (const CardBox& box : view_.StackBoxes(false)) {
+        fillBox(box);
     }
 
     /* 绳子本身只有 1.6~2.3px 宽，AA 之后真正 alpha=255 的像素更少。
@@ -2715,6 +3177,20 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         return 0;
     }
 
+    case kMsgRackScroll: {
+        /* 滚轮 = 拉绳子：连续像素移动，一格不再固定切一张卡。 */
+        DismissPreview();
+        const int delta = static_cast<int>(wParam);
+        const float pixels = -static_cast<float>(delta) / 120.0f * 52.0f * scale_;
+        if (pixels != 0.0f) {
+            view_.ScrollByPixels(pixels);
+            if (hwnd()) {
+                SetTimer(hwnd(), kTimerAnim, 16, nullptr);
+            }
+        }
+        return 0;
+    }
+
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
 
@@ -2737,11 +3213,23 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         const float px = static_cast<float>(point.x);
         const float py = static_cast<float>(point.y);
         const float extra = 2.5f * scale_;
-        for (int i = 0;; ++i) {
+        const RackLayout& layoutNow = view_.layout();
+        const int shapeFirst = rack::ClampInt(layoutNow.visibleFirst, 0,
+                                              static_cast<int>(plugin_->items().size()));
+        const int shapeLast = std::min(static_cast<int>(plugin_->items().size()),
+                                       shapeFirst + layoutNow.visibleCount);
+        for (int i = shapeFirst; i < shapeLast; ++i) {
             const CardBox* box = view_.CardAt(i);
             if (!box) break;
             if (PointInCardShape(*box, px, py, extra) ||
                 (box->hasNote && PointInNoteShape(*box, px, py, extra))) {
+                return HTCLIENT;
+            }
+        }
+        for (bool left : {true, false}) {
+            const CardBox* top = view_.StackTop(left);
+            if (top && (PointInCardShape(*top, px, py, extra) ||
+                        (top->hasNote && PointInNoteShape(*top, px, py, extra)))) {
                 return HTCLIENT;
             }
         }
@@ -2827,10 +3315,24 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             dragStarted_ = false;
             pressPoint_ = point;
             cardDragStartOffset_ = plugin_->items()[hit.index].rackOffsetX;
+            if (const CardBox* display = view_.DisplayCard(hit.index)) {
+                cardDragStartLeft_ = display->card.left;
+            }
+            /* 一开始拖就收掉悬停预览和高亮：否则预览框会挡在拖动路径上。 */
+            DismissPreview();
+            hovered_ = -1;
+            cardHoverTarget_ = 0.0f;
+            cardHoverVelocity_ = 0.0f;
+            lastHoverPart_ = static_cast<int>(RackPart::None);
+            lastHoverPartIndex_ = -1;
+            view_.SetHoverPart(lastHoverPart_, lastHoverPartIndex_);
             cardDragging_ = false;
+            view_.SetFreeDragging(-1);
             lastCardDragPaint_ = 0;
             pendingAdjustId_ = -1;
-            offsetAnims_.clear();
+            /* 上一次松手的偏移缓动可能还没跑完：先落到终点再开始新拖动，
+               否则取消 timer 后那张卡会永远停在半路。 */
+            SettleOffsetAnims();
             SetCapture(hwnd());
             Render();
         } else if (hit.part == RackPart::Clip) {
@@ -2850,7 +3352,10 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_MOUSEMOVE: {
-        if (!mouseDown_ || dragStarted_ || !plugin_) {
+        if (!plugin_) return 0;
+        if (!mouseDown_ || dragStarted_) {
+            /* hover 跟鼠标走：不再等 50ms 轮询。 */
+            UpdateHoverFromMouse();
             return 0;
         }
         if (pressedPart_ == RackPart::Clip) {
@@ -2870,21 +3375,48 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         const bool horizontalDominant =
             horizontalRun > 12.0f * scale_ && horizontalRun >= verticalRun * 1.3f;
         const bool cardPress = pressedPart_ == RackPart::Card;
-        if (cardPress && horizontalDominant) {
-            cardDragging_ = true;
+        if (cardPress && horizontalDominant && !cardDragging_) {
+            const int index = plugin_->IndexById(pressItemId_);
+            if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
+                cardDragging_ = true;
+                /* 叠层里的卡也能直接拖：从它现在露在叠组里的位置起手，
+                   用 rackOffsetX 把它抬到可见行这一层，之后跟着指针走。 */
+                Item& item = plugin_->items()[index];
+                const std::vector<float> targets = view_.TargetLefts(plugin_->items());
+                if (index < static_cast<int>(targets.size())) {
+                    item.rackOffsetX =
+                        cardDragStartLeft_ - view_.ScreenLeftForContentLeft(targets[index]);
+                }
+                view_.SetFreeDragging(index);
+            }
         }
         if (cardDragging_) {
-            if (Item* item = plugin_->ItemById(pressItemId_)) {
-                const int index = plugin_->IndexById(pressItemId_);
+            const int index = plugin_->IndexById(pressItemId_);
+            if (index >= 0 && index < static_cast<int>(plugin_->items().size())) {
                 if (const CardBox* box = view_.Card(index)) {
                     const float width = box->card.right - box->card.left;
-                    const float baseLeft = box->card.left - item->rackOffsetX;
-                    float desired = cardDragStartOffset_ + (point.x - pressPoint_.x);
+                    float desiredLeft = cardDragStartLeft_ + (point.x - pressPoint_.x);
                     const float minLeft = 24.0f * scale_;
                     const float maxLeft = view_.layout().width - width - 24.0f * scale_;
-                    const float left = baseLeft + desired;
-                    desired += rack::Clamp(left, minLeft, std::max(minLeft, maxLeft)) - left;
-                    item->rackOffsetX = desired;
+                    desiredLeft = rack::Clamp(desiredLeft, minLeft, std::max(minLeft, maxLeft));
+                    /* 拖动中只让卡片跟着指针走，先不挤邻居。 */
+                    if (Item* moved = plugin_->ItemById(pressItemId_)) {
+                        if (moved->custom) {
+                            moved->customX = view_.ContentXForScreenLeft(desiredLeft);
+                        } else {
+                            const int groupCount = view_.GroupCount();
+                            std::vector<Item> group;
+                            for (int g = 0; g < groupCount; ++g) {
+                                group.push_back(plugin_->items()[static_cast<size_t>(g)]);
+                            }
+                            const std::vector<float> targets = view_.TargetLefts(group);
+                            if (index < static_cast<int>(targets.size())) {
+                                const float slotLeft = view_.ScreenLeftForContentLeft(
+                                    targets[static_cast<size_t>(index)]);
+                                moved->rackOffsetX = desiredLeft - slotLeft;
+                            }
+                        }
+                    }
                 }
             }
             const uint64_t paintNow = rack::NowMs();
@@ -2918,7 +3450,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                     RECT returnBand{};
                     if (const RECT work = MonitorWorkArea(monitor_); work.right > work.left) {
                         float bottom = 200.0f * scale_;
-                        if (const CardBox* box = view_.Card(index)) {
+                        if (const CardBox* box = view_.DisplayCard(index)) {
                             bottom = std::max(bottom, box->card.bottom + 24.0f * scale_);
                         }
                         returnBand.left = work.left;
@@ -2934,7 +3466,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
                     dragdrop::DragOutcome outcome;
                     view_.SetDragging(index);
                     Render();
-                    const CardBox* dragBox = view_.Card(index);
+                    const CardBox* dragBox = view_.DisplayCard(index);
                     const int dragW = dragBox ? static_cast<int>(dragBox->card.right -
                                                                  dragBox->card.left)
                                               : static_cast<int>(150.0f * scale_);
@@ -2978,7 +3510,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         RECT returnBand{};
         if (const RECT work = MonitorWorkArea(monitor_); work.right > work.left) {
             float bottom = 200.0f * scale_;
-            if (const CardBox* box = view_.Card(index)) {
+            if (const CardBox* box = view_.DisplayCard(index)) {
                 bottom = std::max(bottom, box->card.bottom + 24.0f * scale_);
             }
             returnBand.left = work.left;
@@ -2995,7 +3527,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             dragdrop::DragOutcome outcome;
             view_.SetDragging(index);
             Render();
-            const CardBox* dragBox = view_.Card(index);
+            const CardBox* dragBox = view_.DisplayCard(index);
             const int dragW = dragBox ? static_cast<int>(dragBox->card.right -
                                                          dragBox->card.left)
                                       : static_cast<int>(154.0f * scale_);
@@ -3058,7 +3590,7 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
             }
             view_.SetDragging(-1);
             /* 文字类拖拽：松手后静默复制同一段文本，再替用户按 Ctrl+V。
-               不依赖目标软件接不接拖放，也不区分 Figma/Pixso/MasterGo 等。 */
+               不依赖目标软件接不接拖放，也不区分具体是哪种设计软件。 */
             if (!dragText.empty() && !outcome.cancelled && !outcome.returnedToRack &&
                 plugin_->CopyCardText(index)) {
                 POINT dropPoint{};
@@ -3168,14 +3700,10 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         }
         if (cardDragging_) {
             cardDragging_ = false;
+            view_.SetFreeDragging(-1);
             pressed_ = -1;
             pressedPart_ = RackPart::None;
-            pendingAdjustId_ = pressItemId_;
-            pendingAdjustAt_ = rack::NowMs() + 320;
-            if (hwnd()) SetTimer(hwnd(), kTimerAnim, 16, nullptr);
-            Reposition();
-            plugin_->SaveItems();
-            Render();
+            FinishCardDrag(pressItemId_);
             return 0;
         }
         if (plugin_) {
@@ -3265,6 +3793,16 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
         const int index = CardIndexAtScreen(screen);
         if (index >= 0 && index < static_cast<int>(plugin_->items().size()) && !menuOpen_) {
             ShowItemMenu(index, screen);
+        } else if (!menuOpen_) {
+            /* 右键点在绳子/空白处：打开通用菜单（收起、设置）。
+               卡片数量只在轻雪的设置页里改，不在右键菜单里重复一份。 */
+            POINT client = screen;
+            ScreenToClient(hwnd(), &client);
+            const RackHit hit = view_.HitTest(static_cast<float>(client.x),
+                                              static_cast<float>(client.y), scale_);
+            if (hit.part == RackPart::Line || hit.part == RackPart::Background) {
+                ShowGeneralMenu(screen);
+            }
         }
         return 0;
     }
@@ -3285,6 +3823,8 @@ LRESULT RackWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
     case WM_CAPTURECHANGED:
         if (mouseDown_ && GetCapture() != hwnd()) {
             mouseDown_ = false;
+            cardDragging_ = false;
+            view_.SetFreeDragging(-1);
             pressItemId_ = -1;
             pressed_ = -1;
             pressedPart_ = RackPart::None;

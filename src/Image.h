@@ -29,6 +29,10 @@ public:
        （例如篮子的旋转：软件光栅不会对旋转位图做亚像素采样，只能先转好再贴）。 */
     HRESULT LoadPixels(const std::wstring& path, UINT width, UINT height,
                        std::vector<BYTE>& out);
+    /* 卡片缩略图缓存：把 source 缩到 maxDim 存成 cacheFile（PNG），返回缓存路径。
+       已经存在就直接返回；生成失败返回空，调用方退回原图。 */
+    std::wstring EnsureThumbnail(const std::wstring& source, const std::wstring& cacheFile,
+                                 UINT maxDim);
 
 private:
     ComPtr<IWICImagingFactory> wic_;

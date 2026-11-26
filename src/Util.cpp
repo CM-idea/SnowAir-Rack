@@ -1,5 +1,10 @@
 #include "Util.h"
 
+#include "MiniJson.h"
+
+#include <filesystem>
+#include <system_error>
+
 #include <shellscalingapi.h>
 #include <cstdarg>
 
@@ -151,6 +156,241 @@ std::wstring GetDataDir()
         return fallback;
     }();
     return cached;
+}
+
+namespace {
+
+/* 当前进程是否为轻雪主程序：插件加载在 SnowAir.exe 内；测试宿主（HostSim）
+   不应读写用户真实的缓存目录。 */
+bool RunningInSnowAir()
+{
+    static const bool cached = []() -> bool {
+        wchar_t exe[MAX_PATH * 2]{};
+        if (GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe))) == 0) {
+            return false;
+        }
+        std::wstring name = std::filesystem::path(exe).filename().wstring();
+        std::wstring lower;
+        lower.reserve(name.size());
+        for (wchar_t c : name) {
+            lower.push_back(static_cast<wchar_t>(towlower(c)));
+        }
+        return lower.find(L"snowair") != std::wstring::npos;
+    }();
+    return cached;
+}
+
+/* 轻雪的配置路径：先看 exe 同目录（便携模式，和宿主 initConfigPath 一致），
+   否则 %AppData%\SnowAir\config.json。 */
+std::wstring HostConfigPath()
+{
+    if (!RunningInSnowAir()) {
+        return {};
+    }
+    wchar_t exe[MAX_PATH * 2]{};
+    if (GetModuleFileNameW(nullptr, exe, static_cast<DWORD>(std::size(exe))) > 0) {
+        const std::filesystem::path portable =
+            std::filesystem::path(exe).parent_path() / L"config.json";
+        std::error_code ec;
+        if (std::filesystem::exists(portable, ec)) {
+            return portable.wstring();
+        }
+    }
+    PWSTR roaming = nullptr;
+    std::wstring path;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roaming)) && roaming) {
+        path = (std::filesystem::path(roaming) / L"SnowAir" / L"config.json").wstring();
+    }
+    if (roaming) {
+        CoTaskMemFree(roaming);
+    }
+    return path;
+}
+
+std::wstring RoamingSnowAirDir()
+{
+    PWSTR roaming = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roaming)) && roaming) {
+        dir = (std::filesystem::path(roaming) / L"SnowAir").wstring();
+    }
+    if (roaming) {
+        CoTaskMemFree(roaming);
+    }
+    return dir;
+}
+
+std::wstring DefaultSnowAirCacheRoot()
+{
+    PWSTR local = nullptr;
+    std::wstring root;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local)) && local) {
+        root = (std::filesystem::path(local) / L"SnowAir" / L"Cache").wstring();
+    }
+    if (local) {
+        CoTaskMemFree(local);
+    }
+    return root;
+}
+
+std::wstring TrimSpace(const std::wstring& text)
+{
+    const size_t first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) {
+        return {};
+    }
+    const size_t last = text.find_last_not_of(L" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+/* 把缓存文件从旧目录搬到新目录（同名时保留新目录里的那份）。 */
+void MigrateThumbFiles(const std::wstring& from, const std::wstring& to)
+{
+    if (from.empty() || to.empty() || SamePath(from, to)) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(from, ec)) {
+        return;
+    }
+    if (!EnsureDir(to)) {
+        return;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(from, ec)) {
+        if (ec || !entry.is_regular_file(ec)) {
+            continue;
+        }
+        if (_wcsicmp(entry.path().extension().c_str(), L".png") != 0) {
+            continue;
+        }
+        const std::filesystem::path target = std::filesystem::path(to) / entry.path().filename();
+        std::error_code existsEc;
+        if (std::filesystem::exists(target, existsEc)) {
+            continue;
+        }
+        std::error_code moveEc;
+        std::filesystem::rename(entry.path(), target, moveEc);
+        if (moveEc) {
+            moveEc.clear();
+            std::filesystem::copy_file(entry.path(), target,
+                                       std::filesystem::copy_options::overwrite_existing, moveEc);
+            if (!moveEc) {
+                std::error_code removeEc;
+                std::filesystem::remove(entry.path(), removeEc);
+            }
+        }
+    }
+    std::error_code emptyEc;
+    if (std::filesystem::is_directory(from, emptyEc) &&
+        std::filesystem::is_empty(from, emptyEc)) {
+        std::error_code removeEc;
+        std::filesystem::remove(from, removeEc);
+    }
+}
+
+std::wstring ResolveSnowAirCacheRoot()
+{
+    const std::wstring configPath = HostConfigPath();
+    std::wstring root;
+    if (!configPath.empty()) {
+        std::vector<BYTE> bytes;
+        if (ReadFileBytes(configPath, bytes) && !bytes.empty()) {
+            std::string text(bytes.begin(), bytes.end());
+            if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+                static_cast<unsigned char>(text[1]) == 0xBB &&
+                static_cast<unsigned char>(text[2]) == 0xBF) {
+                text.erase(0, 3);
+            }
+            json::Value value;
+            if (json::Parse(text, value)) {
+                const json::Value* features = value.Get("features");
+                const json::Value* custom = features ? features->Get("cacheDir") : nullptr;
+                if (custom && custom->type == json::Type::String) {
+                    const std::wstring stored = TrimSpace(Utf8ToWide(custom->text));
+                    if (!stored.empty()) {
+                        std::filesystem::path path(stored);
+                        if (path.is_relative()) {
+                            path = std::filesystem::path(RoamingSnowAirDir()) / path;
+                        }
+                        path = path.lexically_normal();
+                        /* 宿主存的是最终缓存根（...\SnowAir\Cache）；兼容旧版只给了
+                           「放在哪」的情况，和 Setting::setCacheDir 的规则保持一致。 */
+                        const std::wstring fileName = path.filename().wstring();
+                        const std::wstring parentName = path.parent_path().filename().wstring();
+                        if (!(_wcsicmp(fileName.c_str(), L"Cache") == 0 &&
+                              _wcsicmp(parentName.c_str(), L"SnowAir") == 0)) {
+                            if (_wcsicmp(fileName.c_str(), L"SnowAir") == 0) {
+                                path /= L"Cache";
+                            } else {
+                                path /= L"SnowAir";
+                                path /= L"Cache";
+                            }
+                        }
+                        root = path.wstring();
+                    }
+                }
+            }
+        }
+    }
+    if (root.empty()) {
+        root = DefaultSnowAirCacheRoot();
+    }
+    return root;
+}
+
+} /* namespace */
+
+std::wstring SnowAirCacheRoot()
+{
+    static std::wstring cached;
+    static uint64_t cachedAt = 0;
+    if (!RunningInSnowAir()) {
+        return {};
+    }
+    /* 用户改「缓存位置」时宿主不会通知插件；隔几秒重读一次配置就能跟上，
+       文件已经由宿主随 Misc 整棵搬走。 */
+    const uint64_t now = GetTickCount64();
+    if (cachedAt != 0 && now - cachedAt < 5000) {
+        return cached;
+    }
+    cachedAt = now;
+    cached = ResolveSnowAirCacheRoot();
+    return cached;
+}
+
+std::wstring RackThumbDir()
+{
+    static std::wstring cached;
+    static uint64_t cachedAt = 0;
+    static std::wstring lastDir;
+    const uint64_t now = GetTickCount64();
+    if (!cached.empty() && now - cachedAt < 5000) {
+        return cached;
+    }
+    cachedAt = now;
+    std::wstring target;
+    const std::wstring cacheRoot = SnowAirCacheRoot();
+    if (!cacheRoot.empty()) {
+        const std::wstring dir = JoinPath(JoinPath(cacheRoot, L"Misc"), L"Rack");
+        if (EnsureDir(dir)) {
+            target = dir;
+        }
+    }
+    if (target.empty()) {
+        target = JoinPath(GetDataDir(), L"thumbs");
+        EnsureDir(target);
+    }
+    /* 主程序换了缓存位置（或从旧版插件升级）：把旧缩略图搬过来，卡片不用重缩。 */
+    if (!lastDir.empty()) {
+        MigrateThumbFiles(lastDir, target);
+    }
+    const std::wstring legacy = JoinPath(GetDataDir(), L"thumbs");
+    if (!SamePath(legacy, target)) {
+        MigrateThumbFiles(legacy, target);
+    }
+    lastDir = target;
+    cached = target;
+    return target;
 }
 
 bool CopyFileTo(const std::wstring& from, const std::wstring& to)

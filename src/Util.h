@@ -11,6 +11,14 @@ std::wstring GetDllDir();
 std::wstring GetDataDir();
 std::wstring JoinPath(const std::wstring& a, const std::wstring& b);
 
+/* SnowAir 的缓存根（跟着主程序的 features.cacheDir 走，默认
+   %LocalAppData%\SnowAir\Cache）。不在 SnowAir 进程里时返回空。 */
+std::wstring SnowAirCacheRoot();
+/* 卡片缩略图缓存目录：<SnowAir 缓存根>\Misc\Rack。
+   主程序换自定义缓存目录时整棵 Misc 会跟着搬，旧位置的缩略图也会被搬过来；
+   拿不到主程序缓存目录（HostSim/测试）时退回插件自己的 data\thumbs。 */
+std::wstring RackThumbDir();
+
 bool FileExists(const std::wstring& path);
 bool DirectoryExists(const std::wstring& path);
 bool EnsureDir(const std::wstring& path);
